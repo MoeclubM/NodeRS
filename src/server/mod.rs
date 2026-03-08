@@ -264,6 +264,7 @@ async fn accept_loop(
                 continue;
             }
         };
+        let _ = stream.set_nodelay(true);
         let acceptor = {
             let tls_config = tls_config.read().expect("tls config lock poisoned").clone();
             tokio_rustls::TlsAcceptor::from(tls_config)

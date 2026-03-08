@@ -48,8 +48,10 @@ async fn resolve_with_nameserver(
     nameserver: &str,
     ip_strategy: IpStrategy,
 ) -> anyhow::Result<Vec<IpAddr>> {
-    let ipv4 = resolve_with_server(host, nameserver, RecordType::A).await;
-    let ipv6 = resolve_with_server(host, nameserver, RecordType::Aaaa).await;
+    let (ipv4, ipv6) = tokio::join!(
+        resolve_with_server(host, nameserver, RecordType::A),
+        resolve_with_server(host, nameserver, RecordType::Aaaa)
+    );
 
     let mut resolved = Vec::new();
     match ip_strategy {
