@@ -702,19 +702,17 @@ where
         if control.is_cancelled() {
             return Ok(total);
         }
+        let chunk_len = limiter
+            .as_ref()
+            .map(|limiter| limiter.chunk_size(buffer.len()))
+            .unwrap_or(buffer.len());
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer) => read.context("read throttled chunk")?,
+            read = reader.read(&mut buffer[..chunk_len]) => read.context("read throttled chunk")?,
         };
         if read == 0 {
             let _ = writer.shutdown().await;
             return Ok(total);
-        }
-        if let Some(limiter) = &limiter {
-            limiter.consume(read).await;
-            if control.is_cancelled() {
-                return Ok(total);
-            }
         }
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
@@ -729,6 +727,12 @@ where
         }
         if let Some(activity) = activity.as_ref() {
             activity.record();
+        }
+        if let Some(limiter) = &limiter {
+            tokio::select! {
+                _ = control.cancelled() => return Ok(total),
+                _ = limiter.consume(read) => {}
+            }
         }
     }
 }
@@ -751,19 +755,17 @@ where
         if control.is_cancelled() {
             return Ok(total);
         }
+        let chunk_len = limiter
+            .as_ref()
+            .map(|limiter| limiter.chunk_size(buffer.len()))
+            .unwrap_or(buffer.len());
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer) => read?,
+            read = reader.read(&mut buffer[..chunk_len]) => read?,
         };
         if read == 0 {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
-        }
-        if let Some(limiter) = &limiter {
-            limiter.consume(read).await;
-            if control.is_cancelled() {
-                return Ok(total);
-            }
         }
         write_frame(&writer, CMD_PSH, stream_id, &buffer[..read]).await?;
         let transferred = read as u64;
@@ -773,6 +775,12 @@ where
         }
         if let Some(activity) = activity.as_ref() {
             activity.record();
+        }
+        if let Some(limiter) = &limiter {
+            tokio::select! {
+                _ = control.cancelled() => return Ok(total),
+                _ = limiter.consume(read) => {}
+            }
         }
     }
 }
@@ -933,5 +941,47 @@ mod tests {
         drop(source_writer);
         let transferred = task.await.expect("join pump").expect("pump succeeds");
         assert_eq!(transferred, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pump_copy_writes_before_waiting_for_limiter() {
+        let control = SessionControl::new();
+        let limiter = SharedRateLimiter::new(1024);
+        let (mut source_reader, mut source_writer) = tokio::io::duplex(8192);
+        let (mut sink_writer, mut sink_reader) = tokio::io::duplex(8192);
+
+        let task = tokio::spawn({
+            let control = control.clone();
+            let limiter = limiter.clone();
+            async move {
+                pump_copy(
+                    &mut source_reader,
+                    &mut sink_writer,
+                    control,
+                    Some(limiter),
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+
+        let payload = vec![7u8; 4096];
+        source_writer
+            .write_all(&payload)
+            .await
+            .expect("write source payload");
+
+        let mut observed = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            sink_reader.read_exact(&mut observed),
+        )
+        .await
+        .expect("throttled write should complete before limiter wait")
+        .expect("read sink payload");
+        assert_eq!(observed, payload);
+
+        task.abort();
     }
 }

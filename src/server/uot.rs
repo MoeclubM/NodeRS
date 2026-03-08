@@ -203,12 +203,6 @@ async fn relay_client_to_udp(
             warn!(destination = %packet.destination, "dropping blocked UOT packet");
             continue;
         }
-        if let Some(limiter) = &context.limiter {
-            limiter.consume(packet.wire_len).await;
-            if context.control.is_cancelled() {
-                return Ok(());
-            }
-        }
         let sent = match &context.mode {
             RelayMode::Connect { .. } => tokio::select! {
                 _ = context.control.cancelled() => return Ok(()),
@@ -236,6 +230,12 @@ async fn relay_client_to_udp(
             );
         }
         context.traffic.record(packet.wire_len as u64);
+        if let Some(limiter) = &context.limiter {
+            tokio::select! {
+                _ = context.control.cancelled() => return Ok(()),
+                _ = limiter.consume(packet.wire_len) => {}
+            }
+        }
     }
 }
 
@@ -270,17 +270,17 @@ async fn relay_udp_to_client(
             &SocksAddr::Ip(source),
             &buffer[..payload_len],
         )?;
-        if let Some(limiter) = &context.limiter {
-            limiter.consume(encoded.len()).await;
-            if context.control.is_cancelled() {
-                return Ok(());
-            }
-        }
         tokio::select! {
             _ = context.control.cancelled() => return Ok(()),
             result = writer.write_all(&encoded) => result.context("write UOT response to AnyTLS stream")?,
         }
         context.traffic.record(encoded.len() as u64);
+        if let Some(limiter) = &context.limiter {
+            tokio::select! {
+                _ = context.control.cancelled() => return Ok(()),
+                _ = limiter.consume(encoded.len()) => {}
+            }
+        }
     }
 }
 

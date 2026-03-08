@@ -31,6 +31,11 @@ impl SharedRateLimiter {
         state.available_at = Instant::now();
     }
 
+    pub fn chunk_size(&self, max_bytes: usize) -> usize {
+        let state = self.state.lock().expect("rate limiter poisoned");
+        recommended_chunk_size(state.bytes_per_second, max_bytes)
+    }
+
     pub async fn consume(&self, bytes: usize) {
         if bytes == 0 {
             return;
@@ -58,6 +63,16 @@ impl SharedRateLimiter {
             tokio::time::sleep(wait).await;
         }
     }
+}
+
+fn recommended_chunk_size(bytes_per_second: u64, max_bytes: usize) -> usize {
+    if bytes_per_second == 0 {
+        return max_bytes.max(1);
+    }
+    let capped_max = max_bytes.max(1) as u64;
+    let minimum = capped_max.min(4 * 1024);
+    let suggested = (bytes_per_second / 20).max(minimum);
+    suggested.min(capped_max) as usize
 }
 
 fn reserve_duration(bytes: usize, bytes_per_second: u64) -> Duration {
@@ -91,5 +106,15 @@ mod tests {
         let state = limiter.state.lock().expect("rate limiter poisoned");
         assert_eq!(state.bytes_per_second, 2048);
         assert_eq!(state.burst_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn scales_chunk_size_with_rate() {
+        let limiter = SharedRateLimiter::new(125 * 1024);
+        assert_eq!(limiter.chunk_size(64 * 1024), 6_400);
+        assert_eq!(limiter.chunk_size(2 * 1024), 2 * 1024);
+
+        limiter.set_rate(10 * 1024 * 1024);
+        assert_eq!(limiter.chunk_size(64 * 1024), 64 * 1024);
     }
 }
