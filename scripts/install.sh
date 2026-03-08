@@ -1,20 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_REPOSITORY="__GITHUB_REPOSITORY__"
-if [[ "$DEFAULT_REPOSITORY" == "__GITHUB_REPOSITORY__" ]]; then
-  DEFAULT_REPOSITORY=""
-fi
-
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-REPOSITORY="${NODERS_ANYTLS_REPOSITORY:-$DEFAULT_REPOSITORY}"
-VERSION="${NODERS_ANYTLS_VERSION:-latest}"
 PREFIX="/usr/local"
-CONFIG_DIR="/etc/noders-anytls"
-STATE_DIR="/var/lib/noders-anytls"
+CONFIG_DIR="/etc/noders/anytls"
+STATE_DIR="/var/lib/noders/anytls"
 SERVICE_NAME="noders-anytls"
 SERVICE_USER="noders-anytls"
-ARCHIVE_PATH=""
 SELF_SIGNED_DOMAIN=""
 ACME_DOMAIN=""
 ACME_EMAIL=""
@@ -33,13 +25,14 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
+This installer is for Linux release packages only. Run it from the unpacked
+release directory that already contains `noders-anytls`, `config.example.toml`
+and `packaging/systemd/noders-anytls.service`.
+
 Options:
-  --repo <owner/repo>         GitHub repository used for release downloads
-  --version <tag>             Release tag to install, default: latest
-  --archive <path>            Install from a local release archive
   --prefix <path>             Binary installation prefix, default: /usr/local
-  --config-dir <path>         Config directory, default: /etc/noders-anytls
-  --state-dir <path>          Working directory, default: /var/lib/noders-anytls
+  --config-dir <path>         Config directory, default: /etc/noders/anytls
+  --state-dir <path>          Working directory, default: /var/lib/noders/anytls
   --panel-url <url>           Single-node Xboard API address
   --panel-token <token>       Single-node Xboard key/token
   --node-id <id>              Single-node Xboard node id
@@ -67,6 +60,13 @@ need_cmd() {
   }
 }
 
+require_linux() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "This installer only supports Linux release packages." >&2
+    exit 1
+  fi
+}
+
 normalize_paths() {
   CERT_PATH="${CONFIG_DIR%/}/cert.pem"
   KEY_PATH="${CONFIG_DIR%/}/key.pem"
@@ -75,18 +75,6 @@ normalize_paths() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --repo)
-        REPOSITORY="$2"
-        shift 2
-        ;;
-      --version)
-        VERSION="$2"
-        shift 2
-        ;;
-      --archive)
-        ARCHIVE_PATH="$2"
-        shift 2
-        ;;
       --prefix)
         PREFIX="$2"
         shift 2
@@ -163,82 +151,11 @@ validate_args() {
   fi
 }
 
-detect_asset_suffix() {
-  local os arch
-  os="$(uname -s)"
-  arch="$(uname -m)"
-  case "$os/$arch" in
-    Linux/x86_64) echo "linux-amd64" ;;
-    Darwin/x86_64) echo "macos-amd64" ;;
-    Darwin/arm64|Darwin/aarch64) echo "macos-arm64" ;;
-    *)
-      echo "Unsupported platform: $os/$arch" >&2
-      exit 1
-      ;;
-  esac
-}
-
 find_local_staging() {
-  if [[ -f "$SCRIPT_DIR/noders-anytls" || -f "$SCRIPT_DIR/noders-anytls.exe" ]]; then
-    printf '%s\n' "$SCRIPT_DIR"
-  fi
-}
-
-resolve_release_tag() {
-  if [[ "$VERSION" != "latest" ]]; then
-    printf '%s\n' "$VERSION"
-    return
-  fi
-  [[ -n "$REPOSITORY" ]] || {
-    echo "Repository is required when downloading a release; pass --repo owner/repo" >&2
-    exit 1
-  }
-  need_cmd curl
-  local tag
-  tag="$(curl -fsSL "https://api.github.com/repos/$REPOSITORY/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
-  [[ -n "$tag" ]] || {
-    echo "Unable to detect the latest release tag for $REPOSITORY" >&2
-    exit 1
-  }
-  printf '%s\n' "$tag"
-}
-
-download_release_archive() {
-  need_cmd curl
-  local tag suffix archive_name archive_path url tmpdir
-  tag="$1"
-  suffix="$2"
-  archive_name="noders-anytls-${tag}-${suffix}.tar.gz"
-  tmpdir="$(mktemp -d)"
-  archive_path="$tmpdir/$archive_name"
-  url="https://github.com/$REPOSITORY/releases/download/$tag/$archive_name"
-  echo "Downloading $url"
-  curl -fL "$url" -o "$archive_path"
-  printf '%s\n' "$archive_path"
-}
-
-extract_archive() {
-  local archive_path extract_dir
-  archive_path="$1"
-  need_cmd tar
-  extract_dir="$(mktemp -d)"
-  tar -xzf "$archive_path" -C "$extract_dir"
-  find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n1
-}
-
-binary_name_for_staging() {
-  local staging_dir
-  staging_dir="$1"
-  if [[ -f "$staging_dir/noders-anytls" ]]; then
-    printf '%s\n' "noders-anytls"
-    return
-  fi
-  if [[ -f "$staging_dir/noders-anytls.exe" ]]; then
-    printf '%s\n' "noders-anytls.exe"
-    return
-  fi
-  echo "Release staging directory does not contain noders-anytls binary" >&2
-  exit 1
+  [[ -f "$SCRIPT_DIR/noders-anytls" ]] || return 1
+  [[ -f "$SCRIPT_DIR/config.example.toml" ]] || return 1
+  [[ -f "$SCRIPT_DIR/packaging/systemd/noders-anytls.service" ]] || return 1
+  printf '%s\n' "$SCRIPT_DIR"
 }
 
 ensure_directories() {
@@ -387,12 +304,11 @@ write_default_config() {
   if [[ -n "$ACME_DOMAIN" ]]; then
     acme_enabled=true
     acme_domain="$ACME_DOMAIN"
-    account_key_path="${CONFIG_DIR%/}/acme-account.pem"
   else
     acme_enabled=false
     acme_domain="node.example.com"
-    account_key_path="${CONFIG_DIR%/}/acme-account.pem"
   fi
+  account_key_path="${CONFIG_DIR%/}/acme-account.pem"
   render_config_file \
     "$template_path" \
     "$CONFIG_DIR/config.toml" \
@@ -420,12 +336,11 @@ write_xboard_configs() {
     if [[ -n "$ACME_DOMAIN" ]]; then
       acme_enabled=true
       acme_domain="$ACME_DOMAIN"
-      account_key_path="${CONFIG_DIR%/}/acme-account.pem"
     else
       acme_enabled=false
       acme_domain="node.example.com"
-      account_key_path="${CONFIG_DIR%/}/acme-account.pem"
     fi
+    account_key_path="${CONFIG_DIR%/}/acme-account.pem"
     render_config_file \
       "$template_path" \
       "$config_path" \
@@ -465,7 +380,7 @@ render_service_file() {
 }
 
 install_service() {
-  local staging_dir spec panel_url panel_token node_id config_path unit_path service_unit
+  local staging_dir spec node_id config_path unit_path service_unit
   staging_dir="$1"
   [[ "$NO_SERVICE" -eq 0 ]] || return 0
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -492,7 +407,7 @@ install_service() {
   fi
 
   for spec in "${XBOARD_SPECS[@]}"; do
-    IFS='|' read -r panel_url panel_token node_id <<<"$spec"
+    IFS='|' read -r _ _ node_id <<<"$spec"
     config_path="$(node_config_path "$node_id")"
     service_unit="${SERVICE_NAME}-${node_id}"
     unit_path="/etc/systemd/system/${service_unit}.service"
@@ -535,24 +450,17 @@ EOF
 main() {
   parse_args "$@"
   validate_args
+  require_linux
   normalize_paths
 
-  local staging_dir tag suffix archive_path binary_name
-  staging_dir="$(find_local_staging || true)"
-  if [[ -z "$staging_dir" ]]; then
-    if [[ -n "$ARCHIVE_PATH" ]]; then
-      staging_dir="$(extract_archive "$ARCHIVE_PATH")"
-    else
-      suffix="$(detect_asset_suffix)"
-      tag="$(resolve_release_tag)"
-      archive_path="$(download_release_archive "$tag" "$suffix")"
-      staging_dir="$(extract_archive "$archive_path")"
-    fi
-  fi
+  local staging_dir
+  staging_dir="$(find_local_staging)" || {
+    echo "Release package files not found next to install.sh. Use the unpacked Linux release bundle." >&2
+    exit 1
+  }
 
-  binary_name="$(binary_name_for_staging "$staging_dir")"
   ensure_directories
-  install -m 0755 "$staging_dir/$binary_name" "$PREFIX/bin/noders-anytls"
+  install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
 
   if [[ ${#XBOARD_SPECS[@]} -eq 0 ]]; then
     if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
