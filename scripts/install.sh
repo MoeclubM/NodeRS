@@ -12,7 +12,7 @@ VERSION="latest"
 SELF_SIGNED_DOMAIN=""
 ACME_DOMAIN=""
 ACME_EMAIL=""
-ACME_CHALLENGE_LISTEN="0.0.0.0:80"
+ACME_CHALLENGE_LISTEN="[::]:80"
 TLS_SERVER_NAME=""
 DNS_RESOLVER="system"
 IP_STRATEGY="system"
@@ -65,7 +65,7 @@ Options:
   --dns-resolver <value>      Outbound DNS: system or a custom nameserver like 1.1.1.1
   --ip-strategy <value>       Outbound IP order: system, prefer_ipv4, prefer_ipv6
   --acme-challenge-listen <addr>
-                              HTTP-01 listener address, default: 0.0.0.0:80
+                              HTTP-01 listener address, default: [::]:80
   --uninstall                 Remove installed service(s), binary, and related files
   --all                       Used with --uninstall to remove all nodes and all data
   --no-service                Skip systemd service installation
@@ -308,7 +308,7 @@ render_config_file() {
     -e "s#enabled = false#enabled = $acme_enabled#g" \
     -e "s#email = \"admin@example.com\"#email = \"$escaped_acme_email\"#g" \
     -e "s#domain = \"node.example.com\"#domain = \"$escaped_acme_domain\"#g" \
-    -e "s#challenge_listen = \"0.0.0.0:80\"#challenge_listen = \"$escaped_acme_challenge\"#g" \
+    -e "s#challenge_listen = \"\[::\]:80\"#challenge_listen = \"$escaped_acme_challenge\"#g" \
     -e "s#account_key_path = \"acme-account.pem\"#account_key_path = \"$escaped_account_key\"#g" \
     "$template_path" > "$target_path"
 }
