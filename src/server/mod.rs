@@ -76,12 +76,10 @@ mod tests {
                 url: "https://panel.example.com".to_string(),
                 token: "token".to_string(),
                 node_id: 1,
-                node_type: "anytls".to_string(),
                 timeout_seconds: 15,
             },
             node: NodeConfig {
-                listen_ip: "0.0.0.0".to_string(),
-                node_type: "anytls".to_string(),
+                listen_ip: "::".to_string(),
             },
             tls: TlsConfig {
                 cert_path: PathBuf::from("cert.pem"),

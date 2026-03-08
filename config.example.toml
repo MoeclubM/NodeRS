@@ -2,12 +2,10 @@
 url = "https://xboard.example.com"
 token = "replace-me"
 node_id = 1
-node_type = "anytls"
 timeout_seconds = 15
 
 [node]
-listen_ip = "0.0.0.0"
-node_type = "anytls"
+listen_ip = "::"
 
 [tls]
 cert_path = "cert.pem"
@@ -24,7 +22,7 @@ enabled = false
 directory_url = "https://acme-v02.api.letsencrypt.org/directory"
 email = "admin@example.com"
 domain = "node.example.com"
-challenge_listen = "0.0.0.0:80"
+challenge_listen = "[::]:80"
 check_interval_seconds = 86400
 renew_before_days = 30
 account_key_path = "acme-account.pem"

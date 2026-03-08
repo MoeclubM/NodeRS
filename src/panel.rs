@@ -12,7 +12,6 @@ pub struct PanelClient {
     base_url: String,
     token: String,
     node_id: i64,
-    node_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +136,6 @@ impl PanelClient {
             base_url: config.url.trim_end_matches('/').to_string(),
             token: config.token.clone(),
             node_id: config.node_id,
-            node_type: config.node_type.clone(),
         })
     }
 
@@ -247,7 +245,7 @@ impl PanelClient {
         [
             ("token", self.token.clone()),
             ("node_id", self.node_id.to_string()),
-            ("node_type", self.node_type.clone()),
+            ("node_type", "anytls".to_string()),
         ]
     }
 

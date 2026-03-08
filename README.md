@@ -29,7 +29,7 @@ Rust implementation of an Xboard `UniProxy` AnyTLS node.
 - Certificate files are hot-reloaded from disk according to `tls.reload_interval_seconds`
 - Embedded ACME HTTP-01 is implemented in pure Rust under `src/acme.rs`; issued certificates are renewed before expiry and reloaded automatically
 - ACME renewal timing is computed from the current certificate `notAfter` field rather than a fixed timer guess
-- ACME `http-01` requires `tls.acme.challenge_listen` to be reachable by the CA, typically `0.0.0.0:80`
+- ACME `http-01` requires `tls.acme.challenge_listen` to be reachable by the CA, typically `[::]:80`
 - The Linux install script can bootstrap self-signed certificates with `--self-signed-domain`
 - External ACME tools such as `acme.sh` or `certbot` can renew `cert.pem` / `key.pem`, and the node will reload them automatically
 - Embedded ACME `dns-01` provider integration is not implemented yet

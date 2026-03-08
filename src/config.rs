@@ -23,9 +23,6 @@ impl AppConfig {
         let raw = fs::read_to_string(path).await?;
         let mut config: Self = toml::from_str(&raw).context("parse TOML config")?;
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        if config.node.node_type.is_empty() {
-            config.node.node_type = "anytls".to_string();
-        }
         resolve_path(base_dir, &mut config.tls.cert_path);
         resolve_path(base_dir, &mut config.tls.key_path);
         if let Some(acme) = &mut config.tls.acme {
@@ -40,8 +37,6 @@ pub struct PanelConfig {
     pub url: String,
     pub token: String,
     pub node_id: i64,
-    #[serde(default = "default_node_type")]
-    pub node_type: String,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
 }
@@ -50,8 +45,6 @@ pub struct PanelConfig {
 pub struct NodeConfig {
     #[serde(default = "default_listen_ip")]
     pub listen_ip: String,
-    #[serde(default = "default_node_type")]
-    pub node_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,16 +176,12 @@ impl Default for LogConfig {
     }
 }
 
-fn default_node_type() -> String {
-    "anytls".to_string()
-}
-
 fn default_timeout_seconds() -> u64 {
     15
 }
 
 fn default_listen_ip() -> String {
-    "0.0.0.0".to_string()
+    "::".to_string()
 }
 
 fn default_pull_interval_seconds() -> u64 {
@@ -216,7 +205,7 @@ fn default_acme_directory_url() -> String {
 }
 
 fn default_acme_challenge_listen() -> String {
-    "0.0.0.0:80".to_string()
+    "[::]:80".to_string()
 }
 
 fn default_acme_check_interval_seconds() -> u64 {
