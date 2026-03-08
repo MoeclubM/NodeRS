@@ -119,13 +119,21 @@ struct StreamState {
 
 #[derive(Clone)]
 struct FrameWriter {
-    tx: mpsc::Sender<FrameMessage>,
+    control_tx: mpsc::Sender<FrameMessage>,
+    data_tx: mpsc::Sender<FrameMessage>,
 }
 
 struct FrameMessage {
     cmd: u8,
     stream_id: u32,
     payload: Vec<u8>,
+    flush: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramePriority {
+    Control,
+    Data,
 }
 
 enum InboundMessage {
@@ -163,27 +171,35 @@ struct TcpStreamContext {
 
 impl FrameWriter {
     fn spawn(writer: WriteHalf<TlsStream>) -> Self {
-        let (tx, rx) = mpsc::channel(256);
+        let (control_tx, control_rx) = mpsc::channel(128);
+        let (data_tx, data_rx) = mpsc::channel(512);
         tokio::spawn(async move {
-            if let Err(error) = frame_writer_loop(writer, rx).await {
+            if let Err(error) = frame_writer_loop(writer, control_rx, data_rx).await {
                 debug!(%error, "session writer loop exited with error");
             }
         });
-        Self { tx }
+        Self {
+            control_tx,
+            data_tx,
+        }
     }
 
     async fn send(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
         if payload.len() > u16::MAX as usize {
             bail!("payload too large: {}", payload.len());
         }
-        self.tx
-            .send(FrameMessage {
-                cmd,
-                stream_id,
-                payload: payload.to_vec(),
-            })
-            .await
-            .map_err(|_| anyhow!("session writer closed"))
+        let tx = match frame_priority(cmd) {
+            FramePriority::Control => &self.control_tx,
+            FramePriority::Data => &self.data_tx,
+        };
+        tx.send(FrameMessage {
+            cmd,
+            stream_id,
+            payload: payload.to_vec(),
+            flush: should_flush_frame(cmd, payload.len()),
+        })
+        .await
+        .map_err(|_| anyhow!("session writer closed"))
     }
 }
 
@@ -732,9 +748,27 @@ async fn write_frame(
 
 async fn frame_writer_loop(
     mut writer: WriteHalf<TlsStream>,
-    mut rx: mpsc::Receiver<FrameMessage>,
+    mut control_rx: mpsc::Receiver<FrameMessage>,
+    mut data_rx: mpsc::Receiver<FrameMessage>,
 ) -> anyhow::Result<()> {
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            frame = control_rx.recv() => match frame {
+                Some(frame) => frame,
+                None => match data_rx.recv().await {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            },
+            frame = data_rx.recv() => match frame {
+                Some(frame) => frame,
+                None => match control_rx.recv().await {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            },
+        };
         let payload_len = frame.payload.len();
         if payload_len > u16::MAX as usize {
             bail!("payload too large: {payload_len}");
@@ -753,8 +787,26 @@ async fn frame_writer_loop(
                 .await
                 .context("write session frame payload")?;
         }
+        if frame.flush {
+            writer.flush().await.context("flush session frame")?;
+        }
     }
     Ok(())
+}
+
+fn frame_priority(cmd: u8) -> FramePriority {
+    if cmd == CMD_PSH {
+        FramePriority::Data
+    } else {
+        FramePriority::Control
+    }
+}
+
+fn should_flush_frame(cmd: u8, payload_len: usize) -> bool {
+    match frame_priority(cmd) {
+        FramePriority::Control => true,
+        FramePriority::Data => payload_len <= 4096,
+    }
 }
 
 fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
@@ -789,6 +841,20 @@ mod tests {
         let settings = parse_settings(b"v=2\nclient=test");
         assert_eq!(settings.get("v"), Some(&"2".to_string()));
         assert_eq!(settings.get("client"), Some(&"test".to_string()));
+    }
+
+    #[test]
+    fn prioritizes_control_frames_over_payload_frames() {
+        assert_eq!(frame_priority(CMD_PSH), FramePriority::Data);
+        assert_eq!(frame_priority(CMD_SYNACK), FramePriority::Control);
+        assert_eq!(frame_priority(CMD_FIN), FramePriority::Control);
+    }
+
+    #[test]
+    fn flushes_control_and_small_payload_frames() {
+        assert!(should_flush_frame(CMD_SYNACK, 0));
+        assert!(should_flush_frame(CMD_PSH, 1024));
+        assert!(!should_flush_frame(CMD_PSH, 8192));
     }
 
     #[tokio::test]
