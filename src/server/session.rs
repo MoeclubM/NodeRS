@@ -52,14 +52,12 @@ pub async fn serve_connection(
     let lease = accounting.open_session(&user, source)?;
     let control = lease.control();
     let activity = ActivityTracker::new();
-    let limiter = lease.limiter();
     let (reader, writer) = split(stream);
     let session = Session {
         user: user.clone(),
         lease,
         accounting: accounting.clone(),
         padding,
-        limiter,
         route_rules,
         outbound,
         activity,
@@ -104,7 +102,6 @@ struct Session {
     lease: SessionLease,
     accounting: Arc<Accounting>,
     padding: PaddingScheme,
-    limiter: Option<Arc<SharedRateLimiter>>,
     route_rules: RouteRules,
     outbound: OutboundConfig,
     activity: Arc<ActivityTracker>,
@@ -346,16 +343,8 @@ impl Session {
                 .get(&header.stream_id)
                 .and_then(|stream| stream.inbound.clone())
         };
-        let payload_len = payload.len();
         if let Some(inbound) = inbound {
             let _ = inbound.send(InboundMessage::Data(payload)).await;
-        }
-        if let Some(limiter) = &self.limiter {
-            let control = self.lease.control();
-            tokio::select! {
-                _ = control.cancelled() => return Ok(()),
-                _ = limiter.consume(payload_len) => {}
-            }
         }
         Ok(())
     }
@@ -384,7 +373,7 @@ impl Session {
         let context = StreamContext {
             writer: writer.clone(),
             control: control.clone(),
-            limiter: self.lease.limiter(),
+            limiter: None,
             route_rules: self.route_rules.clone(),
             outbound: self.outbound.clone(),
             activity: self.activity.clone(),
