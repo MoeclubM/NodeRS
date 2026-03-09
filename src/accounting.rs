@@ -103,16 +103,11 @@ pub struct SessionLease {
     ip: String,
     session_id: u64,
     control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
 }
 
 impl SessionLease {
     pub fn control(&self) -> Arc<SessionControl> {
         self.control.clone()
-    }
-
-    pub fn limiter(&self) -> Option<Arc<SharedRateLimiter>> {
-        self.limiter.clone()
     }
 }
 
@@ -255,7 +250,7 @@ impl Accounting {
 
         let session_id = self.session_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let control = SessionControl::new();
-        let limiter = self
+        let _limiter = self
             .speed_limiters
             .lock()
             .expect("speed limiter lock poisoned")
@@ -281,7 +276,6 @@ impl Accounting {
             ip,
             session_id,
             control,
-            limiter,
         })
     }
 
