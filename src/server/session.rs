@@ -39,6 +39,7 @@ const CMD_HEART_RESPONSE: u8 = 9;
 const CMD_SERVER_SETTINGS: u8 = 10;
 const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
 const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
+const UPLOAD_BATCH_SIZE: usize = 256 * 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
@@ -206,6 +207,15 @@ impl ChannelReader {
             finished: false,
         }
     }
+
+    fn into_parts(self) -> (Vec<u8>, mpsc::Receiver<InboundMessage>, bool) {
+        let pending = if self.offset < self.current.len() {
+            self.current[self.offset..].to_vec()
+        } else {
+            Vec::new()
+        };
+        (pending, self.rx, self.finished)
+    }
 }
 
 impl AsyncRead for ChannelReader {
@@ -214,17 +224,22 @@ impl AsyncRead for ChannelReader {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let mut wrote_any = false;
         loop {
             if self.offset < self.current.len() {
                 let remaining = &self.current[self.offset..];
                 let to_copy = remaining.len().min(buf.remaining());
                 buf.put_slice(&remaining[..to_copy]);
+                wrote_any = true;
                 self.offset += to_copy;
                 if self.offset >= self.current.len() {
                     self.current.clear();
                     self.offset = 0;
                 }
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
 
             if self.finished {
@@ -240,6 +255,7 @@ impl AsyncRead for ChannelReader {
                     self.finished = true;
                     return Poll::Ready(Ok(()));
                 }
+                Poll::Pending if wrote_any => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -331,7 +347,13 @@ impl Session {
                 .and_then(|stream| stream.inbound.clone())
         };
         if let Some(inbound) = inbound {
-            let _ = inbound.send(InboundMessage::Data(payload)).await;
+            match inbound.try_send(InboundMessage::Data(payload)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
+                    let _ = inbound.send(message).await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
         Ok(())
     }
@@ -646,18 +668,19 @@ async fn handle_stream(
 }
 
 async fn handle_tcp_stream(
-    mut app_side: ChannelReader,
+    app_side: ChannelReader,
     stream: &mut TcpStream,
     context: TcpStreamContext,
 ) -> anyhow::Result<(u64, u64)> {
     let (mut read_b, mut write_b) = stream.split();
-    let upload = pump_copy(
-        &mut app_side,
+    let (pending, inbound_rx, inbound_finished) = app_side.into_parts();
+    let upload = pump_inbound_to_remote(
+        pending,
+        inbound_rx,
+        inbound_finished,
         &mut write_b,
         context.control.clone(),
-        None,
         Some(context.upload_traffic),
-        None,
     );
     let download = pump_remote_to_client(
         &mut read_b,
@@ -669,6 +692,86 @@ async fn handle_tcp_stream(
         Some(context.activity),
     );
     tokio::try_join!(upload, download)
+}
+
+async fn pump_inbound_to_remote<W>(
+    mut pending: Vec<u8>,
+    mut rx: mpsc::Receiver<InboundMessage>,
+    mut finished: bool,
+    writer: &mut W,
+    control: Arc<SessionControl>,
+    traffic: Option<TrafficRecorder>,
+) -> anyhow::Result<u64>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = Vec::with_capacity(UPLOAD_BATCH_SIZE);
+    let mut total = 0u64;
+    loop {
+        if control.is_cancelled() {
+            return Ok(total);
+        }
+        if !pending.is_empty() {
+            buffer.extend_from_slice(&pending);
+            pending.clear();
+        }
+        while buffer.len() < UPLOAD_BATCH_SIZE && !finished {
+            match rx.try_recv() {
+                Ok(InboundMessage::Data(chunk)) => {
+                    if buffer.is_empty() || buffer.len() + chunk.len() <= UPLOAD_BATCH_SIZE {
+                        buffer.extend_from_slice(&chunk);
+                    } else {
+                        pending = chunk;
+                        break;
+                    }
+                }
+                Ok(InboundMessage::Fin) => {
+                    finished = true;
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if buffer.is_empty() {
+            if finished {
+                let _ = writer.shutdown().await;
+                return Ok(total);
+            }
+            match tokio::select! {
+                _ = control.cancelled() => return Ok(total),
+                message = rx.recv() => message,
+            } {
+                Some(InboundMessage::Data(chunk)) => {
+                    pending = chunk;
+                    continue;
+                }
+                Some(InboundMessage::Fin) | None => {
+                    let _ = writer.shutdown().await;
+                    return Ok(total);
+                }
+            }
+        }
+        tokio::select! {
+            _ = control.cancelled() => return Ok(total),
+            result = writer.write_all(&buffer) => {
+                result.context("write throttled chunk")?;
+            }
+        }
+        let transferred = buffer.len() as u64;
+        total += transferred;
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.record(transferred);
+        }
+        buffer.clear();
+        if finished && pending.is_empty() {
+            let _ = writer.shutdown().await;
+            return Ok(total);
+        }
+    }
 }
 
 async fn pump_copy<R, W>(
@@ -810,7 +913,7 @@ fn is_eof(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn parses_settings_lines() {
@@ -853,7 +956,6 @@ mod tests {
                 .await
             }
         });
-
         source_writer
             .write_all(b"hello")
             .await
@@ -867,5 +969,25 @@ mod tests {
         drop(source_writer);
         let transferred = task.await.expect("join pump").expect("pump succeeds");
         assert_eq!(transferred, 5);
+    }
+
+    #[tokio::test]
+    async fn channel_reader_coalesces_multiple_chunks() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(InboundMessage::Data(b"hello".to_vec()))
+            .await
+            .expect("send first chunk");
+        tx.send(InboundMessage::Data(b"world".to_vec()))
+            .await
+            .expect("send second chunk");
+        drop(tx);
+
+        let mut reader = ChannelReader::new(rx);
+        let mut buf = [0u8; 10];
+        reader
+            .read_exact(&mut buf)
+            .await
+            .expect("read combined chunk");
+        assert_eq!(&buf, b"helloworld");
     }
 }
