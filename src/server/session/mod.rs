@@ -1,14 +1,12 @@
-use anyhow::{Context, anyhow, bail, ensure};
-use md5::{Digest as Md5Digest, Md5};
-use std::collections::{HashMap, VecDeque};
-use std::io::IoSlice;
+mod channel;
+mod frame;
+mod io;
+mod writer;
+
+use anyhow::{Context, anyhow, bail};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
-use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf, split,
-};
+use tokio::io::{AsyncReadExt, ReadHalf, split};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -26,23 +24,14 @@ use super::socksaddr::SocksAddr;
 use super::traffic::TrafficRecorder;
 use super::transport;
 use super::uot;
-
-const CMD_WASTE: u8 = 0;
-const CMD_SYN: u8 = 1;
-const CMD_PSH: u8 = 2;
-const CMD_FIN: u8 = 3;
-const CMD_SETTINGS: u8 = 4;
-const CMD_ALERT: u8 = 5;
-const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
-const CMD_SYNACK: u8 = 7;
-const CMD_HEART_REQUEST: u8 = 8;
-const CMD_HEART_RESPONSE: u8 = 9;
-const CMD_SERVER_SETTINGS: u8 = 10;
-const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
-const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
-const UPLOAD_BATCH_SIZE: usize = 128 * 1024;
-const UPLOAD_BATCH_IOVECS: usize = 32;
-const STREAM_INBOUND_QUEUE_CAPACITY: usize = 2048;
+use channel::{ChannelReader, InboundMessage};
+use frame::{
+    CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
+    CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
+    STREAM_INBOUND_QUEUE_CAPACITY, is_eof, padding_md5, parse_settings,
+};
+use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
+use writer::{FrameWriter, write_frame};
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
@@ -120,29 +109,12 @@ struct Session {
 struct SessionState {
     received_settings: bool,
     peer_version: u8,
-    streams: HashMap<u32, StreamState>,
+    streams: std::collections::HashMap<u32, StreamState>,
 }
 
 struct StreamState {
     inbound: Option<mpsc::Sender<InboundMessage>>,
     task: JoinHandle<()>,
-}
-
-#[derive(Clone)]
-struct FrameWriter {
-    inner: Arc<Mutex<WriteHalf<TlsStream>>>,
-}
-
-enum InboundMessage {
-    Data(Vec<u8>),
-    Fin,
-}
-
-struct ChannelReader {
-    rx: mpsc::Receiver<InboundMessage>,
-    current: Vec<u8>,
-    offset: usize,
-    finished: bool,
 }
 
 #[derive(Clone)]
@@ -166,94 +138,6 @@ struct TcpStreamContext {
     activity: Arc<ActivityTracker>,
     upload_traffic: TrafficRecorder,
     download_traffic: TrafficRecorder,
-}
-
-impl FrameWriter {
-    fn spawn(writer: WriteHalf<TlsStream>) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(writer)),
-        }
-    }
-
-    async fn send(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
-        if payload.len() > MAX_FRAME_PAYLOAD_LEN {
-            bail!("payload too large: {}", payload.len());
-        }
-        let mut header = [0u8; 7];
-        header[0] = cmd;
-        header[1..5].copy_from_slice(&stream_id.to_be_bytes());
-        header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        let mut writer = self.inner.lock().await;
-        write_frame_parts(&mut *writer, &header, payload).await?;
-        if should_flush_frame(cmd, payload.len()) {
-            writer.flush().await.context("flush session frame")?;
-        }
-        Ok(())
-    }
-}
-
-impl ChannelReader {
-    fn new(rx: mpsc::Receiver<InboundMessage>) -> Self {
-        Self {
-            rx,
-            current: Vec::new(),
-            offset: 0,
-            finished: false,
-        }
-    }
-
-    fn into_parts(self) -> (Vec<u8>, mpsc::Receiver<InboundMessage>, bool) {
-        let pending = if self.offset < self.current.len() {
-            self.current[self.offset..].to_vec()
-        } else {
-            Vec::new()
-        };
-        (pending, self.rx, self.finished)
-    }
-}
-
-impl AsyncRead for ChannelReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut wrote_any = false;
-        loop {
-            if self.offset < self.current.len() {
-                let remaining = &self.current[self.offset..];
-                let to_copy = remaining.len().min(buf.remaining());
-                buf.put_slice(&remaining[..to_copy]);
-                wrote_any = true;
-                self.offset += to_copy;
-                if self.offset >= self.current.len() {
-                    self.current.clear();
-                    self.offset = 0;
-                }
-                if buf.remaining() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
-            }
-
-            if self.finished {
-                return Poll::Ready(Ok(()));
-            }
-
-            match self.rx.poll_recv(cx) {
-                Poll::Ready(Some(InboundMessage::Data(chunk))) => {
-                    self.current = chunk;
-                    self.offset = 0;
-                }
-                Poll::Ready(Some(InboundMessage::Fin)) | Poll::Ready(None) => {
-                    self.finished = true;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending if wrote_any => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
 }
 
 impl Session {
@@ -504,13 +388,6 @@ impl Session {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FrameHeader {
-    cmd: u8,
-    stream_id: u32,
-    length: u16,
-}
-
 async fn handle_stream(
     stream_id: u32,
     mut app_side: ChannelReader,
@@ -688,357 +565,51 @@ async fn handle_tcp_stream(
     tokio::try_join!(upload, download)
 }
 
-async fn pump_inbound_to_remote<W>(
-    mut pending: Vec<u8>,
-    mut rx: mpsc::Receiver<InboundMessage>,
-    mut finished: bool,
-    writer: &mut W,
-    control: Arc<SessionControl>,
-    traffic: Option<TrafficRecorder>,
-) -> anyhow::Result<u64>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(UPLOAD_BATCH_IOVECS);
-    let mut front_offset = 0usize;
-    let mut queued_bytes = 0usize;
-    let mut total = 0u64;
-    loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
-        if !pending.is_empty() {
-            queued_bytes += pending.len();
-            chunks.push_back(std::mem::take(&mut pending));
-            front_offset = 0;
-        }
-        while queued_bytes < UPLOAD_BATCH_SIZE && chunks.len() < UPLOAD_BATCH_IOVECS && !finished {
-            match rx.try_recv() {
-                Ok(InboundMessage::Data(chunk)) => {
-                    if chunks.is_empty()
-                        || (queued_bytes + chunk.len() <= UPLOAD_BATCH_SIZE
-                            && chunks.len() < UPLOAD_BATCH_IOVECS)
-                    {
-                        queued_bytes += chunk.len();
-                        chunks.push_back(chunk);
-                    } else {
-                        pending = chunk;
-                        break;
-                    }
-                }
-                Ok(InboundMessage::Fin) => {
-                    finished = true;
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
-            }
-        }
-        if chunks.is_empty() {
-            if finished {
-                let _ = writer.shutdown().await;
-                return Ok(total);
-            }
-            match tokio::select! {
-                _ = control.cancelled() => return Ok(total),
-                message = rx.recv() => message,
-            } {
-                Some(InboundMessage::Data(chunk)) => {
-                    pending = chunk;
-                    continue;
-                }
-                Some(InboundMessage::Fin) | None => {
-                    let _ = writer.shutdown().await;
-                    return Ok(total);
-                }
-            }
-        }
-        let written = tokio::select! {
-            _ = control.cancelled() => return Ok(total),
-            result = write_chunk_batch(writer, &chunks, front_offset) => result?,
-        };
-        ensure!(written > 0, "write inbound batch returned zero bytes");
-        advance_chunk_batch(&mut chunks, &mut front_offset, written);
-        queued_bytes = queued_bytes.saturating_sub(written);
-        let transferred = written as u64;
-        total += transferred;
-        if let Some(traffic) = traffic.as_ref() {
-            traffic.record(transferred);
-        }
-        if finished && pending.is_empty() && chunks.is_empty() {
-            let _ = writer.shutdown().await;
-            return Ok(total);
-        }
-    }
-}
-
-async fn pump_copy<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
-    traffic: Option<TrafficRecorder>,
-    activity: Option<Arc<ActivityTracker>>,
-) -> anyhow::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
-    let mut total = 0u64;
-    loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
-        let chunk_len = limiter
-            .as_ref()
-            .map(|limiter| limiter.chunk_size(buffer.len()))
-            .unwrap_or(buffer.len());
-        let read = tokio::select! {
-            _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer[..chunk_len]) => read.context("read throttled chunk")?,
-        };
-        if read == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(total);
-        }
-        tokio::select! {
-            _ = control.cancelled() => return Ok(total),
-            result = writer.write_all(&buffer[..read]) => {
-                result.context("write throttled chunk")?;
-            }
-        }
-        let transferred = read as u64;
-        total += transferred;
-        if let Some(traffic) = traffic.as_ref() {
-            traffic.record(transferred);
-        }
-        if let Some(activity) = activity.as_ref() {
-            activity.record();
-        }
-        if let Some(limiter) = &limiter {
-            tokio::select! {
-                _ = control.cancelled() => return Ok(total),
-                _ = limiter.consume(read) => {}
-            }
-        }
-    }
-}
-
-async fn pump_remote_to_client<R>(
-    reader: &mut R,
-    writer: FrameWriter,
-    stream_id: u32,
-    control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
-    traffic: Option<TrafficRecorder>,
-    activity: Option<Arc<ActivityTracker>>,
-) -> anyhow::Result<u64>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
-    let mut total = 0u64;
-    loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
-        let chunk_len = limiter
-            .as_ref()
-            .map(|limiter| limiter.chunk_size(buffer.len()))
-            .unwrap_or(buffer.len());
-        let read = tokio::select! {
-            _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer[..chunk_len]) => read?,
-        };
-        if read == 0 {
-            write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
-            return Ok(total);
-        }
-        write_frame(&writer, CMD_PSH, stream_id, &buffer[..read]).await?;
-        let transferred = read as u64;
-        total += transferred;
-        if let Some(traffic) = traffic.as_ref() {
-            traffic.record(transferred);
-        }
-        if let Some(activity) = activity.as_ref() {
-            activity.record();
-        }
-        if let Some(limiter) = &limiter {
-            tokio::select! {
-                _ = control.cancelled() => return Ok(total),
-                _ = limiter.consume(read) => {}
-            }
-        }
-    }
-}
-
-async fn write_frame(
-    writer: &FrameWriter,
-    cmd: u8,
-    stream_id: u32,
-    payload: &[u8],
-) -> anyhow::Result<()> {
-    writer.send(cmd, stream_id, payload).await
-}
-
-async fn write_chunk_batch<W>(
-    writer: &mut W,
-    chunks: &VecDeque<Vec<u8>>,
-    front_offset: usize,
-) -> anyhow::Result<usize>
-where
-    W: AsyncWrite + Unpin,
-{
-    if chunks.is_empty() {
-        return Ok(0);
-    }
-    if writer.is_write_vectored() {
-        let slices = chunk_batch_slices(chunks, front_offset);
-        if slices.is_empty() {
-            return Ok(0);
-        }
-        return writer
-            .write_vectored(&slices)
-            .await
-            .context("write inbound chunk batch");
-    }
-
-    let Some(front) = chunks.front() else {
-        return Ok(0);
-    };
-    writer
-        .write(&front[front_offset..])
-        .await
-        .context("write inbound chunk")
-}
-
-async fn write_frame_parts<W>(
-    writer: &mut W,
-    header: &[u8; 7],
-    payload: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut header_offset = 0usize;
-    let mut payload_offset = 0usize;
-    while header_offset < header.len() || payload_offset < payload.len() {
-        let written = if writer.is_write_vectored() {
-            let mut slices = [IoSlice::new(&[]), IoSlice::new(&[])];
-            let mut count = 0usize;
-            if header_offset < header.len() {
-                slices[count] = IoSlice::new(&header[header_offset..]);
-                count += 1;
-            }
-            if payload_offset < payload.len() {
-                slices[count] = IoSlice::new(&payload[payload_offset..]);
-                count += 1;
-            }
-            writer
-                .write_vectored(&slices[..count])
-                .await
-                .context("write session frame")?
-        } else if header_offset < header.len() {
-            writer
-                .write(&header[header_offset..])
-                .await
-                .context("write session frame header")?
-        } else {
-            writer
-                .write(&payload[payload_offset..])
-                .await
-                .context("write session frame payload")?
-        };
-        ensure!(written > 0, "write session frame returned zero bytes");
-        if header_offset < header.len() {
-            let header_remaining = header.len() - header_offset;
-            let header_written = written.min(header_remaining);
-            header_offset += header_written;
-            payload_offset += written - header_written;
-        } else {
-            payload_offset += written;
-        }
-    }
-    Ok(())
-}
-
-fn chunk_batch_slices(chunks: &VecDeque<Vec<u8>>, front_offset: usize) -> Vec<IoSlice<'_>> {
-    let mut slices = Vec::with_capacity(chunks.len().min(UPLOAD_BATCH_IOVECS));
-    let mut remaining = UPLOAD_BATCH_SIZE;
-    for (index, chunk) in chunks.iter().enumerate() {
-        if slices.len() >= UPLOAD_BATCH_IOVECS || remaining == 0 {
-            break;
-        }
-        let slice = if index == 0 {
-            &chunk[front_offset..]
-        } else {
-            chunk.as_slice()
-        };
-        if slice.is_empty() {
-            continue;
-        }
-        let used = slice.len().min(remaining);
-        slices.push(IoSlice::new(&slice[..used]));
-        remaining -= used;
-    }
-    slices
-}
-
-fn advance_chunk_batch(
-    chunks: &mut VecDeque<Vec<u8>>,
-    front_offset: &mut usize,
-    mut written: usize,
-) {
-    while written > 0 {
-        let Some(front) = chunks.front() else {
-            *front_offset = 0;
-            break;
-        };
-        let remaining = front.len().saturating_sub(*front_offset);
-        if written < remaining {
-            *front_offset += written;
-            break;
-        }
-        written -= remaining;
-        chunks.pop_front();
-        *front_offset = 0;
-    }
-}
-
-fn should_flush_frame(_cmd: u8, _payload_len: usize) -> bool {
-    !matches!(_cmd, CMD_PSH) || _payload_len <= SMALL_DATA_FRAME_FLUSH_THRESHOLD
-}
-
-fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
-}
-
-fn padding_md5(lines: &[String]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(lines.join("\n").as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn is_eof(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::channel::{ChannelReader, InboundMessage};
+    use super::frame::{
+        CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, parse_settings, should_flush_frame,
+    };
+    use super::io::{advance_chunk_batch, chunk_batch_slices, coalesce_download_reads, pump_copy};
+    use crate::accounting::{Accounting, SessionControl};
+    use crate::server::traffic::TrafficRecorder;
+    use std::collections::VecDeque as TestVecDeque;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::sync::mpsc;
+
+    struct SegmentedReader {
+        segments: TestVecDeque<Vec<u8>>,
+    }
+
+    impl SegmentedReader {
+        fn new(segments: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                segments: segments.into_iter().collect(),
+            }
+        }
+    }
+
+    impl AsyncRead for SegmentedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let Some(segment) = self.segments.pop_front() else {
+                return Poll::Pending;
+            };
+            let to_copy = segment.len().min(buf.remaining());
+            buf.put_slice(&segment[..to_copy]);
+            if to_copy < segment.len() {
+                self.segments.push_front(segment[to_copy..].to_vec());
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn parses_settings_lines() {
@@ -1116,9 +687,29 @@ mod tests {
         assert_eq!(&buf, b"helloworld");
     }
 
+    #[tokio::test]
+    async fn coalesces_immediately_available_download_reads() {
+        let mut reader = SegmentedReader::new([vec![1u8; 1024], vec![2u8; 1024]]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first)
+            .await
+            .expect("coalesce available reads");
+        assert_eq!(filled, 2048);
+        assert!(!saw_eof);
+        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
     #[test]
     fn advance_chunk_batch_handles_partial_write() {
-        let mut chunks = VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
+        let mut chunks = std::collections::VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
         let mut front_offset = 0;
         advance_chunk_batch(&mut chunks, &mut front_offset, 7);
         assert_eq!(chunks.len(), 1);
@@ -1128,7 +719,7 @@ mod tests {
 
     #[test]
     fn chunk_batch_slices_respects_front_offset() {
-        let chunks = VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
+        let chunks = std::collections::VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
         let slices = chunk_batch_slices(&chunks, 2);
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].len(), 3);
