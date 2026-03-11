@@ -125,6 +125,12 @@ pub struct MemoryStat {
     pub used: u64,
 }
 
+#[derive(Debug)]
+pub enum TrafficReportError {
+    Definite(anyhow::Error),
+    Uncertain(anyhow::Error),
+}
+
 impl PanelClient {
     pub fn new(config: &PanelConfig) -> anyhow::Result<Self> {
         let client = Client::builder()
@@ -166,7 +172,10 @@ impl PanelClient {
         response.json().await.context("decode alive list")
     }
 
-    pub async fn report_traffic(&self, traffic: HashMap<i64, [u64; 2]>) -> anyhow::Result<()> {
+    pub async fn report_traffic(
+        &self,
+        traffic: HashMap<i64, [u64; 2]>,
+    ) -> Result<(), TrafficReportError> {
         if traffic.is_empty() {
             return Ok(());
         }
@@ -177,8 +186,8 @@ impl PanelClient {
             .json(&traffic)
             .send()
             .await
-            .context("report traffic")?;
-        self.ensure_success(response.status(), "report traffic")
+            .map_err(classify_send_error)?;
+        classify_traffic_status(response.status())
     }
 
     pub async fn report_alive(&self, alive: HashMap<i64, Vec<String>>) -> anyhow::Result<()> {
@@ -268,6 +277,33 @@ where
     T: Deserialize<'de> + Default,
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn classify_send_error(error: reqwest::Error) -> TrafficReportError {
+    let error = anyhow::Error::new(error).context("report traffic");
+    if error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .is_some_and(|reqwest| reqwest.is_connect())
+    {
+        TrafficReportError::Definite(error)
+    } else {
+        TrafficReportError::Uncertain(error)
+    }
+}
+
+fn classify_traffic_status(status: StatusCode) -> Result<(), TrafficReportError> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_client_error() {
+        Err(TrafficReportError::Definite(anyhow::anyhow!(
+            "Xboard report traffic failed with status {status}"
+        )))
+    } else {
+        Err(TrafficReportError::Uncertain(anyhow::anyhow!(
+            "Xboard report traffic failed with status {status}"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +396,18 @@ mod tests {
         .expect("parse user");
         assert_eq!(user.speed_limit, 0);
         assert_eq!(user.device_limit, 0);
+    }
+
+    #[test]
+    fn classifies_traffic_status_by_certainty() {
+        assert!(classify_traffic_status(StatusCode::OK).is_ok());
+        assert!(matches!(
+            classify_traffic_status(StatusCode::BAD_REQUEST),
+            Err(TrafficReportError::Definite(_))
+        ));
+        assert!(matches!(
+            classify_traffic_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(TrafficReportError::Uncertain(_))
+        ));
     }
 }
