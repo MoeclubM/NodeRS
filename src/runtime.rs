@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use crate::accounting::Accounting;
 use crate::acme;
 use crate::config::AppConfig;
-use crate::panel::{FetchState, NodeConfigResponse, PanelClient};
+use crate::panel::{FetchState, NodeConfigResponse, PanelClient, TrafficReportError};
 use crate::server::{EffectiveNodeConfig, ServerController};
 use crate::status;
 
@@ -154,9 +154,24 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             ))
             .await;
             let traffic = report_accounting.snapshot_traffic(min_traffic_bytes);
-            if let Err(error) = report_panel.report_traffic(traffic.clone()).await {
-                report_accounting.restore_traffic(&traffic);
-                warn!(%error, "traffic report failed");
+            match report_panel.report_traffic(traffic.clone()).await {
+                Ok(()) => {}
+                Err(TrafficReportError::Definite(error)) => {
+                    report_accounting.restore_traffic(&traffic);
+                    warn!(%error, "traffic report failed before delivery; restored local counters");
+                }
+                Err(TrafficReportError::Uncertain(error)) => {
+                    let dropped_bytes = traffic
+                        .values()
+                        .map(|[upload, download]| upload + download)
+                        .sum::<u64>();
+                    warn!(
+                        %error,
+                        dropped_bytes,
+                        users = traffic.len(),
+                        "traffic report result was ambiguous; not retrying to avoid double-counting"
+                    );
+                }
             }
             let alive = report_accounting.snapshot_alive();
             if let Err(error) = report_panel.report_alive(alive).await {
