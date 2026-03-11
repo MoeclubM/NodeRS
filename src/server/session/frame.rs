@@ -14,12 +14,29 @@ pub(super) const CMD_HEART_REQUEST: u8 = 8;
 pub(super) const CMD_HEART_RESPONSE: u8 = 9;
 pub(super) const CMD_SERVER_SETTINGS: u8 = 10;
 pub(super) const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
+pub(super) const SMALL_PAYLOAD_LEN: usize = 1024;
+pub(super) const MEDIUM_PAYLOAD_LEN: usize = 16 * 1024;
 pub(super) const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
-pub(super) const DOWNLOAD_COALESCE_TRIGGER: usize = 4 * 1024;
-pub(super) const DOWNLOAD_COALESCE_TARGET: usize = 16 * 1024;
-pub(super) const UPLOAD_BATCH_SIZE: usize = 128 * 1024;
-pub(super) const UPLOAD_BATCH_IOVECS: usize = 32;
-pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 2048;
+pub(super) const SMALL_DOWNLOAD_COALESCE_TARGET: usize = 24 * 1024;
+pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
+pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
+pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 96;
+pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
+pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
+pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PayloadTier {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct UploadBatchPolicy {
+    pub(super) max_bytes: usize,
+    pub(super) max_iovecs: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FrameHeader {
@@ -30,6 +47,34 @@ pub(super) struct FrameHeader {
 
 pub(super) fn should_flush_frame(cmd: u8, payload_len: usize) -> bool {
     !matches!(cmd, CMD_PSH) || payload_len <= SMALL_DATA_FRAME_FLUSH_THRESHOLD
+}
+
+pub(super) fn payload_tier(payload_len: usize) -> PayloadTier {
+    if payload_len <= SMALL_PAYLOAD_LEN {
+        PayloadTier::Small
+    } else if payload_len <= MEDIUM_PAYLOAD_LEN {
+        PayloadTier::Medium
+    } else {
+        PayloadTier::Large
+    }
+}
+
+pub(super) fn upload_batch_policy(first_chunk_len: usize) -> UploadBatchPolicy {
+    match payload_tier(first_chunk_len) {
+        PayloadTier::Small => UploadBatchPolicy {
+            max_bytes: SMALL_UPLOAD_BATCH_SIZE,
+            max_iovecs: SMALL_UPLOAD_BATCH_IOVECS,
+        },
+        PayloadTier::Medium | PayloadTier::Large => UploadBatchPolicy {
+            max_bytes: DEFAULT_UPLOAD_BATCH_SIZE,
+            max_iovecs: DEFAULT_UPLOAD_BATCH_IOVECS,
+        },
+    }
+}
+
+pub(super) fn download_coalesce_target(initial_read: usize) -> Option<usize> {
+    (initial_read <= SMALL_DATA_FRAME_FLUSH_THRESHOLD)
+        .then_some(SMALL_DOWNLOAD_COALESCE_TARGET.min(MAX_FRAME_PAYLOAD_LEN))
 }
 
 pub(super) fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {

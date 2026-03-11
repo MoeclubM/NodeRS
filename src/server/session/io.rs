@@ -15,8 +15,8 @@ use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::InboundMessage;
 use super::frame::{
-    CMD_FIN, CMD_PSH, DOWNLOAD_COALESCE_TARGET, DOWNLOAD_COALESCE_TRIGGER, MAX_FRAME_PAYLOAD_LEN,
-    SMALL_DATA_FRAME_FLUSH_THRESHOLD, UPLOAD_BATCH_IOVECS, UPLOAD_BATCH_SIZE,
+    CMD_FIN, CMD_PSH, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, download_coalesce_target, upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame};
 
@@ -31,7 +31,7 @@ pub(super) async fn pump_inbound_to_remote<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(UPLOAD_BATCH_IOVECS);
+    let mut chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(MAX_UPLOAD_BATCH_IOVECS);
     let mut front_offset = 0usize;
     let mut queued_bytes = 0usize;
     let mut total = 0u64;
@@ -44,12 +44,18 @@ where
             chunks.push_back(std::mem::take(&mut pending));
             front_offset = 0;
         }
-        while queued_bytes < UPLOAD_BATCH_SIZE && chunks.len() < UPLOAD_BATCH_IOVECS && !finished {
+        let policy = upload_batch_policy(
+            chunks
+                .front()
+                .map(|chunk| chunk.len().saturating_sub(front_offset))
+                .unwrap_or_default(),
+        );
+        while queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !finished {
             match rx.try_recv() {
                 Ok(InboundMessage::Data(chunk)) => {
                     if chunks.is_empty()
-                        || (queued_bytes + chunk.len() <= UPLOAD_BATCH_SIZE
-                            && chunks.len() < UPLOAD_BATCH_IOVECS)
+                        || (queued_bytes + chunk.len() <= policy.max_bytes
+                            && chunks.len() < policy.max_iovecs)
                     {
                         queued_bytes += chunk.len();
                         chunks.push_back(chunk);
@@ -90,7 +96,7 @@ where
         }
         let written = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            result = write_chunk_batch(writer, &chunks, front_offset) => result?,
+            result = write_chunk_batch(writer, &chunks, front_offset, policy) => result?,
         };
         ensure!(written > 0, "write inbound batch returned zero bytes");
         advance_chunk_batch(&mut chunks, &mut front_offset, written);
@@ -190,10 +196,12 @@ where
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
-        let (read, saw_eof) = if limiter.is_none() && read < DOWNLOAD_COALESCE_TRIGGER {
-            coalesce_download_reads(reader, &mut buffer, read).await?
-        } else {
-            (read, false)
+        let (read, saw_eof) = match limiter.is_none()
+            .then(|| download_coalesce_target(read))
+            .flatten()
+        {
+            Some(target) => coalesce_download_reads(reader, &mut buffer, read, target).await?,
+            None => (read, false),
         };
         write_frame(&writer, CMD_PSH, stream_id, &buffer[..read]).await?;
         let transferred = read as u64;
@@ -221,6 +229,7 @@ async fn write_chunk_batch<W>(
     writer: &mut W,
     chunks: &VecDeque<Vec<u8>>,
     front_offset: usize,
+    policy: super::frame::UploadBatchPolicy,
 ) -> anyhow::Result<usize>
 where
     W: AsyncWrite + Unpin,
@@ -229,9 +238,9 @@ where
         return Ok(0);
     }
     if writer.is_write_vectored() {
-        let mut slices: [IoSlice<'_>; UPLOAD_BATCH_IOVECS] =
+        let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] =
             std::array::from_fn(|_| IoSlice::new(&[]));
-        let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices);
+        let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
         if count == 0 {
             return Ok(0);
         }
@@ -254,11 +263,12 @@ pub(super) async fn coalesce_download_reads<R>(
     reader: &mut R,
     buffer: &mut [u8],
     mut filled: usize,
+    target: usize,
 ) -> anyhow::Result<(usize, bool)>
 where
     R: AsyncRead + Unpin,
 {
-    let target = DOWNLOAD_COALESCE_TARGET.min(buffer.len());
+    let target = target.min(buffer.len());
     let mut saw_eof = false;
     while filled < target {
         match try_read_available(reader, &mut buffer[filled..target]).await? {
@@ -297,11 +307,12 @@ fn fill_chunk_batch_slices<'a>(
     chunks: &'a VecDeque<Vec<u8>>,
     front_offset: usize,
     slices: &mut [IoSlice<'a>],
+    policy: super::frame::UploadBatchPolicy,
 ) -> usize {
     let mut count = 0usize;
-    let mut remaining = UPLOAD_BATCH_SIZE;
+    let mut remaining = policy.max_bytes;
     for (index, chunk) in chunks.iter().enumerate() {
-        if count >= slices.len() || count >= UPLOAD_BATCH_IOVECS || remaining == 0 {
+        if count >= slices.len() || count >= policy.max_iovecs || remaining == 0 {
             break;
         }
         let slice = if index == 0 {
@@ -324,9 +335,10 @@ fn fill_chunk_batch_slices<'a>(
 pub(super) fn chunk_batch_slices(
     chunks: &VecDeque<Vec<u8>>,
     front_offset: usize,
+    policy: super::frame::UploadBatchPolicy,
 ) -> Vec<IoSlice<'_>> {
-    let mut slices: [IoSlice<'_>; UPLOAD_BATCH_IOVECS] = std::array::from_fn(|_| IoSlice::new(&[]));
-    let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices);
+    let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] = std::array::from_fn(|_| IoSlice::new(&[]));
+    let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
     slices.into_iter().take(count).collect()
 }
 

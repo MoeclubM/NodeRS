@@ -4,11 +4,12 @@ mod io;
 mod writer;
 
 use anyhow::{Context, anyhow, bail};
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, ReadHalf, split};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
@@ -56,7 +57,7 @@ pub async fn serve_connection(
         route_rules,
         outbound,
         activity,
-        reader: Mutex::new(reader),
+        reader,
         writer: FrameWriter::spawn(writer),
         state: Arc::new(Mutex::new(SessionState::default())),
     };
@@ -100,7 +101,7 @@ struct Session {
     route_rules: RouteRules,
     outbound: OutboundConfig,
     activity: Arc<ActivityTracker>,
-    reader: Mutex<ReadHalf<TlsStream>>,
+    reader: ReadHalf<TlsStream>,
     writer: FrameWriter,
     state: Arc<Mutex<SessionState>>,
 }
@@ -109,11 +110,11 @@ struct Session {
 struct SessionState {
     received_settings: bool,
     peer_version: u8,
-    streams: std::collections::HashMap<u32, StreamState>,
+    streams: FxHashMap<u32, StreamState>,
 }
 
 struct StreamState {
-    inbound: Option<mpsc::Sender<InboundMessage>>,
+    inbound: Option<tokio::sync::mpsc::Sender<InboundMessage>>,
     task: JoinHandle<()>,
 }
 
@@ -141,8 +142,11 @@ struct TcpStreamContext {
 }
 
 impl Session {
-    async fn run(self) -> anyhow::Result<()> {
+    async fn run(mut self) -> anyhow::Result<()> {
         let control = self.lease.control();
+        let state = self.state.clone();
+        let writer = self.writer.clone();
+        let activity = self.activity.clone();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.tick().await;
@@ -151,16 +155,16 @@ impl Session {
                 biased;
                 _ = control.cancelled() => break Err(anyhow!("session cancelled")),
                 _ = heartbeat.tick() => {
-                    let idle_for = self.activity.idle_for();
+                    let idle_for = activity.idle_for();
                     if idle_for >= SESSION_IDLE_TIMEOUT {
                         break Err(anyhow!("session idle timeout"));
                     }
-                    if idle_for >= HEARTBEAT_INTERVAL && self.can_send_heartbeat().await {
-                        self.write_frame(CMD_HEART_REQUEST, 0, &[]).await?;
+                    if idle_for >= HEARTBEAT_INTERVAL && can_send_heartbeat(&state).await {
+                        write_frame(&writer, CMD_HEART_REQUEST, 0, &[]).await?;
                     }
                     continue;
                 }
-                header = self.read_header() => match header {
+                header = read_header(&mut self.reader) => match header {
                     Ok(header) => header,
                     Err(error) if is_eof(&error) => break Ok(()),
                     Err(error) => break Err(error),
@@ -194,10 +198,6 @@ impl Session {
         result
     }
 
-    async fn can_send_heartbeat(&self) -> bool {
-        self.state.lock().await.received_settings
-    }
-
     async fn shutdown(&self) {
         let streams = {
             let mut state = self.state.lock().await;
@@ -208,11 +208,9 @@ impl Session {
         }
     }
 
-    async fn handle_psh(&self, header: FrameHeader) -> anyhow::Result<()> {
+    async fn handle_psh(&mut self, header: FrameHeader) -> anyhow::Result<()> {
         let mut payload = vec![0u8; header.length as usize];
         self.reader
-            .lock()
-            .await
             .read_exact(&mut payload)
             .await
             .context("read PSH payload")?;
@@ -237,21 +235,24 @@ impl Session {
     }
 
     async fn handle_syn(&self, stream_id: u32) -> anyhow::Result<()> {
-        let peer_version = {
+        let (received_settings, peer_version, exists) = {
             let state = self.state.lock().await;
-            if !state.received_settings {
-                drop(state);
-                self.write_frame(CMD_ALERT, 0, b"client did not send its settings")
-                    .await?;
-                bail!("AnyTLS client did not send settings before SYN")
-            }
-            if state.streams.contains_key(&stream_id) {
-                return Ok(());
-            }
-            state.peer_version
+            (
+                state.received_settings,
+                state.peer_version,
+                state.streams.contains_key(&stream_id),
+            )
         };
+        if !received_settings {
+            self.write_frame(CMD_ALERT, 0, b"client did not send its settings")
+                .await?;
+            bail!("AnyTLS client did not send settings before SYN")
+        }
+        if exists {
+            return Ok(());
+        }
 
-        let (inbound_tx, inbound_rx) = mpsc::channel(STREAM_INBOUND_QUEUE_CAPACITY);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(STREAM_INBOUND_QUEUE_CAPACITY);
 
         let writer = self.writer.clone();
         let accounting = self.accounting.clone();
@@ -280,7 +281,11 @@ impl Session {
             }
         });
 
-        self.state.lock().await.streams.insert(
+        self.state
+            .lock()
+            .await
+            .streams
+            .insert(
             stream_id,
             StreamState {
                 inbound: Some(inbound_tx),
@@ -303,22 +308,21 @@ impl Session {
         }
     }
 
-    async fn handle_settings(&self, length: usize) -> anyhow::Result<()> {
+    async fn handle_settings(&mut self, length: usize) -> anyhow::Result<()> {
         let mut bytes = vec![0u8; length];
         self.reader
-            .lock()
-            .await
             .read_exact(&mut bytes)
             .await
             .context("read settings frame")?;
         let settings = parse_settings(&bytes);
-        let mut state = self.state.lock().await;
-        state.received_settings = true;
-        state.peer_version = settings
-            .get("v")
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or_default();
-        drop(state);
+        {
+            let mut state = self.state.lock().await;
+            state.received_settings = true;
+            state.peer_version = settings
+                .get("v")
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or_default();
+        }
 
         let md5_mismatch = settings
             .get("padding-md5")
@@ -343,49 +347,47 @@ impl Session {
         Ok(())
     }
 
-    async fn handle_alert(&self, length: usize) -> anyhow::Result<()> {
+    async fn handle_alert(&mut self, length: usize) -> anyhow::Result<()> {
         let mut bytes = vec![0u8; length];
         self.reader
-            .lock()
-            .await
             .read_exact(&mut bytes)
             .await
             .context("read alert frame")?;
         bail!("peer alert: {}", String::from_utf8_lossy(&bytes))
     }
 
-    async fn discard(&self, length: usize) -> anyhow::Result<()> {
+    async fn discard(&mut self, length: usize) -> anyhow::Result<()> {
         if length == 0 {
             return Ok(());
         }
         let mut discard = vec![0u8; length];
         self.reader
-            .lock()
-            .await
             .read_exact(&mut discard)
             .await
             .context("discard frame payload")?;
         Ok(())
     }
 
-    async fn read_header(&self) -> anyhow::Result<FrameHeader> {
-        let mut header = [0u8; 7];
-        self.reader
-            .lock()
-            .await
-            .read_exact(&mut header)
-            .await
-            .context("read frame header")?;
-        Ok(FrameHeader {
-            cmd: header[0],
-            stream_id: u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
-            length: u16::from_be_bytes([header[5], header[6]]),
-        })
-    }
-
     async fn write_frame(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
         write_frame(&self.writer, cmd, stream_id, payload).await
     }
+}
+
+async fn can_send_heartbeat(state: &Arc<Mutex<SessionState>>) -> bool {
+    state.lock().await.received_settings
+}
+
+async fn read_header(reader: &mut ReadHalf<TlsStream>) -> anyhow::Result<FrameHeader> {
+    let mut header = [0u8; 7];
+    reader
+        .read_exact(&mut header)
+        .await
+        .context("read frame header")?;
+    Ok(FrameHeader {
+        cmd: header[0],
+        stream_id: u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
+        length: u16::from_be_bytes([header[5], header[6]]),
+    })
 }
 
 async fn handle_stream(
@@ -569,7 +571,8 @@ async fn handle_tcp_stream(
 mod tests {
     use super::channel::{ChannelReader, InboundMessage};
     use super::frame::{
-        CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, parse_settings, should_flush_frame,
+        CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
+        parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
     use super::io::{advance_chunk_batch, chunk_batch_slices, coalesce_download_reads, pump_copy};
     use crate::accounting::{Accounting, SessionControl};
@@ -580,7 +583,6 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::sync::mpsc;
-
     struct SegmentedReader {
         segments: TestVecDeque<Vec<u8>>,
     }
@@ -623,6 +625,25 @@ mod tests {
         assert!(should_flush_frame(CMD_SYNACK, 0));
         assert!(should_flush_frame(CMD_PSH, 1024));
         assert!(!should_flush_frame(CMD_PSH, 8192));
+    }
+
+    #[test]
+    fn classifies_payload_tiers() {
+        assert_eq!(payload_tier(512), PayloadTier::Small);
+        assert_eq!(payload_tier(8 * 1024), PayloadTier::Medium);
+        assert_eq!(payload_tier(32 * 1024), PayloadTier::Large);
+    }
+
+    #[test]
+    fn derives_size_specific_batch_and_download_policies() {
+        let small = upload_batch_policy(512);
+        let medium = upload_batch_policy(8 * 1024);
+        let large = upload_batch_policy(32 * 1024);
+        assert!(small.max_iovecs > medium.max_iovecs);
+        assert_eq!(medium.max_iovecs, large.max_iovecs);
+        assert!(download_coalesce_target(1024).is_some());
+        assert!(download_coalesce_target(8 * 1024).is_none());
+        assert!(download_coalesce_target(32 * 1024).is_none());
     }
 
     #[test]
@@ -698,7 +719,8 @@ mod tests {
             .expect("read first chunk");
         assert_eq!(first, 1024);
 
-        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first)
+        let (filled, saw_eof) =
+            coalesce_download_reads(&mut reader, &mut buffer, first, 2048)
             .await
             .expect("coalesce available reads");
         assert_eq!(filled, 2048);
@@ -720,7 +742,7 @@ mod tests {
     #[test]
     fn chunk_batch_slices_respects_front_offset() {
         let chunks = std::collections::VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
-        let slices = chunk_batch_slices(&chunks, 2);
+        let slices = chunk_batch_slices(&chunks, 2, upload_batch_policy(5));
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].len(), 3);
         assert_eq!(slices[1].len(), 5);
