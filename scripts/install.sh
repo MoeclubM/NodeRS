@@ -285,7 +285,7 @@ bootstrap_release() {
   need_cmd curl
   need_cmd tar
 
-  local tag package_name archive_path package_root bootstrap_args
+  local tag package_name archive_path package_root
   tag="$(resolve_release_tag)"
   package_name="noders-anytls-${tag}-linux-amd64"
   TMP_ROOT="$(mktemp -d)"
@@ -299,14 +299,14 @@ bootstrap_release() {
     echo "Release package layout is invalid: $package_root not found" >&2
     exit 1
   }
+  [[ -f "$package_root/noders-anytls" ]] &&
+  [[ -f "$package_root/config.example.toml" ]] &&
+  [[ -f "$package_root/packaging/systemd/noders-anytls.service" ]] || {
+    echo "Release package layout is invalid: required install assets are missing under $package_root" >&2
+    exit 1
+  }
 
-  bootstrap_args=()
-  while [[ $# -gt 0 ]]; do
-    bootstrap_args+=("$1")
-    shift
-  done
-
-  "$package_root/install.sh" "${bootstrap_args[@]}"
+  install_from_bundle "$package_root"
 }
 
 ensure_directories() {
@@ -699,7 +699,7 @@ main() {
   normalize_paths
 
   if ! release_layout_present; then
-    bootstrap_release "$@"
+    bootstrap_release
     return
   fi
 
