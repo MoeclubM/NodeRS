@@ -584,6 +584,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rsa",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "serde",
