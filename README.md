@@ -34,6 +34,17 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --xboard https://api.example.com server_token 2
 ```
 
+### Install on Alpine / OpenRC / non-systemd containers
+
+If the host does not provide `systemd` such as Alpine or many LXC containers, use the standalone OpenRC installer instead. The issue is the init system, not LXC itself.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install-openrc.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token server_token \
+  --node-id 1
+```
+
 ### Override local `server_name`
 
 If you want to force a local SNI instead of using the one from Xboard, pass `--server-name`. This still uses automatic ACME issuance.
@@ -137,6 +148,14 @@ systemctl disable noders-anytls-1
 
 ```bash
 cat /etc/noders/anytls/nodes/1.toml
+```
+
+### OpenRC status and logs
+
+```bash
+rc-service noders-anytls-1 status
+tail -n 100 /var/log/noders-anytls/noders-anytls-1.log
+tail -f /var/log/noders-anytls/noders-anytls-1.log
 ```
 
 ## Upgrade
