@@ -379,6 +379,8 @@ impl ServerCertVerifier for InsecureVerifier {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let command = parse_args(env::args().skip(1).collect())?;
     match command {
         Command::Sink { listen } => run_sink(listen).await,

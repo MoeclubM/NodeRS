@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 
 pub(super) enum InboundMessage {
     Data(BufferedChunk),
@@ -27,6 +27,10 @@ impl BufferedChunk {
         self.bytes.len()
     }
 
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     pub(super) fn split_off(mut self, at: usize) -> Self {
         let bytes = self.bytes.split_off(at);
         Self {
@@ -44,7 +48,7 @@ pub(super) struct InboundSender {
 
 #[derive(Debug)]
 pub(super) enum TrySendError {
-    Full,
+    Full(Vec<u8>),
     Closed,
 }
 
@@ -57,13 +61,10 @@ impl InboundSender {
     }
 
     pub(super) fn try_send_data(&self, chunk: Vec<u8>) -> Result<(), TrySendError> {
-        let permit = match self
-            .budget
-            .clone()
-            .try_acquire_many_owned(chunk.len() as u32)
-        {
+        let len = chunk.len();
+        let permit = match self.budget.clone().try_acquire_many_owned(len as u32) {
             Ok(permit) => permit,
-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full),
+            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(chunk)),
             Err(TryAcquireError::Closed) => return Err(TrySendError::Closed),
         };
         match self
@@ -71,9 +72,27 @@ impl InboundSender {
             .try_send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
         {
             Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(TrySendError::Full),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
+                let InboundMessage::Data(chunk) = message else {
+                    return Err(TrySendError::Closed);
+                };
+                Err(TrySendError::Full(chunk.into_bytes()))
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Closed),
         }
+    }
+
+    pub(super) async fn send_data(&self, chunk: Vec<u8>) -> anyhow::Result<()> {
+        let permit = self
+            .budget
+            .clone()
+            .acquire_many_owned(chunk.len() as u32)
+            .await
+            .map_err(map_budget_closed)?;
+        self.tx
+            .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
+            .await
+            .map_err(|_| anyhow::anyhow!("inbound channel closed before data could be delivered"))
     }
 
     pub(super) async fn send_fin(&self) -> anyhow::Result<()> {
@@ -82,6 +101,10 @@ impl InboundSender {
             .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
     }
+}
+
+fn map_budget_closed(_: AcquireError) -> anyhow::Error {
+    anyhow::anyhow!("inbound channel budget closed before data could be delivered")
 }
 
 pub(super) struct ChannelReader {
@@ -190,7 +213,7 @@ mod tests {
         assert!(sender.try_send_data(vec![1, 2, 3, 4]).is_ok());
         assert!(matches!(
             sender.try_send_data(vec![5]),
-            Err(TrySendError::Full)
+            Err(TrySendError::Full(_))
         ));
         let Some(InboundMessage::Data(chunk)) = rx.recv().await else {
             panic!("expected data chunk");

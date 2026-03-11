@@ -29,8 +29,8 @@ use channel::ChannelReader;
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
-    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
-    padding_md5, parse_settings,
+    LARGE_INBOUND_SEGMENT_LEN, MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES,
+    STREAM_INBOUND_QUEUE_CAPACITY, inbound_segment_len, is_eof, padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
@@ -229,19 +229,16 @@ impl Session {
                 .get(&header.stream_id)
                 .and_then(|stream| stream.inbound.clone())
         };
-        if let Some(inbound) = inbound {
-            match inbound.try_send_data(payload) {
-                Ok(()) => {}
-                Err(channel::TrySendError::Closed) => {}
-                Err(channel::TrySendError::Full) => {
-                    warn!(
-                        stream_id = header.stream_id,
-                        user = %self.user.uuid,
-                        "closing stream after inbound queue budget exhaustion"
-                    );
-                    self.drop_stream(header.stream_id).await;
-                }
-            }
+        if let Some(inbound) = inbound
+            && let Err(error) = self.forward_inbound_payload(inbound, payload).await
+        {
+            debug!(
+                stream_id = header.stream_id,
+                user = %self.user.uuid,
+                %error,
+                "dropping stream after inbound forwarding failure"
+            );
+            self.drop_stream(header.stream_id).await;
         }
         Ok(())
     }
@@ -401,6 +398,40 @@ impl Session {
 
     async fn write_frame(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
         write_frame(&self.writer, cmd, stream_id, payload).await
+    }
+
+    async fn forward_inbound_payload(
+        &self,
+        inbound: channel::InboundSender,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        if payload.len() <= LARGE_INBOUND_SEGMENT_LEN {
+            return self.forward_inbound_segment(&inbound, payload).await;
+        }
+
+        let segment_len = inbound_segment_len(payload.len());
+        for segment in payload.chunks(segment_len) {
+            self.forward_inbound_segment(&inbound, segment.to_vec())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn forward_inbound_segment(
+        &self,
+        inbound: &channel::InboundSender,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        match inbound.try_send_data(payload) {
+            Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+            Err(channel::TrySendError::Full(payload)) => {
+                let control = self.lease.control();
+                tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                }
+            }
+        }
     }
 }
 
