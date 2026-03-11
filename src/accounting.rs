@@ -227,16 +227,11 @@ impl Accounting {
         source: std::net::SocketAddr,
     ) -> anyhow::Result<SessionLease> {
         let ip = normalize_ip(source.ip().to_string());
-        self.enforce_device_limit(user, &ip)
+        self.reserve_session_slot(user, &ip)
             .with_context(|| format!("device limit reject for user {}", user.uuid))?;
 
         let session_id = self.session_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let control = SessionControl::new();
-        {
-            let mut online = self.online.lock().expect("online lock poisoned");
-            let ip_map = online.entry(user.id).or_default();
-            *ip_map.entry(ip.clone()).or_default() += 1;
-        }
         {
             let mut sessions = self.sessions.lock().expect("session lock poisoned");
             sessions
@@ -306,35 +301,28 @@ impl Accounting {
             .collect()
     }
 
-    fn enforce_device_limit(&self, user: &UserEntry, ip: &str) -> anyhow::Result<()> {
-        if user.device_limit <= 0 {
-            return Ok(());
-        }
-        let local = self.online.lock().expect("online lock poisoned");
-        let local_ips = local.get(&user.id).cloned().unwrap_or_default();
-        if local_ips.contains_key(ip) {
-            return Ok(());
-        }
-        let local_unique = local_ips.len();
-        drop(local);
-
+    fn reserve_session_slot(&self, user: &UserEntry, ip: &str) -> anyhow::Result<()> {
         let external = self
             .external_alive
             .lock()
-            .expect("external alive lock poisoned")
-            .get(&user.id)
-            .copied()
-            .unwrap_or(0);
-        let adjusted_external = external.saturating_sub(local_unique);
-        if adjusted_external + local_unique >= user.device_limit as usize {
-            bail!(
-                "device limit exceeded: uid={}, limit={}, local_unique={}, external_alive={}",
-                user.id,
-                user.device_limit,
-                local_unique,
-                external
-            );
+            .expect("external alive lock poisoned");
+        let mut online = self.online.lock().expect("online lock poisoned");
+        let ip_map = online.entry(user.id).or_default();
+        if user.device_limit > 0 && !ip_map.contains_key(ip) {
+            let local_unique = ip_map.len();
+            let external_count = external.get(&user.id).copied().unwrap_or(0);
+            let adjusted_external = external_count.saturating_sub(local_unique);
+            if adjusted_external + local_unique >= user.device_limit as usize {
+                bail!(
+                    "device limit exceeded: uid={}, limit={}, local_unique={}, external_alive={}",
+                    user.id,
+                    user.device_limit,
+                    local_unique,
+                    external_count
+                );
+            }
         }
+        *ip_map.entry(ip.to_string()).or_default() += 1;
         Ok(())
     }
 

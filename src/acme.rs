@@ -1,13 +1,13 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use p256::ecdsa::SigningKey;
+use p256::ecdsa::signature::Signer;
+use p256::elliptic_curve::rand_core::OsRng;
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest::Client;
 use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
-use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
-use rsa::signature::{SignatureEncoding, Signer};
-use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,6 +24,7 @@ const ACME_CONTENT_TYPE: &str = "application/jose+json";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_ATTEMPTS: usize = 90;
 const HTTP_BUFFER_SIZE: usize = 8192;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn ensure_certificate(
     config: &AcmeConfig,
@@ -46,7 +47,7 @@ pub async fn ensure_certificate(
         .build()
         .context("build ACME HTTP client")?;
     let directory = fetch_directory(&client, &config.directory_url).await?;
-    let account_key = load_or_create_private_key(&config.account_key_path, true).await?;
+    let account_key = load_or_create_account_key(&config.account_key_path).await?;
     let acme = AcmeClient::new(client, directory, account_key)?;
     let account = acme.ensure_account(&config.email).await?;
 
@@ -85,7 +86,7 @@ pub async fn ensure_certificate(
         challenge_result?;
     }
 
-    let domain_key = load_or_create_private_key(key_path, false).await?;
+    let domain_key = load_or_create_domain_key(key_path).await?;
     let csr_der = build_certificate_signing_request(&domain_key, &config.domain)?;
     order = acme
         .finalize_order(&account.kid, &order.url, &order.finalize, &csr_der)
@@ -100,7 +101,7 @@ pub async fn ensure_certificate(
         .download_certificate(&account.kid, &certificate_url)
         .await?;
 
-    write_private_key(key_path, &domain_key).await?;
+    write_domain_key(key_path, &domain_key).await?;
     write_atomic(cert_path, certificate_pem.as_bytes()).await?;
     Ok(true)
 }
@@ -141,7 +142,7 @@ async fn fetch_directory(client: &Client, directory_url: &str) -> anyhow::Result
 struct AcmeClient {
     client: Client,
     directory: AcmeDirectory,
-    account_key: RsaPrivateKey,
+    account_key: SigningKey,
     jwk_header: Value,
     jwk_thumbprint: String,
 }
@@ -205,7 +206,7 @@ impl AcmeClient {
     fn new(
         client: Client,
         directory: AcmeDirectory,
-        account_key: RsaPrivateKey,
+        account_key: SigningKey,
     ) -> anyhow::Result<Self> {
         let jwk_header = build_jwk(&account_key);
         let jwk_thumbprint = jwk_thumbprint(&account_key)?;
@@ -491,21 +492,25 @@ async fn serve_http_request(
     expected_path: &str,
     response_body: &str,
 ) -> anyhow::Result<()> {
-    let mut buffer = Vec::with_capacity(1024);
-    loop {
-        let mut chunk = [0u8; 1024];
-        let read = stream.read(&mut chunk).await.context("read HTTP request")?;
-        if read == 0 {
-            break;
+    let request = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async {
+        let mut buffer = Vec::with_capacity(1024);
+        loop {
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await.context("read HTTP request")?;
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n")
+                || buffer.len() >= HTTP_BUFFER_SIZE
+            {
+                break;
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") || buffer.len() >= HTTP_BUFFER_SIZE
-        {
-            break;
-        }
-    }
-
-    let request = String::from_utf8_lossy(&buffer);
+        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&buffer).into_owned())
+    })
+    .await
+    .context("ACME HTTP-01 request timed out")??;
     let path = request
         .lines()
         .next()
@@ -530,46 +535,64 @@ async fn serve_http_request(
     Ok(())
 }
 
-async fn load_or_create_private_key(
-    path: &Path,
-    persist_generated: bool,
-) -> anyhow::Result<RsaPrivateKey> {
+async fn load_or_create_account_key(path: &Path) -> anyhow::Result<SigningKey> {
     if let Ok(existing) = tokio::fs::read_to_string(path).await
-        && let Ok(key) = parse_private_key(existing).await
+        && let Ok(key) = parse_account_key(existing).await
+    {
+        return Ok(key);
+    }
+
+    let key = tokio::task::spawn_blocking(|| SigningKey::random(&mut OsRng))
+        .await
+        .context("join P-256 account key generation")?;
+    write_account_key(path, &key).await?;
+    Ok(key)
+}
+
+async fn parse_account_key(pem: String) -> anyhow::Result<SigningKey> {
+    tokio::task::spawn_blocking(move || {
+        SigningKey::from_pkcs8_pem(&pem).context("parse PKCS#8 P-256 account key")
+    })
+    .await
+    .context("join P-256 account key parser")?
+}
+
+async fn write_account_key(path: &Path, key: &SigningKey) -> anyhow::Result<()> {
+    let key = key.clone();
+    let pem = tokio::task::spawn_blocking(move || {
+        key.to_pkcs8_pem(LineEnding::LF)
+            .map(|pem| pem.to_string())
+            .context("encode PKCS#8 account key")
+    })
+    .await
+    .context("join account key encoder")??;
+    write_atomic(path, pem.as_bytes()).await
+}
+
+async fn load_or_create_domain_key(path: &Path) -> anyhow::Result<KeyPair> {
+    if let Ok(existing) = tokio::fs::read_to_string(path).await
+        && let Ok(key) = parse_domain_key(existing).await
     {
         return Ok(key);
     }
 
     let key = tokio::task::spawn_blocking(|| {
-        let mut rng = rand::thread_rng();
-        RsaPrivateKey::new(&mut rng, 2048).context("generate RSA private key")
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generate P-256 domain key")
     })
     .await
-    .context("join RSA key generation")??;
-
-    if persist_generated {
-        write_private_key(path, &key).await?;
-    }
+    .context("join P-256 domain key generation")??;
+    write_domain_key(path, &key).await?;
     Ok(key)
 }
 
-async fn parse_private_key(pem: String) -> anyhow::Result<RsaPrivateKey> {
-    tokio::task::spawn_blocking(move || {
-        RsaPrivateKey::from_pkcs8_pem(&pem).context("parse PKCS#8 RSA private key")
-    })
-    .await
-    .context("join RSA private key parser")?
+async fn parse_domain_key(pem: String) -> anyhow::Result<KeyPair> {
+    tokio::task::spawn_blocking(move || KeyPair::from_pem(&pem).context("parse P-256 domain key"))
+        .await
+        .context("join P-256 domain key parser")?
 }
 
-async fn write_private_key(path: &Path, key: &RsaPrivateKey) -> anyhow::Result<()> {
-    let key = key.clone();
-    let pem = tokio::task::spawn_blocking(move || {
-        key.to_pkcs8_pem(LineEnding::LF)
-            .map(|pem| pem.to_string())
-            .context("encode PKCS#8 private key")
-    })
-    .await
-    .context("join private key encoder")??;
+async fn write_domain_key(path: &Path, key: &KeyPair) -> anyhow::Result<()> {
+    let pem = key.serialize_pem();
     write_atomic(path, pem.as_bytes()).await
 }
 
@@ -607,68 +630,48 @@ fn build_key_authorization(token: &str, thumbprint: &str) -> String {
     format!("{token}.{thumbprint}")
 }
 
-fn build_jwk(key: &RsaPrivateKey) -> Value {
-    let public_key = key.to_public_key();
+fn build_jwk(key: &SigningKey) -> Value {
+    let public_key = key.verifying_key().to_encoded_point(false);
+    let x = public_key.x().expect("uncompressed P-256 point has x");
+    let y = public_key.y().expect("uncompressed P-256 point has y");
     json!({
-        "e": base64url(public_key.e().to_bytes_be()),
-        "kty": "RSA",
-        "n": base64url(public_key.n().to_bytes_be()),
+        "crv": "P-256",
+        "kty": "EC",
+        "x": base64url(x),
+        "y": base64url(y),
     })
 }
 
-fn jwk_thumbprint(key: &RsaPrivateKey) -> anyhow::Result<String> {
-    let public_key = key.to_public_key();
+fn jwk_thumbprint(key: &SigningKey) -> anyhow::Result<String> {
+    let public_key = key.verifying_key().to_encoded_point(false);
+    let x = public_key.x().expect("uncompressed P-256 point has x");
+    let y = public_key.y().expect("uncompressed P-256 point has y");
     let jwk = format!(
-        "{{\"e\":\"{}\",\"kty\":\"RSA\",\"n\":\"{}\"}}",
-        base64url(public_key.e().to_bytes_be()),
-        base64url(public_key.n().to_bytes_be()),
+        "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+        base64url(x),
+        base64url(y),
     );
     Ok(base64url(Sha256::digest(jwk.as_bytes()).as_slice()))
 }
 
-fn sign_base64url(key: &RsaPrivateKey, message: &[u8]) -> anyhow::Result<String> {
-    let signing_key = SigningKey::<Sha256>::new(key.clone());
-    let signature = signing_key.sign(message);
+fn sign_base64url(key: &SigningKey, message: &[u8]) -> anyhow::Result<String> {
+    let signature: p256::ecdsa::Signature = key.sign(message);
     Ok(base64url(signature.to_bytes()))
 }
 
 fn build_certificate_signing_request(
-    private_key: &RsaPrivateKey,
+    private_key: &KeyPair,
     domain: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let public_key = RsaPublicKey::from(private_key);
-    let spki = public_key
-        .to_public_key_der()
-        .context("encode CSR subject public key")?;
-    let subject = encode_sequence(&[encode_set(&encode_sequence(&[
-        encode_oid(&[2, 5, 4, 3]),
-        encode_utf8_string(domain),
-    ]))]);
-    let san_extension = encode_sequence(&[
-        encode_oid(&[2, 5, 29, 17]),
-        encode_octet_string(&encode_sequence(&[encode_context_specific_primitive(
-            2,
-            domain.as_bytes(),
-        )])),
-    ]);
-    let extensions = encode_sequence(&[san_extension]);
-    let extension_request_attribute = encode_sequence(&[
-        encode_oid(&[1, 2, 840, 113549, 1, 9, 14]),
-        encode_set(&extensions),
-    ]);
-    let certification_request_info = encode_sequence(&[
-        encode_integer_zero(),
-        subject,
-        spki.as_bytes().to_vec(),
-        encode_context_specific_constructed(0, &extension_request_attribute),
-    ]);
-    let signature =
-        SigningKey::<Sha256>::new(private_key.clone()).sign(&certification_request_info);
-    Ok(encode_sequence(&[
-        certification_request_info,
-        encode_sequence(&[encode_oid(&[1, 2, 840, 113549, 1, 1, 11]), encode_null()]),
-        encode_bit_string(&signature.to_bytes()),
-    ]))
+    let mut params = CertificateParams::new(vec![domain.to_string()])
+        .context("build ACME certificate parameters")?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, domain);
+    params.distinguished_name = distinguished_name;
+    let csr = params
+        .serialize_request(private_key)
+        .context("serialize P-256 certificate signing request")?;
+    Ok(csr.der().as_ref().to_vec())
 }
 
 fn first_certificate_not_after(cert_pem: &[u8]) -> anyhow::Result<u64> {
@@ -765,118 +768,6 @@ fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
     let doy = (153 * month + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     i64::from(era * 146097 + doe)
-}
-
-fn encode_integer_zero() -> Vec<u8> {
-    vec![0x02, 0x01, 0x00]
-}
-
-fn encode_null() -> Vec<u8> {
-    vec![0x05, 0x00]
-}
-
-fn encode_utf8_string(value: &str) -> Vec<u8> {
-    encode_tagged(0x0c, value.as_bytes())
-}
-
-fn encode_octet_string(value: &[u8]) -> Vec<u8> {
-    encode_tagged(0x04, value)
-}
-
-fn encode_bit_string(value: &[u8]) -> Vec<u8> {
-    let mut content = Vec::with_capacity(value.len() + 1);
-    content.push(0);
-    content.extend_from_slice(value);
-    encode_tagged(0x03, &content)
-}
-
-fn encode_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
-    let body = flatten(parts);
-    encode_tagged(0x30, &body)
-}
-
-fn encode_set(value: &[u8]) -> Vec<u8> {
-    encode_tagged(0x31, value)
-}
-
-fn encode_context_specific_constructed(tag_number: u8, value: &[u8]) -> Vec<u8> {
-    encode_tagged(0xa0 | (tag_number & 0x1f), value)
-}
-
-fn encode_context_specific_primitive(tag_number: u8, value: &[u8]) -> Vec<u8> {
-    encode_tagged(0x80 | (tag_number & 0x1f), value)
-}
-
-fn encode_oid(components: &[u64]) -> Vec<u8> {
-    assert!(components.len() >= 2);
-    let mut body = Vec::new();
-    body.push((components[0] * 40 + components[1]) as u8);
-    for &component in &components[2..] {
-        encode_oid_component(component, &mut body);
-    }
-    encode_tagged(0x06, &body)
-}
-
-fn encode_oid_component(mut value: u64, out: &mut Vec<u8>) {
-    let mut buffer = [0u8; 10];
-    let mut index = buffer.len();
-    buffer[index - 1] = (value & 0x7f) as u8;
-    index -= 1;
-    value >>= 7;
-    while value > 0 {
-        buffer[index - 1] = ((value & 0x7f) as u8) | 0x80;
-        index -= 1;
-        value >>= 7;
-    }
-    out.extend_from_slice(&buffer[index..]);
-}
-
-fn encode_tagged(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(1 + encoded_len_len(value.len()) + value.len());
-    encoded.push(tag);
-    encode_length(value.len(), &mut encoded);
-    encoded.extend_from_slice(value);
-    encoded
-}
-
-fn encoded_len_len(length: usize) -> usize {
-    if length < 128 {
-        1
-    } else {
-        let mut length = length;
-        let mut count = 0;
-        while length > 0 {
-            count += 1;
-            length >>= 8;
-        }
-        1 + count
-    }
-}
-
-fn encode_length(length: usize, out: &mut Vec<u8>) {
-    if length < 128 {
-        out.push(length as u8);
-        return;
-    }
-    let mut buffer = [0u8; 8];
-    let mut index = buffer.len();
-    let mut value = length;
-    while value > 0 {
-        buffer[index - 1] = (value & 0xff) as u8;
-        index -= 1;
-        value >>= 8;
-    }
-    out.push(0x80 | (buffer.len() - index) as u8);
-    out.extend_from_slice(&buffer[index..]);
-}
-
-fn flatten(parts: &[Vec<u8>]) -> Vec<u8> {
-    let total = parts.iter().map(Vec::len).sum();
-    let mut body = Vec::with_capacity(total);
-    for part in parts {
-        body.extend_from_slice(part);
-    }
-    body
 }
 
 fn header_value(

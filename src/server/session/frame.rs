@@ -24,6 +24,8 @@ pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 96;
 pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
+pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
+pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PayloadTier {
