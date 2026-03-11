@@ -13,7 +13,7 @@ use crate::limiter::SharedRateLimiter;
 
 use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
-use super::channel::InboundMessage;
+use super::channel::{BufferedChunk, InboundMessage};
 use super::frame::{
     CMD_FIN, CMD_PSH, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
     SMALL_DATA_FRAME_FLUSH_THRESHOLD, download_coalesce_target, upload_batch_policy,
@@ -21,7 +21,7 @@ use super::frame::{
 use super::writer::{FrameWriter, write_frame};
 
 pub(super) async fn pump_inbound_to_remote<W>(
-    mut pending: Vec<u8>,
+    mut pending: Option<BufferedChunk>,
     mut rx: mpsc::Receiver<InboundMessage>,
     mut finished: bool,
     writer: &mut W,
@@ -31,7 +31,7 @@ pub(super) async fn pump_inbound_to_remote<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(MAX_UPLOAD_BATCH_IOVECS);
+    let mut chunks: VecDeque<BufferedChunk> = VecDeque::with_capacity(MAX_UPLOAD_BATCH_IOVECS);
     let mut front_offset = 0usize;
     let mut queued_bytes = 0usize;
     let mut total = 0u64;
@@ -39,9 +39,9 @@ where
         if control.is_cancelled() {
             return Ok(total);
         }
-        if !pending.is_empty() {
-            queued_bytes += pending.len();
-            chunks.push_back(std::mem::take(&mut pending));
+        if let Some(chunk) = pending.take() {
+            queued_bytes += chunk.len();
+            chunks.push_back(chunk);
             front_offset = 0;
         }
         let policy = upload_batch_policy(
@@ -60,7 +60,7 @@ where
                         queued_bytes += chunk.len();
                         chunks.push_back(chunk);
                     } else {
-                        pending = chunk;
+                        pending = Some(chunk);
                         break;
                     }
                 }
@@ -85,7 +85,7 @@ where
                 message = rx.recv() => message,
             } {
                 Some(InboundMessage::Data(chunk)) => {
-                    pending = chunk;
+                    pending = Some(chunk);
                     continue;
                 }
                 Some(InboundMessage::Fin) | None => {
@@ -106,7 +106,7 @@ where
         if let Some(traffic) = traffic.as_ref() {
             traffic.record(transferred);
         }
-        if finished && pending.is_empty() && chunks.is_empty() {
+        if finished && pending.is_none() && chunks.is_empty() {
             let _ = writer.shutdown().await;
             return Ok(total);
         }
@@ -228,7 +228,7 @@ where
 
 async fn write_chunk_batch<W>(
     writer: &mut W,
-    chunks: &VecDeque<Vec<u8>>,
+    chunks: &VecDeque<BufferedChunk>,
     front_offset: usize,
     policy: super::frame::UploadBatchPolicy,
 ) -> anyhow::Result<usize>
@@ -255,7 +255,7 @@ where
         return Ok(0);
     };
     writer
-        .write(&front[front_offset..])
+        .write(&front.bytes()[front_offset..])
         .await
         .context("write inbound chunk")
 }
@@ -305,7 +305,7 @@ where
 }
 
 fn fill_chunk_batch_slices<'a>(
-    chunks: &'a VecDeque<Vec<u8>>,
+    chunks: &'a VecDeque<BufferedChunk>,
     front_offset: usize,
     slices: &mut [IoSlice<'a>],
     policy: super::frame::UploadBatchPolicy,
@@ -317,9 +317,9 @@ fn fill_chunk_batch_slices<'a>(
             break;
         }
         let slice = if index == 0 {
-            &chunk[front_offset..]
+            &chunk.bytes()[front_offset..]
         } else {
-            chunk.as_slice()
+            chunk.bytes()
         };
         if slice.is_empty() {
             continue;
@@ -334,7 +334,7 @@ fn fill_chunk_batch_slices<'a>(
 
 #[cfg(test)]
 pub(super) fn chunk_batch_slices(
-    chunks: &VecDeque<Vec<u8>>,
+    chunks: &VecDeque<BufferedChunk>,
     front_offset: usize,
     policy: super::frame::UploadBatchPolicy,
 ) -> Vec<IoSlice<'_>> {
@@ -345,7 +345,7 @@ pub(super) fn chunk_batch_slices(
 }
 
 pub(super) fn advance_chunk_batch(
-    chunks: &mut VecDeque<Vec<u8>>,
+    chunks: &mut VecDeque<BufferedChunk>,
     front_offset: &mut usize,
     mut written: usize,
 ) {

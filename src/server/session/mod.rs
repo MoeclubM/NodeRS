@@ -25,16 +25,18 @@ use super::socksaddr::SocksAddr;
 use super::traffic::TrafficRecorder;
 use super::transport;
 use super::uot;
-use channel::{ChannelReader, InboundMessage};
+use channel::ChannelReader;
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
-    STREAM_INBOUND_QUEUE_CAPACITY, is_eof, padding_md5, parse_settings,
+    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
+    padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
+const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub async fn serve_connection(
     mut stream: TlsStream,
@@ -44,7 +46,12 @@ pub async fn serve_connection(
     route_rules: RouteRules,
     outbound: OutboundConfig,
 ) -> anyhow::Result<()> {
-    let user = authenticate(&mut stream, &accounting).await?;
+    let user = tokio::time::timeout(
+        AUTHENTICATION_TIMEOUT,
+        authenticate(&mut stream, &accounting),
+    )
+    .await
+    .context("authentication timed out")??;
     let lease = accounting.open_session(&user, source)?;
     let control = lease.control();
     let activity = ActivityTracker::new();
@@ -114,7 +121,7 @@ struct SessionState {
 }
 
 struct StreamState {
-    inbound: Option<tokio::sync::mpsc::Sender<InboundMessage>>,
+    inbound: Option<channel::InboundSender>,
     task: JoinHandle<()>,
 }
 
@@ -223,24 +230,30 @@ impl Session {
                 .and_then(|stream| stream.inbound.clone())
         };
         if let Some(inbound) = inbound {
-            match inbound.try_send(InboundMessage::Data(payload)) {
+            match inbound.try_send_data(payload) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
-                    let _ = inbound.send(message).await;
+                Err(channel::TrySendError::Closed) => {}
+                Err(channel::TrySendError::Full) => {
+                    warn!(
+                        stream_id = header.stream_id,
+                        user = %self.user.uuid,
+                        "closing stream after inbound queue budget exhaustion"
+                    );
+                    self.drop_stream(header.stream_id).await;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
         Ok(())
     }
 
     async fn handle_syn(&self, stream_id: u32) -> anyhow::Result<()> {
-        let (received_settings, peer_version, exists) = {
+        let (received_settings, peer_version, exists, stream_count) = {
             let state = self.state.lock().await;
             (
                 state.received_settings,
                 state.peer_version,
                 state.streams.contains_key(&stream_id),
+                state.streams.len(),
             )
         };
         if !received_settings {
@@ -251,8 +264,19 @@ impl Session {
         if exists {
             return Ok(());
         }
+        if stream_count >= MAX_STREAMS_PER_SESSION {
+            let error = format!("too many concurrent streams: limit={MAX_STREAMS_PER_SESSION}");
+            if peer_version >= 2 {
+                self.write_frame(CMD_SYNACK, stream_id, error.as_bytes())
+                    .await?;
+            }
+            return Ok(());
+        }
 
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(STREAM_INBOUND_QUEUE_CAPACITY);
+        let (inbound_tx, inbound_rx) = channel::bounded_inbound_channel(
+            STREAM_INBOUND_QUEUE_CAPACITY,
+            STREAM_INBOUND_QUEUE_BYTES,
+        );
 
         let writer = self.writer.clone();
         let accounting = self.accounting.clone();
@@ -300,7 +324,18 @@ impl Session {
                 .and_then(|stream| stream.inbound.take())
         };
         if let Some(inbound) = inbound {
-            let _ = inbound.send(InboundMessage::Fin).await;
+            let _ = inbound.send_fin().await;
+        }
+    }
+
+    async fn drop_stream(&self, stream_id: u32) {
+        let stream = {
+            let mut state = self.state.lock().await;
+            state.streams.remove(&stream_id)
+        };
+        if let Some(stream) = stream {
+            stream.task.abort();
+            let _ = self.write_frame(CMD_FIN, stream_id, &[]).await;
         }
     }
 
@@ -565,7 +600,7 @@ async fn handle_tcp_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::channel::{ChannelReader, InboundMessage};
+    use super::channel::{ChannelReader, InboundMessage, test_chunk};
     use super::frame::{
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
         parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
@@ -687,10 +722,10 @@ mod tests {
     #[tokio::test]
     async fn channel_reader_coalesces_multiple_chunks() {
         let (tx, rx) = mpsc::channel(4);
-        tx.send(InboundMessage::Data(b"hello".to_vec()))
+        tx.send(InboundMessage::Data(test_chunk(b"hello")))
             .await
             .expect("send first chunk");
-        tx.send(InboundMessage::Data(b"world".to_vec()))
+        tx.send(InboundMessage::Data(test_chunk(b"world")))
             .await
             .expect("send second chunk");
         drop(tx);
@@ -726,17 +761,18 @@ mod tests {
 
     #[test]
     fn advance_chunk_batch_handles_partial_write() {
-        let mut chunks = std::collections::VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
+        let mut chunks =
+            std::collections::VecDeque::from([test_chunk(b"hello"), test_chunk(b"world")]);
         let mut front_offset = 0;
         advance_chunk_batch(&mut chunks, &mut front_offset, 7);
         assert_eq!(chunks.len(), 1);
         assert_eq!(front_offset, 2);
-        assert_eq!(&chunks.front().expect("remaining chunk")[..], b"world");
+        assert_eq!(chunks.front().expect("remaining chunk").bytes(), b"world");
     }
 
     #[test]
     fn chunk_batch_slices_respects_front_offset() {
-        let chunks = std::collections::VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
+        let chunks = std::collections::VecDeque::from([test_chunk(b"hello"), test_chunk(b"world")]);
         let slices = chunk_batch_slices(&chunks, 2, upload_batch_policy(5));
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].len(), 3);
