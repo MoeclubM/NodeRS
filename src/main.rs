@@ -13,6 +13,8 @@ use tracing::level_filters::LevelFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let config_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
