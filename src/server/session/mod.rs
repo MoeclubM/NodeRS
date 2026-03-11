@@ -281,11 +281,7 @@ impl Session {
             }
         });
 
-        self.state
-            .lock()
-            .await
-            .streams
-            .insert(
+        self.state.lock().await.streams.insert(
             stream_id,
             StreamState {
                 inbound: Some(inbound_tx),
@@ -719,8 +715,7 @@ mod tests {
             .expect("read first chunk");
         assert_eq!(first, 1024);
 
-        let (filled, saw_eof) =
-            coalesce_download_reads(&mut reader, &mut buffer, first, 2048)
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, 2048)
             .await
             .expect("coalesce available reads");
         assert_eq!(filled, 2048);

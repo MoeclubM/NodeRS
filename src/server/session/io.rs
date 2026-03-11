@@ -196,7 +196,8 @@ where
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
-        let (read, saw_eof) = match limiter.is_none()
+        let (read, saw_eof) = match limiter
+            .is_none()
             .then(|| download_coalesce_target(read))
             .flatten()
         {
@@ -337,7 +338,8 @@ pub(super) fn chunk_batch_slices(
     front_offset: usize,
     policy: super::frame::UploadBatchPolicy,
 ) -> Vec<IoSlice<'_>> {
-    let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] = std::array::from_fn(|_| IoSlice::new(&[]));
+    let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] =
+        std::array::from_fn(|_| IoSlice::new(&[]));
     let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
     slices.into_iter().take(count).collect()
 }
