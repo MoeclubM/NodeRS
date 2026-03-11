@@ -106,6 +106,32 @@ normalize_paths() {
   :
 }
 
+detect_asset_suffix() {
+  local arch_suffix libc_variant
+  case "$(uname -m)" in
+    x86_64|amd64)
+      arch_suffix="amd64"
+      ;;
+    *)
+      echo "Unsupported architecture for prebuilt releases: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+
+  libc_variant="gnu"
+  if [[ -f /etc/alpine-release ]] || compgen -G '/lib/ld-musl-*.so.1' >/dev/null; then
+    libc_variant="musl"
+  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | head -n1 | grep -qi 'musl'; then
+    libc_variant="musl"
+  fi
+
+  if [[ "$libc_variant" == "musl" ]]; then
+    printf 'linux-%s-musl\n' "$arch_suffix"
+  else
+    printf 'linux-%s\n' "$arch_suffix"
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -288,9 +314,10 @@ bootstrap_release() {
   need_cmd curl
   need_cmd tar
 
-  local tag package_name archive_path package_root
+  local tag asset_suffix package_name archive_path package_root
   tag="$(resolve_release_tag)"
-  package_name="noders-anytls-${tag}-linux-amd64"
+  asset_suffix="$(detect_asset_suffix)"
+  package_name="noders-anytls-${tag}-${asset_suffix}"
   TMP_ROOT="$(mktemp -d)"
   archive_path="$TMP_ROOT/${package_name}.tar.gz"
 

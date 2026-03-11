@@ -11,21 +11,35 @@ permissions:
 
 env:
   BIN_NAME: noders-anytls
-  TARGET: x86_64-unknown-linux-gnu
-  ASSET_SUFFIX: linux-amd64
 
 jobs:
   build:
-    name: Build Linux release bundle
+    name: Build Linux release bundle (${{ matrix.asset_suffix }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-amd64
+            apt_packages: ""
+          - target: x86_64-unknown-linux-musl
+            asset_suffix: linux-amd64-musl
+            apt_packages: musl-tools
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install target toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ env.TARGET }}
+          targets: ${{ matrix.target }}
+
+      - name: Install system packages
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -40,12 +54,14 @@ jobs:
         run: cargo test --locked --offline
 
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ env.TARGET }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Prepare release package
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
+          TARGET: ${{ matrix.target }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
         run: |
           set -euo pipefail
           tag="${RELEASE_TAG:-dev}"
@@ -54,16 +70,17 @@ jobs:
           cp "target/${TARGET}/release/${BIN_NAME}" "$package_dir/${BIN_NAME}"
           cp README.md LICENSE config.example.toml "$package_dir/"
           cp scripts/install.sh "$package_dir/install.sh"
+          cp scripts/install-openrc.sh "$package_dir/install-openrc.sh"
           cp scripts/upgrade.sh "$package_dir/upgrade.sh"
           cp packaging/systemd/noders-anytls.service "$package_dir/packaging/systemd/noders-anytls.service"
-          chmod +x "$package_dir/install.sh" "$package_dir/upgrade.sh" "$package_dir/${BIN_NAME}"
+          chmod +x "$package_dir/install.sh" "$package_dir/install-openrc.sh" "$package_dir/upgrade.sh" "$package_dir/${BIN_NAME}"
           tar -C dist -czf "${package_dir}.tar.gz" "$(basename "$package_dir")"
           sha256sum "${package_dir}.tar.gz" > "${package_dir}.tar.gz.sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-release-bundle
+          name: linux-release-bundle-${{ matrix.asset_suffix }}
           path: dist/*
           if-no-files-found: error
 
