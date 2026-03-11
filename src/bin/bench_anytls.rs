@@ -51,6 +51,7 @@ const DEFAULT_PARALLEL: usize = 1;
 const DEFAULT_SCENARIO_PARALLEL: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNACK_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type ClientTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 type SharedWriter = Arc<Mutex<WriteHalf<ClientTlsStream>>>;
@@ -276,6 +277,14 @@ impl SessionState {
         self.finished.store(true, Ordering::SeqCst);
         self.synack_notify.notify_waiters();
         self.finish_notify.notify_waiters();
+    }
+
+    async fn current_error(&self) -> Option<String> {
+        self.error.lock().await.clone()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
     }
 
     fn set_synack_ok(&self) {
@@ -967,9 +976,18 @@ async fn run_worker(worker_id: usize, options: ClientOptions) -> anyhow::Result<
     }
 
     let _ = write_frame(&writer, CMD_FIN, stream_id, &[]).await;
-    let _ = tokio::time::timeout(Duration::from_secs(1), reader_task).await;
+    match tokio::time::timeout(Duration::from_secs(2), reader_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => return Err(error.context("read loop failed")),
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_) => {
+            if let Some(error) = state.current_error().await {
+                bail!(error);
+            }
+        }
+    }
 
-    if let Some(error) = state.error.lock().await.clone() {
+    if let Some(error) = state.current_error().await {
         bail!(error);
     }
 
@@ -992,7 +1010,15 @@ async fn run_upload_loop(
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
-        write_frame(writer, CMD_PSH, stream_id, &payload).await?;
+        if state.is_finished() {
+            break;
+        }
+        if let Some(error) = state.current_error().await {
+            bail!(error);
+        }
+        if !write_frame_until_finish(writer, state.clone(), CMD_PSH, stream_id, &payload).await? {
+            break;
+        }
         state.record_upload(payload.len());
     }
     Ok(())
@@ -1008,10 +1034,37 @@ async fn run_udp_upload_loop(
     let packet = encode_uot_connected_packet(&payload)?;
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
-        write_frame(writer, CMD_PSH, stream_id, &packet).await?;
+        if state.is_finished() {
+            break;
+        }
+        if let Some(error) = state.current_error().await {
+            bail!(error);
+        }
+        if !write_frame_until_finish(writer, state.clone(), CMD_PSH, stream_id, &packet).await? {
+            break;
+        }
         state.record_upload(packet.len());
     }
     Ok(())
+}
+
+async fn write_frame_until_finish(
+    writer: &SharedWriter,
+    state: Arc<SessionState>,
+    cmd: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> anyhow::Result<bool> {
+    if state.is_finished() {
+        return Ok(false);
+    }
+    tokio::select! {
+        _ = state.finish_notify.notified() => Ok(false),
+        result = write_frame(writer, cmd, stream_id, payload) => {
+            result?;
+            Ok(true)
+        }
+    }
 }
 
 async fn wait_for_udp_download(
@@ -1091,8 +1144,14 @@ async fn read_loop(
         let mut header = [0u8; 7];
         if let Err(error) = reader.read_exact(&mut header).await {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                state.finish();
-                return Ok(());
+                if state.is_finished() {
+                    state.finish();
+                    return Ok(());
+                }
+                state
+                    .set_error("unexpected EOF while reading AnyTLS header")
+                    .await;
+                return Err(error.into());
             }
             state
                 .set_error(format!("read AnyTLS header: {error}"))
@@ -1103,11 +1162,13 @@ async fn read_loop(
         let stream_id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         let length = u16::from_be_bytes([header[5], header[6]]) as usize;
         let mut payload = vec![0u8; length];
-        if length > 0 {
-            reader
-                .read_exact(&mut payload)
-                .await
-                .context("read AnyTLS payload")?;
+        if length > 0
+            && let Err(error) = reader.read_exact(&mut payload).await
+        {
+            state
+                .set_error(format!("read AnyTLS payload: {error}"))
+                .await;
+            return Err(error).context("read AnyTLS payload");
         }
         match cmd {
             CMD_PSH if stream_id == state.stream_id => {
@@ -1183,12 +1244,15 @@ async fn write_frame(
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
     let mut guard = writer.lock().await;
-    guard
-        .write_all(&frame)
+    timeout(WRITE_TIMEOUT, guard.write_all(&frame))
         .await
+        .context("write AnyTLS frame timed out")?
         .context("write AnyTLS frame")?;
     if cmd != CMD_PSH || payload.len() <= 4 * 1024 {
-        guard.flush().await.context("flush AnyTLS frame")?;
+        timeout(WRITE_TIMEOUT, guard.flush())
+            .await
+            .context("flush AnyTLS frame timed out")?
+            .context("flush AnyTLS frame")?;
     }
     Ok(())
 }
