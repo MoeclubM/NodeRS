@@ -271,6 +271,7 @@ where
 {
     let target = target.min(buffer.len());
     let mut saw_eof = false;
+    let mut retried_after_yield = false;
     while filled < target {
         match try_read_available(reader, &mut buffer[filled..target]).await? {
             Some(0) => {
@@ -279,9 +280,17 @@ where
             }
             Some(read) => {
                 filled += read;
+                retried_after_yield = false;
                 if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
                     break;
                 }
+            }
+            // Under high concurrency the next download chunk often lands on the next scheduler
+            // turn instead of being immediately readable. Yield once before giving up so we can
+            // coalesce another small slice without blocking on a full read.
+            None if !retried_after_yield && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD => {
+                retried_after_yield = true;
+                tokio::task::yield_now().await;
             }
             None => break,
         }
