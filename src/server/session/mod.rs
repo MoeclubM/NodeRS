@@ -5,10 +5,13 @@ mod writer;
 
 use anyhow::{Context, anyhow, bail};
 use rustc_hash::FxHashMap;
+use std::future::poll_fn;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::io::{AsyncReadExt, ReadHalf, split};
+use std::task::Poll;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf, ReadHalf, split};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -227,10 +230,7 @@ impl Session {
 
     async fn handle_psh(&mut self, header: FrameHeader) -> anyhow::Result<()> {
         let mut payload = self.payload_pool.take(header.length as usize);
-        self.reader
-            .read_exact(payload.as_mut_slice())
-            .await
-            .context("read PSH payload")?;
+        read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
 
         let inbound = {
             let streams = self.state.streams.read().expect("streams lock poisoned");
@@ -428,9 +428,12 @@ impl Session {
         }
 
         let segment_len = inbound_segment_len(payload.len());
-        let payload = payload.into_vec();
-        for segment in payload.chunks(segment_len) {
-            self.forward_inbound_segment(&inbound, PayloadBuffer::new(segment.to_vec()))
+        for segment in payload.as_slice().chunks(segment_len) {
+            // Keep segmented uploads on the pooled-buffer path instead of
+            // materializing standalone `Vec`s for each slice.
+            let mut segment_buffer = self.payload_pool.take(segment.len());
+            segment_buffer.extend_from_slice(segment);
+            self.forward_inbound_segment(&inbound, segment_buffer)
                 .await?;
         }
         Ok(())
@@ -469,6 +472,41 @@ async fn read_header(reader: &mut ReadHalf<TlsStream>) -> anyhow::Result<FrameHe
         stream_id: u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
         length: u16::from_be_bytes([header[5], header[6]]),
     })
+}
+
+async fn read_exact_payload<R>(
+    reader: &mut R,
+    payload: &mut PayloadBuffer,
+    len: usize,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    payload.clear();
+    payload.reserve(len);
+    while payload.len() < len {
+        let read = poll_fn(|cx| {
+            let remaining = len - payload.len();
+            // Read straight into spare capacity so pooled buffers do not pay for
+            // zero-filling bytes that will be overwritten immediately.
+            let mut read_buf = ReadBuf::uninit(&mut payload.spare_capacity_mut()[..remaining]);
+            match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .context("read PSH payload")?;
+        if read == 0 {
+            bail!("unexpected EOF while reading PSH payload");
+        }
+        // SAFETY: `poll_read` only reports bytes in `filled()` after initializing them.
+        unsafe {
+            payload.advance_mut(read);
+        }
+    }
+    Ok(())
 }
 
 async fn handle_stream(
@@ -650,16 +688,18 @@ async fn handle_tcp_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::channel::{ChannelReader, InboundMessage, test_chunk};
+    use super::channel::{ChannelReader, InboundMessage, PayloadPool, test_chunk};
     use super::frame::{
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
         parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
     use super::io::{advance_chunk_batch, chunk_batch_slices, coalesce_download_reads, pump_copy};
+    use super::read_exact_payload;
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -808,6 +848,19 @@ mod tests {
         assert!(!saw_eof);
         assert!(buffer[..1024].iter().all(|byte| *byte == 1));
         assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
+    #[tokio::test]
+    async fn reads_psh_payload_into_pooled_buffer_without_presizing_len() {
+        let pool = Arc::new(PayloadPool::new(1));
+        let mut payload = pool.take(16);
+        assert_eq!(payload.len(), 0);
+
+        let mut reader = SegmentedReader::new([b"hel".to_vec(), b"lo".to_vec()]);
+        read_exact_payload(&mut reader, &mut payload, 5)
+            .await
+            .expect("read pooled payload");
+        assert_eq!(payload.as_slice(), b"hello");
     }
 
     #[test]
