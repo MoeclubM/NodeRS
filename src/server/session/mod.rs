@@ -734,6 +734,47 @@ mod tests {
         }
     }
 
+    struct PendingOnceSegmentedReader {
+        segments: TestVecDeque<Vec<u8>>,
+        delivered_reads: usize,
+        pending_once_after_first_read: bool,
+    }
+
+    impl PendingOnceSegmentedReader {
+        fn new(segments: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                segments: segments.into_iter().collect(),
+                delivered_reads: 0,
+                pending_once_after_first_read: true,
+            }
+        }
+    }
+
+    impl AsyncRead for PendingOnceSegmentedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.delivered_reads > 0 && self.pending_once_after_first_read {
+                self.pending_once_after_first_read = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let Some(segment) = self.segments.pop_front() else {
+                return Poll::Pending;
+            };
+            let to_copy = segment.len().min(buf.remaining());
+            buf.put_slice(&segment[..to_copy]);
+            if to_copy < segment.len() {
+                self.segments.push_front(segment[to_copy..].to_vec());
+            }
+            self.delivered_reads += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn parses_settings_lines() {
         let settings = parse_settings(b"v=2\nclient=test");
@@ -848,6 +889,50 @@ mod tests {
         assert!(!saw_eof);
         assert!(buffer[..1024].iter().all(|byte| *byte == 1));
         assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
+    #[tokio::test]
+    async fn coalesces_download_reads_after_one_scheduler_yield() {
+        let mut reader = PendingOnceSegmentedReader::new([vec![1u8; 1024], vec![2u8; 1024]]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, 2048)
+            .await
+            .expect("coalesce deferred read");
+
+        assert_eq!(filled, 2048);
+        assert!(!saw_eof);
+        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
+    #[tokio::test]
+    async fn coalescing_download_reads_does_not_wait_when_no_more_data_arrives() {
+        let mut reader = SegmentedReader::new([vec![7u8; 1024]]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) = tokio::time::timeout(
+            Duration::from_millis(50),
+            coalesce_download_reads(&mut reader, &mut buffer, first, 2048),
+        )
+        .await
+        .expect("coalesce should return without blocking")
+        .expect("coalesce result");
+
+        assert_eq!(filled, 1024);
+        assert!(!saw_eof);
     }
 
     #[tokio::test]
