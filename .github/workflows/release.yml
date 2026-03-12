@@ -66,11 +66,12 @@ jobs:
           set -euo pipefail
           tag="${RELEASE_TAG:-dev}"
           package_dir="dist/${BIN_NAME}-${tag}-${ASSET_SUFFIX}"
-          mkdir -p "$package_dir/packaging/systemd"
+          mkdir -p "$package_dir/packaging/systemd" "$package_dir/lib"
           cp "target/${TARGET}/release/${BIN_NAME}" "$package_dir/${BIN_NAME}"
           cp README.md LICENSE config.example.toml "$package_dir/"
           cp scripts/install.sh "$package_dir/install.sh"
           cp scripts/install-openrc.sh "$package_dir/install-openrc.sh"
+          cp scripts/lib/install-common.sh "$package_dir/lib/install-common.sh"
           cp scripts/upgrade.sh "$package_dir/upgrade.sh"
           cp packaging/systemd/noders-anytls.service "$package_dir/packaging/systemd/noders-anytls.service"
           chmod +x "$package_dir/install.sh" "$package_dir/install-openrc.sh" "$package_dir/upgrade.sh" "$package_dir/${BIN_NAME}"
