@@ -160,20 +160,34 @@ def write_outputs(
     memory_musl_system = signed_delta(musl_system_private, gnu_system_private)
     memory_musl_mimalloc = signed_delta(musl_mimalloc_private, gnu_system_private)
 
+    memory_mimalloc_regression = max(
+        memory_gnu_mimalloc or 0.0,
+        signed_delta(musl_mimalloc_private, musl_system_private) or 0.0,
+    )
+    memory_musl_regression = max(memory_musl_system or 0.0, 0.0)
     if memory_gnu_mimalloc is not None and memory_musl_system is not None:
-        if abs(memory_gnu_mimalloc) > abs(memory_musl_system) * 1.5:
+        if memory_mimalloc_regression > memory_musl_regression * 1.5:
             memory_culprit = "mimalloc"
-        elif abs(memory_musl_system) > abs(memory_gnu_mimalloc) * 1.5:
+        elif memory_musl_regression > memory_mimalloc_regression * 1.5:
             memory_culprit = "musl"
         else:
             memory_culprit = "mixed"
     else:
         memory_culprit = "n/a"
 
+    small_mimalloc_regression = max(
+        -(small_gnu_mimalloc or 0.0),
+        -(signed_delta(
+            small_case["musl_mimalloc_mbps"] if small_case else None,
+            small_case["musl_system_mbps"] if small_case else None,
+        ) or 0.0),
+        0.0,
+    )
+    small_musl_regression = max(-(small_musl_system or 0.0), 0.0)
     if small_gnu_mimalloc is not None and small_musl_system is not None:
-        if abs(small_gnu_mimalloc) > abs(small_musl_system) * 1.5:
+        if small_mimalloc_regression > small_musl_regression * 1.5:
             small_packet_culprit = "mimalloc"
-        elif abs(small_musl_system) > abs(small_gnu_mimalloc) * 1.5:
+        elif small_musl_regression > small_mimalloc_regression * 1.5:
             small_packet_culprit = "musl"
         else:
             small_packet_culprit = "mixed"
