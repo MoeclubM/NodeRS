@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::config::AcmeConfig;
 
 const ACME_CONTENT_TYPE: &str = "application/jose+json";
+const ACME_JWS_ALGORITHM: &str = "ES256";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_ATTEMPTS: usize = 90;
 const HTTP_BUFFER_SIZE: usize = 8192;
@@ -414,14 +415,14 @@ impl AcmeClient {
     ) -> anyhow::Result<Vec<u8>> {
         let protected = if let Some(kid) = kid {
             json!({
-                "alg": "RS256",
+                "alg": ACME_JWS_ALGORITHM,
                 "kid": kid,
                 "nonce": nonce,
                 "url": url,
             })
         } else {
             json!({
-                "alg": "RS256",
+                "alg": ACME_JWS_ALGORITHM,
                 "jwk": self.jwk_header,
                 "nonce": nonce,
                 "url": url,
@@ -896,6 +897,7 @@ struct DerElement<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use tokio::net::{TcpListener, TcpStream};
 
     #[test]
@@ -914,6 +916,38 @@ mod tests {
             parse_der_time(0x18, b"20260308000000Z").unwrap(),
             1772928000
         );
+    }
+
+    #[test]
+    fn acme_jws_header_uses_es256_for_p256_account_keys() {
+        let account_key = SigningKey::random(&mut OsRng);
+        let client = AcmeClient::new(
+            Client::new(),
+            AcmeDirectory {
+                new_nonce: "https://example.invalid/new-nonce".to_string(),
+                new_account: "https://example.invalid/new-account".to_string(),
+                new_order: "https://example.invalid/new-order".to_string(),
+            },
+            account_key,
+        )
+        .unwrap();
+        let signed = client
+            .signed_payload(
+                "https://example.invalid/new-account",
+                "nonce-1",
+                None,
+                Some(&json!({ "termsOfServiceAgreed": true })),
+            )
+            .unwrap();
+        let envelope: Value = serde_json::from_slice(&signed).unwrap();
+        let protected = envelope["protected"].as_str().unwrap();
+        let decoded = URL_SAFE_NO_PAD.decode(protected).unwrap();
+        let header: Value = serde_json::from_slice(&decoded).unwrap();
+
+        assert_eq!(header["alg"], ACME_JWS_ALGORITHM);
+        assert_eq!(header["nonce"], "nonce-1");
+        assert_eq!(header["url"], "https://example.invalid/new-account");
+        assert!(header.get("jwk").is_some());
     }
 
     #[tokio::test]
