@@ -44,6 +44,40 @@ def wait_tcp(host: str, port: int, timeout: float = 20.0) -> None:
     raise RuntimeError(f"port {host}:{port} not ready: {last_error}")
 
 
+def ensure_tls_materials(temp_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    tracked_cert = (BENCHMARK_DIR / "cert.pem").resolve()
+    tracked_key = (BENCHMARK_DIR / "key.pem").resolve()
+    if tracked_cert.exists() and tracked_key.exists():
+        return tracked_cert, tracked_key
+
+    cert_path = temp_root / "perf-cert.pem"
+    key_path = temp_root / "perf-key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(cert_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return cert_path, key_path
+
+
 class MockPanel:
     def __init__(self, port: int, server_port: int) -> None:
         self.port = port
@@ -239,12 +273,8 @@ def main() -> int:
 
     node_bin = resolve_binary(binary_dir, "noders-anytls")
     bench_bin = resolve_binary(binary_dir, "bench_anytls")
-    cert_path = (BENCHMARK_DIR / "cert.pem").resolve()
-    key_path = (BENCHMARK_DIR / "key.pem").resolve()
     if not node_bin.exists() or not bench_bin.exists():
         raise FileNotFoundError(f"benchmark binaries missing under {binary_dir}")
-    if not cert_path.exists() or not key_path.exists():
-        raise FileNotFoundError("benchmark cert.pem/key.pem missing")
 
     panel_port = reserve_port()
     server_port = reserve_port()
@@ -255,6 +285,7 @@ def main() -> int:
     processes: list[subprocess.Popen[str]] = []
     with tempfile.TemporaryDirectory(prefix="noders-perf-") as temp_dir:
         temp_root = pathlib.Path(temp_dir)
+        cert_path, key_path = ensure_tls_materials(temp_root)
         config_path = temp_root / "config.toml"
         config_path.write_text(
             "\n".join(
