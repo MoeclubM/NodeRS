@@ -44,12 +44,7 @@ where
             chunks.push_back(chunk);
             front_offset = 0;
         }
-        let policy = upload_batch_policy(
-            chunks
-                .front()
-                .map(|chunk| chunk.len().saturating_sub(front_offset))
-                .unwrap_or_default(),
-        );
+        let policy = upload_batch_policy_for_chunks(&chunks);
         while queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !finished {
             match rx.try_recv() {
                 Ok(InboundMessage::Data(chunk)) => {
@@ -260,6 +255,16 @@ where
         .context("write inbound chunk")
 }
 
+fn upload_batch_policy_for_chunks(
+    chunks: &VecDeque<BufferedChunk>,
+) -> super::frame::UploadBatchPolicy {
+    let front_len = chunks.front().map(BufferedChunk::len).unwrap_or_default();
+    // Anchor the batch tier to the original leading chunk size. Partial writes can
+    // leave a tiny front tail behind; reclassifying the whole batch from that tail
+    // alone shrinks large uploads into the small-batch policy on the next write.
+    upload_batch_policy(front_len)
+}
+
 pub(super) async fn coalesce_download_reads<R>(
     reader: &mut R,
     buffer: &mut [u8],
@@ -351,6 +356,13 @@ pub(super) fn chunk_batch_slices(
         std::array::from_fn(|_| IoSlice::new(&[]));
     let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
     slices.into_iter().take(count).collect()
+}
+
+#[cfg(test)]
+pub(super) fn chunk_batch_policy(
+    chunks: &VecDeque<BufferedChunk>,
+) -> super::frame::UploadBatchPolicy {
+    upload_batch_policy_for_chunks(chunks)
 }
 
 pub(super) fn advance_chunk_batch(

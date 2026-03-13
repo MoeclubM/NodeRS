@@ -693,7 +693,10 @@ mod tests {
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
         parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
-    use super::io::{advance_chunk_batch, chunk_batch_slices, coalesce_download_reads, pump_copy};
+    use super::io::{
+        advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
+        pump_copy,
+    };
     use super::read_exact_payload;
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
@@ -966,5 +969,26 @@ mod tests {
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].len(), 3);
         assert_eq!(slices[1].len(), 5);
+    }
+
+    #[test]
+    fn partial_front_write_keeps_large_upload_batch_policy() {
+        let large = vec![7u8; 32 * 1024];
+        let chunks = std::collections::VecDeque::from([
+            test_chunk(&large),
+            test_chunk(&large),
+            test_chunk(&large),
+            test_chunk(&large),
+            test_chunk(&large),
+            test_chunk(&large),
+            test_chunk(&large),
+        ]);
+        let policy = chunk_batch_policy(&chunks);
+        let slices = chunk_batch_slices(&chunks, 31 * 1024, policy);
+        let total: usize = slices.iter().map(|slice| slice.len()).sum();
+
+        assert_eq!(policy.max_bytes, upload_batch_policy(32 * 1024).max_bytes);
+        assert_eq!(policy.max_iovecs, upload_batch_policy(32 * 1024).max_iovecs);
+        assert_eq!(total, policy.max_bytes);
     }
 }
