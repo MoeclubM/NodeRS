@@ -1,5 +1,6 @@
 mod accounting;
 mod acme;
+mod allocator;
 mod config;
 mod limiter;
 mod panel;

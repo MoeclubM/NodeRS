@@ -14,6 +14,18 @@ require_linux() {
   fi
 }
 
+detect_release_asset_suffix() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'linux-amd64-musl\n'
+      ;;
+    *)
+      echo "Unsupported architecture for prebuilt releases: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 
 ### Install on Alpine / OpenRC / non-systemd containers
 
-If the host does not provide `systemd` such as Alpine or many LXC containers, use the standalone OpenRC installer instead. The issue is the init system, not LXC itself. The installer auto-detects `musl` vs `glibc` and downloads the matching release bundle.
+If the host does not provide `systemd` such as Alpine or many LXC containers, use the standalone OpenRC installer instead. The issue is the init system, not LXC itself. Linux installers now default to the `musl` release bundle so the same package works on both `musl` and `glibc` hosts.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install-openrc.sh | bash -s -- \
