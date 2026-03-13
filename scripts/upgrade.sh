@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPOSITORY="MoeclubM/NodeRS-AnyTLS"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 SERVICE_NAME="noders-anytls"
@@ -12,6 +13,11 @@ TMP_ROOT=""
 BACKUP_BINARY=""
 declare -a DISCOVERED_UNITS=()
 declare -a ACTIVE_UNITS=()
+
+if [[ -f "$COMMON_LIB_PATH" ]]; then
+  # shellcheck source=/dev/null
+  source "$COMMON_LIB_PATH"
+fi
 
 cleanup() {
   if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" ]]; then
@@ -56,29 +62,20 @@ require_linux() {
 }
 
 detect_asset_suffix() {
-  local arch_suffix libc_variant
+  if declare -F detect_release_asset_suffix >/dev/null 2>&1; then
+    detect_release_asset_suffix
+    return
+  fi
+
   case "$(uname -m)" in
     x86_64|amd64)
-      arch_suffix="amd64"
+      printf 'linux-amd64-musl\n'
       ;;
     *)
       echo "Unsupported architecture for prebuilt releases: $(uname -m)" >&2
       exit 1
       ;;
   esac
-
-  libc_variant="gnu"
-  if [[ -f /etc/alpine-release ]] || compgen -G '/lib/ld-musl-*.so.1' >/dev/null; then
-    libc_variant="musl"
-  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | head -n1 | grep -qi 'musl'; then
-    libc_variant="musl"
-  fi
-
-  if [[ "$libc_variant" == "musl" ]]; then
-    printf 'linux-%s-musl\n' "$arch_suffix"
-  else
-    printf 'linux-%s\n' "$arch_suffix"
-  fi
 }
 
 parse_args() {

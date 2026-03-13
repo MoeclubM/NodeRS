@@ -31,6 +31,11 @@ declare -a GENERATED_CONFIGS=()
 declare -a INSTALLED_SERVICES=()
 declare -a TARGET_NODE_IDS=()
 
+if [[ -f "$COMMON_LIB_PATH" ]]; then
+  # shellcheck source=/dev/null
+  source "$COMMON_LIB_PATH"
+fi
+
 cleanup() {
   if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" ]]; then
     rm -rf "$TMP_ROOT"
@@ -100,29 +105,20 @@ require_linux() {
 }
 
 detect_asset_suffix() {
-  local arch_suffix libc_variant
+  if declare -F detect_release_asset_suffix >/dev/null 2>&1; then
+    detect_release_asset_suffix
+    return
+  fi
+
   case "$(uname -m)" in
     x86_64|amd64)
-      arch_suffix="amd64"
+      printf 'linux-amd64-musl\n'
       ;;
     *)
       echo "Unsupported architecture for prebuilt releases: $(uname -m)" >&2
       exit 1
       ;;
   esac
-
-  libc_variant="gnu"
-  if [[ -f /etc/alpine-release ]] || compgen -G '/lib/ld-musl-*.so.1' >/dev/null; then
-    libc_variant="musl"
-  elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | head -n1 | grep -qi 'musl'; then
-    libc_variant="musl"
-  fi
-
-  if [[ "$libc_variant" == "musl" ]]; then
-    printf 'linux-%s-musl\n' "$arch_suffix"
-  else
-    printf 'linux-%s\n' "$arch_suffix"
-  fi
 }
 
 release_layout_present() {
@@ -190,9 +186,7 @@ bootstrap_args_only() {
 }
 
 load_common_or_bootstrap() {
-  if [[ -f "$COMMON_LIB_PATH" ]]; then
-    # shellcheck source=/dev/null
-    source "$COMMON_LIB_PATH"
+  if declare -F parse_args >/dev/null 2>&1; then
     return
   fi
 

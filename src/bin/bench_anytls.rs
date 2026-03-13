@@ -1,3 +1,6 @@
+#[path = "../allocator.rs"]
+mod allocator;
+
 use anyhow::{Context, bail, ensure};
 use md5::{Digest as Md5Digest, Md5};
 use rand::Rng;
