@@ -1,7 +1,6 @@
 mod accounting;
 mod acme;
 mod config;
-mod limiter;
 mod panel;
 mod runtime;
 mod server;

@@ -5,7 +5,7 @@ Pure Rust AnyTLS node for Xboard `UniProxy`.
 - Linux only
 - Native Rust AnyTLS + UOT implementation
 - Xboard `config / user / push / alive / alivelist / status` compatible
-- Multi-user hot reload, device-limit control, per-user rate limiting
+- Multi-user hot reload, device-limit control
 - Built-in ACME HTTP-01, TLS hot reload, dual-stack listen
 - No `sing-box_mod`, subprocess core, or external protocol engine at runtime
 
