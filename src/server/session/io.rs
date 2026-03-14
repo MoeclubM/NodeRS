@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::accounting::SessionControl;
 
@@ -270,7 +271,7 @@ where
     let target = target.min(buffer.len());
     let mut saw_eof = false;
     let mut retried_after_yield = false;
-    let mut retried_after_wait = false;
+    let mut wait_deadline = None;
     while filled < target {
         match try_read_available(reader, &mut buffer[filled..target]).await? {
             Some(0) => {
@@ -292,16 +293,17 @@ where
                 tokio::task::yield_now().await;
             }
             // Lossy or jittery links can deliver the next 1 KiB slice just after the current
-            // scheduler turn. Wait briefly once so concurrent small downloads can coalesce past
-            // the immediate-flush threshold without turning this into a blocking read loop.
-            None if !retried_after_wait && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD => {
-                retried_after_wait = true;
-                match wait_for_available_read(
-                    reader,
-                    &mut buffer[filled..target],
-                    SMALL_DOWNLOAD_COALESCE_WAIT,
-                )
-                .await?
+            // scheduler turn. Reuse one bounded wait budget across follow-up slices so a burst of
+            // delayed 1 KiB chunks can still coalesce past the immediate-flush threshold without
+            // turning this into an open-ended blocking read loop.
+            None if filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD => {
+                let deadline = *wait_deadline
+                    .get_or_insert_with(|| Instant::now() + SMALL_DOWNLOAD_COALESCE_WAIT);
+                if Instant::now() >= deadline {
+                    break;
+                }
+                match wait_for_available_read_until(reader, &mut buffer[filled..target], deadline)
+                    .await?
                 {
                     Some(0) => {
                         saw_eof = true;
@@ -338,15 +340,15 @@ where
     .await
 }
 
-async fn wait_for_available_read<R>(
+async fn wait_for_available_read_until<R>(
     reader: &mut R,
     buffer: &mut [u8],
-    wait: std::time::Duration,
+    deadline: Instant,
 ) -> std::io::Result<Option<usize>>
 where
     R: AsyncRead + Unpin,
 {
-    let delay = tokio::time::sleep(wait);
+    let delay = tokio::time::sleep_until(deadline);
     tokio::pin!(delay);
     poll_fn(|cx| {
         let mut read_buf = ReadBuf::new(buffer);
