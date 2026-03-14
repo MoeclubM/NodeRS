@@ -15,7 +15,8 @@ use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 use super::frame::{
     CMD_FIN, CMD_PSH, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
-    SMALL_DATA_FRAME_FLUSH_THRESHOLD, download_coalesce_target, upload_batch_policy,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, download_coalesce_target,
+    upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame};
 
@@ -250,6 +251,7 @@ where
     let target = target.min(buffer.len());
     let mut saw_eof = false;
     let mut retried_after_yield = false;
+    let mut retried_after_wait = false;
     while filled < target {
         match try_read_available(reader, &mut buffer[filled..target]).await? {
             Some(0) => {
@@ -270,6 +272,32 @@ where
                 retried_after_yield = true;
                 tokio::task::yield_now().await;
             }
+            // Lossy or jittery links can deliver the next 1 KiB slice just after the current
+            // scheduler turn. Wait briefly once so concurrent small downloads can coalesce past
+            // the immediate-flush threshold without turning this into a blocking read loop.
+            None if !retried_after_wait && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD => {
+                retried_after_wait = true;
+                match wait_for_available_read(
+                    reader,
+                    &mut buffer[filled..target],
+                    SMALL_DOWNLOAD_COALESCE_WAIT,
+                )
+                .await?
+                {
+                    Some(0) => {
+                        saw_eof = true;
+                        break;
+                    }
+                    Some(read) => {
+                        filled += read;
+                        retried_after_yield = false;
+                        if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
             None => break,
         }
     }
@@ -286,6 +314,33 @@ where
             Poll::Ready(Ok(())) => Poll::Ready(Ok(Some(read_buf.filled().len()))),
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Ready(Ok(None)),
+        }
+    })
+    .await
+}
+
+async fn wait_for_available_read<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    wait: std::time::Duration,
+) -> std::io::Result<Option<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    let delay = tokio::time::sleep(wait);
+    tokio::pin!(delay);
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buffer);
+        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(Some(read_buf.filled().len()))),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => {
+                if delay.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(Ok(None))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     })
     .await

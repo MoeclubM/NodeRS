@@ -698,6 +698,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::sync::mpsc;
+    use tokio::time::{Instant, Sleep};
     struct SegmentedReader {
         segments: TestVecDeque<Vec<u8>>,
     }
@@ -754,6 +755,62 @@ mod tests {
                 self.pending_once_after_first_read = false;
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
+            }
+
+            let Some(segment) = self.segments.pop_front() else {
+                return Poll::Pending;
+            };
+            let to_copy = segment.len().min(buf.remaining());
+            buf.put_slice(&segment[..to_copy]);
+            if to_copy < segment.len() {
+                self.segments.push_front(segment[to_copy..].to_vec());
+            }
+            self.delivered_reads += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct DelayedSegmentedReader {
+        segments: TestVecDeque<Vec<u8>>,
+        delivered_reads: usize,
+        delay: Duration,
+        wake: Option<Pin<Box<Sleep>>>,
+    }
+
+    impl DelayedSegmentedReader {
+        fn new(delay: Duration, segments: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                segments: segments.into_iter().collect(),
+                delivered_reads: 0,
+                delay,
+                wake: None,
+            }
+        }
+    }
+
+    impl AsyncRead for DelayedSegmentedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.delivered_reads > 0 {
+                if self.wake.is_none() {
+                    self.wake = Some(Box::pin(tokio::time::sleep_until(
+                        Instant::now() + self.delay,
+                    )));
+                }
+                if self
+                    .wake
+                    .as_mut()
+                    .expect("wake timer initialized")
+                    .as_mut()
+                    .poll(cx)
+                    .is_pending()
+                {
+                    return Poll::Pending;
+                }
+                self.wake = None;
             }
 
             let Some(segment) = self.segments.pop_front() else {
@@ -898,6 +955,30 @@ mod tests {
         let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, 2048)
             .await
             .expect("coalesce deferred read");
+
+        assert_eq!(filled, 2048);
+        assert!(!saw_eof);
+        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
+    #[tokio::test]
+    async fn coalesces_download_reads_after_brief_delay() {
+        let mut reader = DelayedSegmentedReader::new(
+            Duration::from_millis(1),
+            [vec![1u8; 1024], vec![2u8; 1024]],
+        );
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, 2048)
+            .await
+            .expect("coalesce delayed read");
 
         assert_eq!(filled, 2048);
         assert!(!saw_eof);
