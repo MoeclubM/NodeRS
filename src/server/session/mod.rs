@@ -19,7 +19,6 @@ use tracing::{debug, warn};
 
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::config::OutboundConfig;
-use crate::limiter::SharedRateLimiter;
 
 use super::activity::{ActivityTracker, HEARTBEAT_INTERVAL, SESSION_IDLE_TIMEOUT};
 use super::padding::PaddingScheme;
@@ -144,7 +143,6 @@ struct StreamState {
 struct StreamContext {
     writer: FrameWriter,
     control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
     route_rules: RouteRules,
     outbound: OutboundConfig,
     activity: Arc<ActivityTracker>,
@@ -157,7 +155,6 @@ struct TcpStreamContext {
     writer: FrameWriter,
     stream_id: u32,
     control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
     activity: Arc<ActivityTracker>,
     upload_traffic: TrafficRecorder,
     download_traffic: TrafficRecorder,
@@ -291,7 +288,6 @@ impl Session {
         let context = StreamContext {
             writer: writer.clone(),
             control: control.clone(),
-            limiter: None,
             route_rules: self.route_rules.clone(),
             outbound: self.outbound.clone(),
             activity: self.activity.clone(),
@@ -547,7 +543,6 @@ async fn handle_stream(
                             bridge_control,
                             None,
                             None,
-                            None,
                         )
                         .await
                     });
@@ -561,7 +556,6 @@ async fn handle_stream(
                             stream_id,
                             pump_control,
                             None,
-                            None,
                             Some(pump_activity),
                         )
                         .await
@@ -570,7 +564,6 @@ async fn handle_stream(
                         .run(
                             app_bridge_side,
                             context.control,
-                            context.limiter,
                             context.upload_traffic,
                             context.download_traffic,
                         )
@@ -631,7 +624,6 @@ async fn handle_stream(
                     writer: context.writer.clone(),
                     stream_id,
                     control: context.control,
-                    limiter: context.limiter,
                     activity: context.activity,
                     upload_traffic: context.upload_traffic,
                     download_traffic: context.download_traffic,
@@ -679,7 +671,6 @@ async fn handle_tcp_stream(
         context.writer,
         context.stream_id,
         context.control,
-        context.limiter,
         Some(context.download_traffic),
         Some(context.activity),
     );
@@ -832,7 +823,6 @@ mod tests {
                     &mut source_reader,
                     &mut sink_writer,
                     control,
-                    None,
                     Some(TrafficRecorder::upload(accounting, 7)),
                     None,
                 )

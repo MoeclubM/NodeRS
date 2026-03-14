@@ -12,7 +12,6 @@ pub struct UserEntry {
     pub id: i64,
     pub uuid: String,
     pub password_sha256: [u8; 32],
-    pub speed_limit: i64,
     pub device_limit: i64,
 }
 
@@ -148,7 +147,6 @@ impl Accounting {
                     id: user.id,
                     uuid: user.uuid.clone(),
                     password_sha256: sha256_bytes(user.uuid.as_bytes()),
-                    speed_limit: user.speed_limit,
                     device_limit: user.device_limit,
                 };
                 (entry.password_sha256, entry)
@@ -387,7 +385,6 @@ mod tests {
         accounting.replace_users(&[PanelUser {
             id: 1,
             uuid: "abc".to_string(),
-            speed_limit: 0,
             device_limit: 0,
         }]);
         let hash = sha256_bytes(b"abc");
@@ -400,7 +397,6 @@ mod tests {
         accounting.replace_users(&[PanelUser {
             id: 1,
             uuid: "abc".to_string(),
-            speed_limit: 0,
             device_limit: 1,
         }]);
         let user = accounting
@@ -422,7 +418,6 @@ mod tests {
         accounting.replace_users(&[PanelUser {
             id: 1,
             uuid: "abc".to_string(),
-            speed_limit: 0,
             device_limit: 0,
         }]);
         let user = accounting

@@ -9,7 +9,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::accounting::SessionControl;
-use crate::limiter::SharedRateLimiter;
 
 use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
@@ -112,7 +111,6 @@ pub(super) async fn pump_copy<R, W>(
     reader: &mut R,
     writer: &mut W,
     control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
     traffic: Option<TrafficRecorder>,
     activity: Option<Arc<ActivityTracker>>,
 ) -> anyhow::Result<u64>
@@ -126,13 +124,9 @@ where
         if control.is_cancelled() {
             return Ok(total);
         }
-        let chunk_len = limiter
-            .as_ref()
-            .map(|limiter| limiter.chunk_size(buffer.len()))
-            .unwrap_or(buffer.len());
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer[..chunk_len]) => read.context("read throttled chunk")?,
+            read = reader.read(&mut buffer) => read.context("read proxied chunk")?,
         };
         if read == 0 {
             let _ = writer.shutdown().await;
@@ -141,7 +135,7 @@ where
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
             result = writer.write_all(&buffer[..read]) => {
-                result.context("write throttled chunk")?;
+                result.context("write proxied chunk")?;
             }
         }
         let transferred = read as u64;
@@ -152,12 +146,6 @@ where
         if let Some(activity) = activity.as_ref() {
             activity.record();
         }
-        if let Some(limiter) = &limiter {
-            tokio::select! {
-                _ = control.cancelled() => return Ok(total),
-                _ = limiter.consume(read) => {}
-            }
-        }
     }
 }
 
@@ -166,7 +154,6 @@ pub(super) async fn pump_remote_to_client<R>(
     writer: FrameWriter,
     stream_id: u32,
     control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
     traffic: Option<TrafficRecorder>,
     activity: Option<Arc<ActivityTracker>>,
 ) -> anyhow::Result<u64>
@@ -179,23 +166,15 @@ where
         if control.is_cancelled() {
             return Ok(total);
         }
-        let chunk_len = limiter
-            .as_ref()
-            .map(|limiter| limiter.chunk_size(buffer.len()))
-            .unwrap_or(buffer.len());
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer[..chunk_len]) => read?,
+            read = reader.read(&mut buffer) => read?,
         };
         if read == 0 {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
-        let (read, saw_eof) = match limiter
-            .is_none()
-            .then(|| download_coalesce_target(read))
-            .flatten()
-        {
+        let (read, saw_eof) = match download_coalesce_target(read) {
             Some(target) => coalesce_download_reads(reader, &mut buffer, read, target).await?,
             None => (read, false),
         };
@@ -207,12 +186,6 @@ where
         }
         if let Some(activity) = activity.as_ref() {
             activity.record();
-        }
-        if let Some(limiter) = &limiter {
-            tokio::select! {
-                _ = control.cancelled() => return Ok(total),
-                _ = limiter.consume(read) => {}
-            }
         }
         if saw_eof {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;

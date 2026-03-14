@@ -9,7 +9,6 @@ use tracing::debug;
 
 use crate::accounting::SessionControl;
 use crate::config::OutboundConfig;
-use crate::limiter::SharedRateLimiter;
 
 use super::rules::RouteRules;
 use super::socksaddr::SocksAddr;
@@ -47,7 +46,6 @@ struct UdpRelayContext {
     socket: Arc<UdpSocket>,
     mode: RelayMode,
     control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
     traffic: TrafficRecorder,
 }
 
@@ -138,7 +136,6 @@ impl PreparedUotRelay {
         self,
         app_side: DuplexStream,
         control: Arc<SessionControl>,
-        limiter: Option<Arc<SharedRateLimiter>>,
         upload: TrafficRecorder,
         download: TrafficRecorder,
     ) -> anyhow::Result<()> {
@@ -150,14 +147,12 @@ impl PreparedUotRelay {
             socket: self.socket.clone(),
             mode: self.mode.clone(),
             control: control.clone(),
-            limiter: None,
             traffic: upload,
         };
         let server_context = UdpRelayContext {
             socket: self.socket.clone(),
             mode: self.mode.clone(),
             control,
-            limiter,
             traffic: download,
         };
 
@@ -230,12 +225,6 @@ async fn relay_client_to_udp(
             );
         }
         context.traffic.record(packet.wire_len as u64);
-        if let Some(limiter) = &context.limiter {
-            tokio::select! {
-                _ = context.control.cancelled() => return Ok(()),
-                _ = limiter.consume(packet.wire_len) => {}
-            }
-        }
     }
 }
 
@@ -275,12 +264,6 @@ async fn relay_udp_to_client(
             result = writer.write_all(&encoded) => result.context("write UOT response to AnyTLS stream")?,
         }
         context.traffic.record(encoded.len() as u64);
-        if let Some(limiter) = &context.limiter {
-            tokio::select! {
-                _ = context.control.cancelled() => return Ok(()),
-                _ = limiter.consume(encoded.len()) => {}
-            }
-        }
     }
 }
 

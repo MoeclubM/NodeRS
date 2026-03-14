@@ -649,19 +649,7 @@ async fn run_udp_proxy_session(
         let upstream_socket = upstream_socket.clone();
         let listen_socket = listen_socket.clone();
         tokio::spawn(async move {
-            let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
-            loop {
-                let size = upstream_socket.recv(&mut buffer).await?;
-                if should_drop_datagram(impairment) {
-                    continue;
-                }
-                if let Some(delay) = network_delay(impairment) {
-                    sleep(delay).await;
-                }
-                listen_socket.send_to(&buffer[..size], client).await?;
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
+            proxy_udp_download_loop(listen_socket, upstream_socket, client, impairment).await
         })
     };
 
@@ -671,6 +659,25 @@ async fn run_udp_proxy_session(
     };
     sessions.lock().await.remove(&client);
     Ok(())
+}
+
+async fn proxy_udp_download_loop(
+    listen_socket: Arc<UdpSocket>,
+    upstream_socket: Arc<UdpSocket>,
+    client: SocketAddr,
+    impairment: ImpairmentProfile,
+) -> anyhow::Result<()> {
+    let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+    loop {
+        let size = upstream_socket.recv(&mut buffer).await?;
+        if should_drop_datagram(impairment) {
+            continue;
+        }
+        if let Some(delay) = network_delay(impairment) {
+            sleep(delay).await;
+        }
+        listen_socket.send_to(&buffer[..size], client).await?;
+    }
 }
 
 async fn bind_udp_proxy_upstream_socket(upstream: SocketAddr) -> anyhow::Result<UdpSocket> {

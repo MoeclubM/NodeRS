@@ -98,8 +98,6 @@ pub struct PanelUser {
     pub id: i64,
     pub uuid: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
-    pub speed_limit: i64,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub device_limit: i64,
 }
 
@@ -387,11 +385,9 @@ mod tests {
         let user: PanelUser = serde_json::from_value(serde_json::json!({
             "id": 1,
             "uuid": "test-user",
-            "speed_limit": null,
             "device_limit": null
         }))
         .expect("parse user");
-        assert_eq!(user.speed_limit, 0);
         assert_eq!(user.device_limit, 0);
     }
 
