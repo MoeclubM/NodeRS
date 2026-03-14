@@ -1122,4 +1122,20 @@ mod tests {
         assert_eq!(writer.scalar_writes, 1);
         assert_eq!(writer.vectored_writes, 0);
     }
+
+    #[tokio::test]
+    async fn large_single_chunk_upload_batch_keeps_vectored_write_path() {
+        let payload = vec![7u8; 32 * 1024];
+        let chunks = std::collections::VecDeque::from([test_chunk(&payload)]);
+        let mut writer = WriteModeRecorder::default();
+
+        let written =
+            write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(payload.len()))
+                .await
+                .expect("write large single chunk batch");
+
+        assert_eq!(written, payload.len());
+        assert_eq!(writer.scalar_writes, 0);
+        assert_eq!(writer.vectored_writes, 1);
+    }
 }

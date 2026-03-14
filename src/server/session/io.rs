@@ -15,8 +15,8 @@ use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 use super::frame::{
     CMD_FIN, CMD_PSH, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
-    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, download_coalesce_target,
-    upload_batch_policy,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
+    download_coalesce_target, upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame};
 
@@ -210,7 +210,7 @@ where
     let Some(front) = chunks.front() else {
         return Ok(0);
     };
-    if chunks.len() == 1 {
+    if chunks.len() == 1 && front.len().saturating_sub(front_offset) <= SMALL_PAYLOAD_LEN {
         return writer
             .write(&front.bytes()[front_offset..])
             .await
