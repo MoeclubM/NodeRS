@@ -27,10 +27,19 @@ impl PayloadPool {
 
     pub(super) fn take(self: &Arc<Self>, len: usize) -> PayloadBuffer {
         let mut buffers = self.buffers.lock().expect("payload pool lock poisoned");
-        let index = buffers.iter().position(|buffer| buffer.capacity() >= len);
-        let mut bytes = index
-            .map(|index| buffers.swap_remove(index))
-            .unwrap_or_default();
+        // Hot paths usually recycle the same buffer sizes repeatedly. Reusing the most recent
+        // buffer first avoids scanning the whole cache on every small frame, and only falls
+        // back to a linear search when that hot buffer is too small for the next payload.
+        let mut bytes = buffers.pop().unwrap_or_default();
+        if bytes.capacity() < len
+            && let Some(index) = buffers.iter().position(|buffer| buffer.capacity() >= len)
+        {
+            let replacement = buffers.swap_remove(index);
+            if bytes.capacity() > 0 {
+                buffers.push(bytes);
+            }
+            bytes = replacement;
+        }
         drop(buffers);
         if bytes.capacity() < len {
             bytes.reserve(len);
@@ -463,6 +472,24 @@ mod tests {
         let reused = pool.take(32768);
         assert_eq!(reused.bytes.len(), 0);
         assert!(reused.bytes.capacity() >= 32768);
+    }
+
+    #[test]
+    fn payload_pool_scans_older_buffer_when_recent_one_is_too_small() {
+        let pool = Arc::new(PayloadPool::new(4));
+        {
+            let mut buffers = pool.buffers.lock().expect("pool lock");
+            buffers.push(Vec::with_capacity(128));
+            buffers.push(Vec::with_capacity(8));
+        }
+
+        let reused = pool.take(64);
+        assert_eq!(reused.bytes.len(), 0);
+        assert!(reused.bytes.capacity() >= 128);
+
+        let buffers = pool.buffers.lock().expect("pool lock");
+        assert_eq!(buffers.len(), 1);
+        assert!(buffers[0].capacity() >= 8);
     }
 
     #[test]
