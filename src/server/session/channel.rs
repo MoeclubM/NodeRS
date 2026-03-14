@@ -159,7 +159,7 @@ impl BufferedChunk {
 pub(super) struct InboundSender {
     tx: mpsc::Sender<InboundMessage>,
     budget: Arc<ByteBudget>,
-    small_budget_cache: Arc<Mutex<SenderBudgetCache>>,
+    small_budget_cache: Arc<SenderBudgetCache>,
 }
 
 #[derive(Debug)]
@@ -174,7 +174,7 @@ impl InboundSender {
         Self {
             tx,
             budget: budget.clone(),
-            small_budget_cache: Arc::new(Mutex::new(SenderBudgetCache::new(budget))),
+            small_budget_cache: Arc::new(SenderBudgetCache::new(budget)),
         }
     }
 
@@ -226,21 +226,21 @@ impl InboundSender {
             return Ok(ByteBudgetPermit::new(self.budget.clone(), len));
         }
 
-        let mut cache = self
-            .small_budget_cache
-            .lock()
-            .expect("sender budget cache lock poisoned");
-        if cache.reserved < len {
-            let needed = len - cache.reserved;
+        if !self.small_budget_cache.try_take(len) {
+            let needed = len.saturating_sub(self.small_budget_cache.available());
             let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
             if self.budget.try_reserve(grant).is_ok() {
-                cache.reserved += grant;
+                self.small_budget_cache.add_reserved(grant);
             } else {
                 self.budget.try_reserve(needed)?;
-                cache.reserved += needed;
+                self.small_budget_cache.add_reserved(needed);
             }
+            let reserved = self.small_budget_cache.try_take(len);
+            debug_assert!(
+                reserved,
+                "small budget cache top-up should satisfy reservation"
+            );
         }
-        cache.reserved -= len;
         Ok(ByteBudgetPermit::new(self.budget.clone(), len))
     }
 
@@ -254,51 +254,22 @@ impl InboundSender {
         }
 
         loop {
-            {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                if cache.reserved >= len {
-                    cache.reserved -= len;
-                    return Some(ByteBudgetPermit::new(self.budget.clone(), len));
-                }
+            if self.small_budget_cache.try_take(len) {
+                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
             }
 
-            let needed = {
-                let cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                len - cache.reserved
-            };
+            let needed = len.saturating_sub(self.small_budget_cache.available());
             let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
             if self.budget.try_reserve(grant).is_ok() {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                cache.reserved += grant;
-                cache.reserved -= len;
-                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+                self.small_budget_cache.add_reserved(grant);
+                continue;
             }
             if grant != needed && self.budget.try_reserve(needed).is_ok() {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                cache.reserved += needed;
-                cache.reserved -= len;
-                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+                self.small_budget_cache.add_reserved(needed);
+                continue;
             }
             self.budget.acquire(needed, &self.tx).await?;
-            let mut cache = self
-                .small_budget_cache
-                .lock()
-                .expect("sender budget cache lock poisoned");
-            cache.reserved += needed;
-            cache.reserved -= len;
-            return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+            self.small_budget_cache.add_reserved(needed);
         }
     }
 }
@@ -380,21 +351,55 @@ impl ByteBudget {
 #[derive(Debug)]
 struct SenderBudgetCache {
     budget: Arc<ByteBudget>,
-    reserved: usize,
+    reserved: AtomicUsize,
 }
 
 impl SenderBudgetCache {
     fn new(budget: Arc<ByteBudget>) -> Self {
         Self {
             budget,
-            reserved: 0,
+            reserved: AtomicUsize::new(0),
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
+    }
+
+    fn add_reserved(&self, len: usize) {
+        if len > 0 {
+            self.reserved.fetch_add(len, Ordering::AcqRel);
+        }
+    }
+
+    fn try_take(&self, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        loop {
+            let reserved = self.reserved.load(Ordering::Acquire);
+            if reserved < len {
+                return false;
+            }
+            if self
+                .reserved
+                .compare_exchange_weak(
+                    reserved,
+                    reserved - len,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
         }
     }
 }
 
 impl Drop for SenderBudgetCache {
     fn drop(&mut self) {
-        self.budget.release(self.reserved);
+        self.budget.release(self.reserved.swap(0, Ordering::AcqRel));
     }
 }
 
