@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const MAX_THROTTLE_WAIT: Duration = Duration::from_millis(100);
@@ -16,25 +16,6 @@ struct BucketState {
 }
 
 impl SharedRateLimiter {
-    #[allow(dead_code)]
-    pub fn new(bytes_per_second: u64) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(BucketState {
-                bytes_per_second,
-                burst_bytes: bucket_capacity(bytes_per_second),
-                available_at: Instant::now(),
-            }),
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn set_rate(&self, bytes_per_second: u64) {
-        let mut state = self.state.lock().expect("rate limiter poisoned");
-        state.bytes_per_second = bytes_per_second;
-        state.burst_bytes = bucket_capacity(bytes_per_second);
-        state.available_at = Instant::now();
-    }
-
     pub fn chunk_size(&self, max_bytes: usize) -> usize {
         let state = self.state.lock().expect("rate limiter poisoned");
         recommended_chunk_size(state.bytes_per_second, max_bytes)
@@ -96,7 +77,7 @@ fn burst_window(bytes_per_second: u64, burst_bytes: u64) -> Duration {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn bucket_capacity(bytes_per_second: u64) -> u64 {
     if bytes_per_second == 0 {
         0
@@ -108,11 +89,31 @@ fn bucket_capacity(bytes_per_second: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    impl SharedRateLimiter {
+        fn new_for_test(bytes_per_second: u64) -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(BucketState {
+                    bytes_per_second,
+                    burst_bytes: bucket_capacity(bytes_per_second),
+                    available_at: Instant::now(),
+                }),
+            })
+        }
+
+        fn set_rate_for_test(&self, bytes_per_second: u64) {
+            let mut state = self.state.lock().expect("rate limiter poisoned");
+            state.bytes_per_second = bytes_per_second;
+            state.burst_bytes = bucket_capacity(bytes_per_second);
+            state.available_at = Instant::now();
+        }
+    }
 
     #[test]
     fn updates_rate() {
-        let limiter = SharedRateLimiter::new(1024);
-        limiter.set_rate(2048);
+        let limiter = SharedRateLimiter::new_for_test(1024);
+        limiter.set_rate_for_test(2048);
         let state = limiter.state.lock().expect("rate limiter poisoned");
         assert_eq!(state.bytes_per_second, 2048);
         assert_eq!(state.burst_bytes, 64 * 1024);
@@ -120,11 +121,11 @@ mod tests {
 
     #[test]
     fn scales_chunk_size_with_rate() {
-        let limiter = SharedRateLimiter::new(125 * 1024);
+        let limiter = SharedRateLimiter::new_for_test(125 * 1024);
         assert_eq!(limiter.chunk_size(64 * 1024), 12_800);
         assert_eq!(limiter.chunk_size(2 * 1024), 2 * 1024);
 
-        limiter.set_rate(10 * 1024 * 1024);
+        limiter.set_rate_for_test(10 * 1024 * 1024);
         assert_eq!(limiter.chunk_size(64 * 1024), 64 * 1024);
     }
 }

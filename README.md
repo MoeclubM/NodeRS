@@ -45,9 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --node-id 1
 ```
 
-### Override local `server_name`
+### Override certificate domain
 
-If you want to force a local SNI instead of using the one from Xboard, pass `--server-name`. This still uses automatic ACME issuance.
+If you want to force the certificate domain instead of using the one from Xboard, pass `--server-name`. This still uses automatic ACME issuance.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -209,7 +209,6 @@ Fill at least:
 
 Optional:
 
-- `tls.server_name`
 - `[outbound].dns_resolver`
 - `[outbound].ip_strategy`
 - `[tls.acme]`

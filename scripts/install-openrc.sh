@@ -68,7 +68,7 @@ Options:
   --panel-token <token>       Single-node Xboard server_token
   --node-id <id>              Single-node Xboard node id
   --xboard <url> <token> <id> Add one Xboard node triplet; may be repeated
-  --server-name <fqdn>        Override local tls.server_name and auto-issue ACME for it
+  --server-name <fqdn>        Override the certificate domain used for ACME or self-signed TLS
   --self-signed               Generate a self-signed certificate per node and disable ACME
   --self-signed-days <days>   Validity for generated self-signed certs, default: 3650
   --cert-file <path>          Use an existing certificate file and disable ACME
@@ -454,7 +454,7 @@ print_summary() {
   elif [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]]; then
     tls_summary="Using existing certificate files from --cert-file/--key-file"
   else
-    tls_summary="Auto ACME from local --server-name or Xboard server_name"
+    tls_summary="Auto ACME from --server-name or Xboard server_name"
   fi
   cat <<EOF
 Installed NodeRS-AnyTLS (OpenRC)

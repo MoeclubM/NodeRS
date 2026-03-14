@@ -49,8 +49,6 @@ pub struct NodeConfig {
 pub struct TlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-    #[serde(default)]
-    pub server_name: String,
     #[serde(default = "default_tls_reload_interval_seconds")]
     pub reload_interval_seconds: u64,
     #[serde(default)]

@@ -263,7 +263,7 @@ validate_args() {
   fi
 
   if [[ -n "$TLS_SERVER_NAME" && ( -n "$CERT_PATH" || -n "$KEY_PATH" ) ]]; then
-    echo "--server-name only affects local SNI when using --cert-file/--key-file; ACME stays disabled." >&2
+    echo "--server-name is ignored when using --cert-file/--key-file because the certificate is already selected locally." >&2
   fi
 }
 
@@ -272,7 +272,7 @@ sed_escape() {
 }
 
 render_config_file() {
-  local template_path target_path panel_url panel_token node_id cert_path key_path tls_server_name acme_enabled acme_domain account_key_path escaped_url escaped_token escaped_node_id escaped_cert escaped_key escaped_tls_server_name escaped_dns_resolver escaped_ip_strategy escaped_acme_domain escaped_acme_email escaped_acme_challenge escaped_account_key
+  local template_path target_path panel_url panel_token node_id cert_path key_path acme_enabled acme_domain account_key_path escaped_url escaped_token escaped_node_id escaped_cert escaped_key escaped_dns_resolver escaped_ip_strategy escaped_acme_domain escaped_acme_email escaped_acme_challenge escaped_account_key
   template_path="$1"
   target_path="$2"
   panel_url="$3"
@@ -280,17 +280,15 @@ render_config_file() {
   node_id="$5"
   cert_path="$6"
   key_path="$7"
-  tls_server_name="$8"
-  acme_enabled="$9"
-  acme_domain="${10}"
-  account_key_path="${11}"
+  acme_enabled="$8"
+  acme_domain="$9"
+  account_key_path="${10}"
 
   escaped_url="$(sed_escape "$panel_url")"
   escaped_token="$(sed_escape "$panel_token")"
   escaped_node_id="$(sed_escape "$node_id")"
   escaped_cert="$(sed_escape "$cert_path")"
   escaped_key="$(sed_escape "$key_path")"
-  escaped_tls_server_name="$(sed_escape "$tls_server_name")"
   escaped_dns_resolver="$(sed_escape "$DNS_RESOLVER")"
   escaped_ip_strategy="$(sed_escape "$IP_STRATEGY")"
   escaped_acme_domain="$(sed_escape "$acme_domain")"
@@ -304,7 +302,6 @@ render_config_file() {
     -e "s#node_id = 1#node_id = $escaped_node_id#g" \
     -e "s#cert_path = \"cert.pem\"#cert_path = \"$escaped_cert\"#g" \
     -e "s#key_path = \"key.pem\"#key_path = \"$escaped_key\"#g" \
-    -e "s#server_name = \"\"#server_name = \"$escaped_tls_server_name\"#g" \
     -e "s#dns_resolver = \"system\"#dns_resolver = \"$escaped_dns_resolver\"#g" \
     -e "s#ip_strategy = \"system\"#ip_strategy = \"$escaped_ip_strategy\"#g" \
     -e "s#enabled = false#enabled = $acme_enabled#g" \
@@ -418,7 +415,7 @@ determine_tls_settings() {
   account_key_path="$(node_account_key_path "$node_id")"
 
   if [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]]; then
-    printf '%s|%s|%s|false|node.example.com|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name" "$account_key_path"
+    printf '%s|%s|false|node.example.com|%s\n' "$CERT_PATH" "$KEY_PATH" "$account_key_path"
     return
   fi
 
@@ -438,7 +435,7 @@ determine_tls_settings() {
     cert_path="$(node_self_signed_cert_path "$node_id")"
     key_path="$(node_self_signed_key_path "$node_id")"
     generate_self_signed_certificate "$selected_server_name" "$cert_path" "$key_path"
-    printf '%s|%s|%s|false|node.example.com|%s\n' "$cert_path" "$key_path" "$selected_server_name" "$account_key_path"
+    printf '%s|%s|false|node.example.com|%s\n' "$cert_path" "$key_path" "$account_key_path"
     return
   fi
 
@@ -446,11 +443,11 @@ determine_tls_settings() {
   key_path="$(node_key_path "$node_id")"
   acme_enabled=true
   acme_domain="$selected_server_name"
-  printf '%s|%s|%s|%s|%s|%s\n' "$cert_path" "$key_path" "$selected_server_name" "$acme_enabled" "$acme_domain" "$account_key_path"
+  printf '%s|%s|%s|%s|%s\n' "$cert_path" "$key_path" "$acme_enabled" "$acme_domain" "$account_key_path"
 }
 
 write_xboard_configs() {
-  local staging_dir template_path spec panel_url panel_token node_id tls_settings cert_path key_path tls_server_name config_path acme_enabled acme_domain account_key_path rest
+  local staging_dir template_path spec panel_url panel_token node_id tls_settings cert_path key_path config_path acme_enabled acme_domain account_key_path rest
   staging_dir="$1"
   template_path="$staging_dir/config.example.toml"
 
@@ -460,8 +457,6 @@ write_xboard_configs() {
     cert_path="${tls_settings%%|*}"
     rest="${tls_settings#*|}"
     key_path="${rest%%|*}"
-    rest="${rest#*|}"
-    tls_server_name="${rest%%|*}"
     rest="${rest#*|}"
     acme_enabled="${rest%%|*}"
     rest="${rest#*|}"
@@ -476,7 +471,6 @@ write_xboard_configs() {
       "$node_id" \
       "$cert_path" \
       "$key_path" \
-      "$tls_server_name" \
       "$acme_enabled" \
       "$acme_domain" \
       "$account_key_path"
