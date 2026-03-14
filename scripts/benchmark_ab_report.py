@@ -47,7 +47,6 @@ class Implementation:
     ref: str
     commit: str
     binary: pathlib.Path
-    version: str | None = None
     bench_binary: pathlib.Path | None = None
 
 
@@ -683,7 +682,7 @@ def benchmark_impl(
                         "impl": implementation.label,
                         "ref": implementation.ref,
                         "commit": implementation.commit,
-                        "version": implementation.version or implementation.ref,
+                        "version": implementation.ref,
                         "scenario": case.name,
                         **metrics,
                     }
@@ -945,7 +944,6 @@ def main() -> int:
             ref=sing_version,
             commit=sing_version,
             binary=sing_binary,
-            version=sing_version,
         )
     )
 

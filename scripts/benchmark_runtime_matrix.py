@@ -185,7 +185,6 @@ def main() -> int:
             ref=sing_version,
             commit=sing_version,
             binary=sing_binary,
-            version=sing_version,
             bench_binary=implementations[0].bench_binary,
         )
     )

@@ -14,7 +14,6 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-BENCHMARK_DIR = ROOT / "benchmark"
 RESULT_RE = re.compile(
     r"mode=(?P<mode>\S+) parallel=(?P<parallel>\d+) users=(?P<users>\d+) duration=(?P<duration>\d+)s "
     r"uploaded=(?P<uploaded_mib>\d+) MiB \((?P<uploaded_mbps>[0-9.]+) Mbps\) "
@@ -45,11 +44,6 @@ def wait_tcp(host: str, port: int, timeout: float = 20.0) -> None:
 
 
 def ensure_tls_materials(temp_root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    tracked_cert = (BENCHMARK_DIR / "cert.pem").resolve()
-    tracked_key = (BENCHMARK_DIR / "key.pem").resolve()
-    if tracked_cert.exists() and tracked_key.exists():
-        return tracked_cert, tracked_key
-
     cert_path = temp_root / "perf-cert.pem"
     key_path = temp_root / "perf-key.pem"
     subprocess.run(
