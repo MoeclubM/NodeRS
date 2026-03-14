@@ -686,17 +686,18 @@ mod tests {
     };
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
-        pump_copy,
+        pump_copy, write_chunk_batch_for_test,
     };
     use super::read_exact_payload;
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
+    use std::io::IoSlice;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::mpsc;
     use tokio::time::{Instant, Sleep};
     struct SegmentedReader {
@@ -822,6 +823,51 @@ mod tests {
                 self.segments.push_front(segment[to_copy..].to_vec());
             }
             self.delivered_reads += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct WriteModeRecorder {
+        scalar_writes: usize,
+        vectored_writes: usize,
+    }
+
+    impl AsyncWrite for WriteModeRecorder {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.scalar_writes += 1;
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_writes += 1;
+            let written: usize = bufs.iter().map(|buf| buf.len()).sum();
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -1061,5 +1107,19 @@ mod tests {
         assert_eq!(policy.max_bytes, upload_batch_policy(32 * 1024).max_bytes);
         assert_eq!(policy.max_iovecs, upload_batch_policy(32 * 1024).max_iovecs);
         assert_eq!(total, policy.max_bytes);
+    }
+
+    #[tokio::test]
+    async fn single_chunk_upload_batch_uses_scalar_write_fast_path() {
+        let chunks = std::collections::VecDeque::from([test_chunk(b"hello")]);
+        let mut writer = WriteModeRecorder::default();
+
+        let written = write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(5))
+            .await
+            .expect("write single chunk batch");
+
+        assert_eq!(written, 5);
+        assert_eq!(writer.scalar_writes, 1);
+        assert_eq!(writer.vectored_writes, 0);
     }
 }
