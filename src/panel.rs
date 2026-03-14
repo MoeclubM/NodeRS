@@ -357,7 +357,6 @@ mod tests {
         let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
             "protocol": "anytls",
             "server_port": 443,
-            "server_name": null,
             "padding_scheme": null,
             "routes": null,
             "base_config": {

@@ -11,8 +11,10 @@ VERSION="latest"
 NO_RESTART=0
 TMP_ROOT=""
 BACKUP_BINARY=""
+RESTART_STATE="pending"
 declare -a DISCOVERED_UNITS=()
 declare -a ACTIVE_UNITS=()
+declare -a RESTARTED_UNITS=()
 
 if [[ -f "$COMMON_LIB_PATH" ]]; then
   # shellcheck source=/dev/null
@@ -281,22 +283,28 @@ install_from_bundle() {
 }
 
 restart_active_units() {
+  RESTARTED_UNITS=()
+
   [[ "$NO_RESTART" -eq 0 ]] || {
+    RESTART_STATE="skipped-no-restart"
     echo "Binary upgraded; service restart skipped because --no-restart was used."
     return 0
   }
 
   if ! command -v systemctl >/dev/null 2>&1; then
+    RESTART_STATE="skipped-no-systemd"
     echo "Binary upgraded; systemd not detected, so services were not restarted."
     return 0
   fi
 
   if [[ "$(id -u)" -ne 0 ]]; then
+    RESTART_STATE="skipped-non-root"
     echo "Binary upgraded; run as root if you want the upgrader to restart services automatically."
     return 0
   fi
 
   if [[ ${#DISCOVERED_UNITS[@]} -eq 0 ]]; then
+    RESTART_STATE="no-services"
     echo "Binary upgraded; no NodeRS-AnyTLS systemd units were found."
     return 0
   fi
@@ -304,6 +312,7 @@ restart_active_units() {
   systemctl daemon-reload
 
   if [[ ${#ACTIVE_UNITS[@]} -eq 0 ]]; then
+    RESTART_STATE="no-active-services"
     echo "Binary upgraded; no active NodeRS-AnyTLS services needed a restart."
     return 0
   fi
@@ -320,7 +329,9 @@ restart_active_units() {
       done
       exit 1
     fi
+    RESTARTED_UNITS+=("$unit_name")
   done
+  RESTART_STATE="restarted"
 }
 
 print_summary() {
@@ -331,19 +342,31 @@ Upgraded NodeRS-AnyTLS
   Config: $CONFIG_DIR
 EOF
 
-  if [[ "$NO_RESTART" -eq 1 ]]; then
-    echo "  Restart: skipped"
-    return
-  fi
-
-  if [[ ${#ACTIVE_UNITS[@]} -eq 0 ]]; then
-    echo "  Restart: no active services"
-    return
-  fi
-
-  for unit_name in "${ACTIVE_UNITS[@]}"; do
-    echo "  Restarted: $unit_name"
-  done
+  case "$RESTART_STATE" in
+    skipped-no-restart)
+      echo "  Restart: skipped"
+      ;;
+    skipped-no-systemd)
+      echo "  Restart: skipped because systemd was not detected"
+      ;;
+    skipped-non-root)
+      echo "  Restart: skipped because the upgrader was not run as root"
+      ;;
+    no-services)
+      echo "  Restart: no services found"
+      ;;
+    no-active-services)
+      echo "  Restart: no active services"
+      ;;
+    restarted)
+      for unit_name in "${RESTARTED_UNITS[@]}"; do
+        echo "  Restarted: $unit_name"
+      done
+      ;;
+    *)
+      echo "  Restart: not attempted"
+      ;;
+  esac
 }
 
 main() {
