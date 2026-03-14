@@ -211,6 +211,9 @@ where
     let Some(front) = chunks.front() else {
         return Ok(0);
     };
+    // GNU consistently benefits from bypassing write_vectored for tiny single-chunk uploads.
+    // Musl has not shown the same win, so keep it on the regular vectored path there.
+    #[cfg(not(target_env = "musl"))]
     if chunks.len() == 1 && front.len().saturating_sub(front_offset) <= SMALL_PAYLOAD_LEN {
         return writer
             .write(&front.bytes()[front_offset..])
