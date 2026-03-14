@@ -207,7 +207,7 @@ async fn apply_remote_config(
     if remote.protocol != "anytls" {
         anyhow::bail!("unsupported remote protocol {}", remote.protocol);
     }
-    let effective = EffectiveNodeConfig::from_remote(app_config, remote);
+    let effective = EffectiveNodeConfig::from_remote(&app_config.node.listen_ip, remote);
     server.apply_config(effective).await
 }
 

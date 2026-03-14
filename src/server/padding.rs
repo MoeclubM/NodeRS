@@ -1,6 +1,4 @@
 use anyhow::{bail, ensure};
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SCHEME: &[&str] = &[
     "stop=8",
@@ -16,15 +14,7 @@ const DEFAULT_SCHEME: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct PaddingScheme {
-    stop: u32,
-    rules: HashMap<u32, Vec<PaddingRule>>,
     raw: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PaddingRule {
-    Size { min: usize, max: usize },
-    CheckMark,
 }
 
 impl Default for PaddingScheme {
@@ -39,59 +29,38 @@ impl PaddingScheme {
     }
 
     pub fn from_lines(lines: &[String]) -> anyhow::Result<Self> {
-        let mut stop = None;
-        let mut rules = HashMap::new();
-        for line in lines {
-            let Some((key, value)) = line.split_once('=') else {
-                bail!("invalid padding line: {line}");
-            };
-            if key == "stop" {
-                stop = Some(value.parse::<u32>()?);
-                continue;
-            }
-            let packet = key.parse::<u32>()?;
-            let parts = value
-                .split(',')
-                .map(parse_rule)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            rules.insert(packet, parts);
-        }
-        let stop = stop.ok_or_else(|| anyhow::anyhow!("padding scheme missing stop"))?;
-        ensure!(stop > 0, "padding stop must be positive");
-        Ok(Self {
-            stop,
-            rules,
-            raw: lines.to_vec(),
-        })
+        validate_scheme(lines)?;
+        Ok(Self { raw: lines.to_vec() })
     }
 
     pub fn raw_lines(&self) -> &[String] {
         &self.raw
     }
-
-    #[allow(dead_code)]
-    pub fn stop(&self) -> u32 {
-        self.stop
-    }
-
-    #[allow(dead_code)]
-    pub fn packet_sizes(&self, packet_index: u32) -> Vec<Option<usize>> {
-        self.rules
-            .get(&packet_index)
-            .into_iter()
-            .flatten()
-            .map(|rule| match rule {
-                PaddingRule::CheckMark => None,
-                PaddingRule::Size { min, max } if min == max => Some(*min),
-                PaddingRule::Size { min, max } => Some(pseudo_random_between(*min, *max)),
-            })
-            .collect()
-    }
 }
 
-fn parse_rule(text: &str) -> anyhow::Result<PaddingRule> {
+fn validate_scheme(lines: &[String]) -> anyhow::Result<()> {
+    let mut saw_stop = false;
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            bail!("invalid padding line: {line}");
+        };
+        if key == "stop" {
+            ensure!(value.parse::<u32>()? > 0, "padding stop must be positive");
+            saw_stop = true;
+            continue;
+        }
+        key.parse::<u32>()?;
+        for rule in value.split(',') {
+            validate_rule(rule)?;
+        }
+    }
+    ensure!(saw_stop, "padding scheme missing stop");
+    Ok(())
+}
+
+fn validate_rule(text: &str) -> anyhow::Result<()> {
     if text == "c" {
-        return Ok(PaddingRule::CheckMark);
+        return Ok(());
     }
     let (a, b) = text
         .split_once('-')
@@ -102,19 +71,7 @@ fn parse_rule(text: &str) -> anyhow::Result<PaddingRule> {
         std::mem::swap(&mut min, &mut max);
     }
     ensure!(min > 0 && max > 0, "padding range must be positive");
-    Ok(PaddingRule::Size { min, max })
-}
-
-fn pseudo_random_between(min: usize, max: usize) -> usize {
-    if min == max {
-        return min;
-    }
-    let span = (max - min + 1) as u128;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    min + (now % span) as usize
+    Ok(())
 }
 
 #[cfg(test)]
@@ -124,8 +81,7 @@ mod tests {
     #[test]
     fn parses_default_scheme() {
         let scheme = PaddingScheme::default();
-        assert_eq!(scheme.stop(), 8);
-        assert!(!scheme.packet_sizes(2).is_empty());
+        assert_eq!(scheme.raw_lines(), &PaddingScheme::default_lines());
     }
 
     #[test]
@@ -134,5 +90,11 @@ mod tests {
             PaddingScheme::default_lines().first().map(String::as_str),
             Some("stop=8")
         );
+    }
+
+    #[test]
+    fn rejects_missing_stop() {
+        let lines = vec!["1=100-200".to_string()];
+        assert!(PaddingScheme::from_lines(&lines).is_err());
     }
 }

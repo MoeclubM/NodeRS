@@ -25,8 +25,6 @@ pub struct NodeConfigResponse {
     pub protocol: String,
     pub server_port: u16,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
-    pub server_name: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub padding_scheme: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub routes: Vec<RouteConfig>,
@@ -370,7 +368,6 @@ mod tests {
             }
         }))
         .expect("parse config");
-        assert_eq!(config.server_name, "");
         assert!(config.padding_scheme.is_empty());
         assert!(config.routes.is_empty());
     }

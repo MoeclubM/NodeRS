@@ -296,7 +296,6 @@ def main() -> int:
                     "[tls]",
                     f'cert_path = "{cert_path.as_posix()}"',
                     f'key_path = "{key_path.as_posix()}"',
-                    'server_name = "localhost"',
                     "reload_interval_seconds = 600",
                     "",
                     "[outbound]",

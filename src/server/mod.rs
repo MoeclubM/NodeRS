@@ -33,22 +33,15 @@ const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
-    pub server_name: String,
     pub padding_scheme: Vec<String>,
     pub routes: Vec<RouteConfig>,
 }
 
 impl EffectiveNodeConfig {
-    pub fn from_remote(local: &AppConfig, remote: &NodeConfigResponse) -> Self {
-        let local_server_name = local.tls.server_name.trim();
+    pub fn from_remote(listen_ip: &str, remote: &NodeConfigResponse) -> Self {
         Self {
-            listen_ip: local.node.listen_ip.clone(),
+            listen_ip: listen_ip.to_string(),
             server_port: remote.server_port,
-            server_name: if local_server_name.is_empty() {
-                remote.server_name.clone()
-            } else {
-                local_server_name.to_string()
-            },
             padding_scheme: if remote.padding_scheme.is_empty() {
                 PaddingScheme::default_lines()
             } else {
@@ -72,62 +65,19 @@ pub struct ServerController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, LogConfig, NodeConfig, PanelConfig, ReportConfig, TlsConfig};
     use crate::panel::NodeConfigResponse;
-    use std::path::PathBuf;
-
-    fn app_config(server_name: &str) -> AppConfig {
-        AppConfig {
-            panel: PanelConfig {
-                url: "https://panel.example.com".to_string(),
-                token: "token".to_string(),
-                node_id: 1,
-                timeout_seconds: 15,
-            },
-            node: NodeConfig {
-                listen_ip: "::".to_string(),
-            },
-            tls: TlsConfig {
-                cert_path: PathBuf::from("cert.pem"),
-                key_path: PathBuf::from("key.pem"),
-                server_name: server_name.to_string(),
-                reload_interval_seconds: 60,
-                acme: None,
-            },
-            outbound: crate::config::OutboundConfig::default(),
-            report: ReportConfig::default(),
-            log: LogConfig::default(),
-        }
-    }
 
     #[test]
-    fn prefers_local_tls_server_name() {
-        let local = app_config("local.example.com");
+    fn fills_default_padding_from_remote_config() {
         let remote = NodeConfigResponse {
             protocol: "anytls".to_string(),
             server_port: 443,
-            server_name: "remote.example.com".to_string(),
-            padding_scheme: vec!["stop=1".to_string(), "0=1-1".to_string()],
-            routes: Vec::new(),
-            base_config: None,
-        };
-        let effective = EffectiveNodeConfig::from_remote(&local, &remote);
-        assert_eq!(effective.server_name, "local.example.com");
-    }
-
-    #[test]
-    fn falls_back_to_remote_server_name_and_default_padding() {
-        let local = app_config("");
-        let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            server_port: 443,
-            server_name: "remote.example.com".to_string(),
             padding_scheme: Vec::new(),
             routes: Vec::new(),
             base_config: None,
         };
-        let effective = EffectiveNodeConfig::from_remote(&local, &remote);
-        assert_eq!(effective.server_name, "remote.example.com");
+        let effective = EffectiveNodeConfig::from_remote("::", &remote);
+        assert_eq!(effective.listen_ip, "::");
         assert_eq!(effective.padding_scheme, PaddingScheme::default_lines());
     }
 
@@ -141,7 +91,8 @@ mod tests {
 }
 
 struct RunningServer {
-    config: EffectiveNodeConfig,
+    listen_ip: String,
+    server_port: u16,
     handle: JoinHandle<()>,
 }
 
@@ -179,8 +130,7 @@ impl ServerController {
         let old = {
             let mut guard = self.inner.lock().expect("server controller poisoned");
             let should_restart = guard.as_ref().is_none_or(|running| {
-                running.config.listen_ip != config.listen_ip
-                    || running.config.server_port != config.server_port
+                running.listen_ip != config.listen_ip || running.server_port != config.server_port
             });
             if !should_restart {
                 return Ok(());
@@ -235,7 +185,11 @@ impl ServerController {
         });
 
         let mut guard = self.inner.lock().expect("server controller poisoned");
-        *guard = Some(RunningServer { config, handle });
+        *guard = Some(RunningServer {
+            listen_ip: config.listen_ip,
+            server_port: config.server_port,
+            handle,
+        });
         Ok(())
     }
 
