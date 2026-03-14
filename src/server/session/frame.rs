@@ -19,6 +19,8 @@ pub(super) const MEDIUM_PAYLOAD_LEN: usize = 16 * 1024;
 pub(super) const COMPACT_FRAME_PAYLOAD_THRESHOLD: usize = 8 * 1024;
 pub(super) const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
 pub(super) const SMALL_DOWNLOAD_COALESCE_TARGET: usize = 24 * 1024;
+pub(super) const SMALL_DOWNLOAD_COALESCE_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(2);
 pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
 pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 192 * 1024;
 pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
