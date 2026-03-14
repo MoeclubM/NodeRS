@@ -5,17 +5,19 @@ Pure Rust AnyTLS node for Xboard `UniProxy`.
 - Linux only
 - Native Rust AnyTLS + UOT implementation
 - Xboard `config / user / push / alive / alivelist / status` compatible
-- Multi-user hot reload, device-limit control
 - Built-in ACME HTTP-01, TLS hot reload, dual-stack listen
-- No `sing-box_mod`, subprocess core, or external protocol engine at runtime
+- Multi-user hot reload and device-limit control
 
 ## Quick Start
 
-### Install one node
+### Before you install
 
-The installer automatically downloads the Linux release package, writes config under `/etc/noders/anytls`, creates the `systemd` service, enables it, and starts it.
+- `--panel-token` must be the Xboard global `server_token` used by `/api/v1/server/UniProxy/*`
+- Standard Linux hosts with `systemd` should use `install.sh`
+- Alpine, OpenRC, and other non-`systemd` hosts should use `install-openrc.sh`
+- On `glibc` hosts the installer prefers the GNU build; on Alpine, other `musl` hosts, or `glibc < 2.17`, it falls back to the `musl` bundle automatically
 
-By default it tries to fetch the node `server_name` from Xboard and uses it for embedded ACME HTTP-01 certificate issuance.
+### Install one node on systemd
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -24,7 +26,12 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --node-id 1
 ```
 
-`--panel-token` must be the Xboard global `server_token` used by `/api/v1/server/UniProxy/*`.
+What this does:
+
+- downloads the matching release package
+- writes config under `/etc/noders/anytls`
+- installs `/usr/local/bin/noders-anytls`
+- creates and starts `noders-anytls-<node_id>`
 
 ### Install multiple nodes
 
@@ -34,9 +41,9 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --xboard https://api.example.com server_token 2
 ```
 
-### Install on Alpine / OpenRC / non-systemd containers
+### Install on Alpine / OpenRC / non-systemd hosts
 
-If the host does not provide `systemd` such as Alpine or many LXC containers, use the standalone OpenRC installer instead. The issue is the init system, not LXC itself. Linux installers now prefer the GNU build on `glibc` hosts and automatically fall back to the `musl` bundle on Alpine, other `musl` systems, or `glibc` older than `2.17`.
+Use the OpenRC installer when the host does not provide `systemd`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install-openrc.sh | bash -s -- \
@@ -45,9 +52,15 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --node-id 1
 ```
 
-### Override certificate domain
+## TLS Options
 
-If you want to force the certificate domain instead of using the one from Xboard, pass `--server-name`. This still uses automatic ACME issuance.
+### Default: automatic ACME
+
+By default the installer fetches the node `server_name` from Xboard and uses it as the ACME domain.
+
+### Override the certificate domain
+
+If you want to force the certificate domain instead of using the one from Xboard, pass `--server-name`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -59,9 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 
 ### Generate a self-signed certificate
 
-If you want the installer to generate a local self-signed certificate instead of using ACME or pre-existing files, pass `--self-signed`. The certificate CN and SAN use `--server-name` when provided, otherwise they fall back to the node `server_name` fetched from Xboard.
-
-This mode requires `openssl` on the target Linux host.
+If you do not want ACME, pass `--self-signed`. This mode requires `openssl` on the target Linux host.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -74,7 +85,7 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 
 ### Use existing certificate files
 
-If you already have a certificate and key, pass both paths. In this mode the installer writes those paths into the config and does not enable ACME.
+If you already have a certificate and key, pass both paths. In this mode ACME is disabled.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -104,40 +115,30 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 - State: `/var/lib/noders/anytls`
 - Service: `noders-anytls-<node_id>`
 
-## Maintenance
+## Common Operations
 
-### Check service status
+### Check systemd service status
 
 ```bash
 systemctl status noders-anytls-1 --no-pager -l
 ```
 
-### View recent logs
+### View systemd logs
 
 ```bash
 journalctl -u noders-anytls-1 -n 100 --no-pager
-```
-
-### Follow logs live
-
-```bash
 journalctl -u noders-anytls-1 -f
 ```
 
-### Restart service
+### Restart or stop a systemd service
 
 ```bash
 systemctl restart noders-anytls-1
-```
-
-### Start or stop service
-
-```bash
 systemctl start noders-anytls-1
 systemctl stop noders-anytls-1
 ```
 
-### Enable or disable auto start
+### Enable or disable systemd auto start
 
 ```bash
 systemctl enable noders-anytls-1
@@ -150,7 +151,7 @@ systemctl disable noders-anytls-1
 cat /etc/noders/anytls/nodes/1.toml
 ```
 
-### OpenRC status and logs
+### Check OpenRC status and logs
 
 ```bash
 rc-service noders-anytls-1 status
@@ -169,24 +170,14 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 ### Upgrade to a specific release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.9
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.27
 ```
 
 ### Upgrade without restart
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.9 --no-restart
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.27 --no-restart
 ```
-
-### Cleanup migrate older installs to v0.0.26
-
-If the host was installed from an older layout and you want one pass that upgrades the binary, renames old `cert-<node_id>.pem` / `key-<node_id>.pem` files, rewrites matching config paths, and removes obsolete `tls.server_name` lines, use:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/migrate-upgrade.sh | bash -s -- --version v0.0.26
-```
-
-Add `--no-restart` if you want to inspect the migrated files before restarting services.
 
 ## Uninstall
 
@@ -209,7 +200,7 @@ cp config.example.toml config.toml
 cargo run --offline -- config.toml
 ```
 
-Fill at least:
+Minimum required fields:
 
 - `panel.url`
 - `panel.token`
@@ -217,7 +208,7 @@ Fill at least:
 - `tls.cert_path`
 - `tls.key_path`
 
-Optional:
+Common optional fields:
 
 - `[outbound].dns_resolver`
 - `[outbound].ip_strategy`
