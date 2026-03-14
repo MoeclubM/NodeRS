@@ -207,6 +207,15 @@ where
     if chunks.is_empty() {
         return Ok(0);
     }
+    let Some(front) = chunks.front() else {
+        return Ok(0);
+    };
+    if chunks.len() == 1 {
+        return writer
+            .write(&front.bytes()[front_offset..])
+            .await
+            .context("write inbound chunk");
+    }
     if writer.is_write_vectored() {
         let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] =
             std::array::from_fn(|_| IoSlice::new(&[]));
@@ -220,13 +229,23 @@ where
             .context("write inbound chunk batch");
     }
 
-    let Some(front) = chunks.front() else {
-        return Ok(0);
-    };
     writer
         .write(&front.bytes()[front_offset..])
         .await
         .context("write inbound chunk")
+}
+
+#[cfg(test)]
+pub(super) async fn write_chunk_batch_for_test<W>(
+    writer: &mut W,
+    chunks: &VecDeque<BufferedChunk>,
+    front_offset: usize,
+    policy: super::frame::UploadBatchPolicy,
+) -> anyhow::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_chunk_batch(writer, chunks, front_offset, policy).await
 }
 
 fn upload_batch_policy_for_chunks(
