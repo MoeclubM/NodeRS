@@ -21,6 +21,9 @@ use super::frame::{
 };
 use super::writer::{FrameWriter, write_frame};
 
+#[cfg(target_env = "musl")]
+const TINY_UPLOAD_BATCH_IOVECS: usize = 4;
+
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
     mut rx: mpsc::Receiver<InboundMessage>,
@@ -221,6 +224,20 @@ where
             .context("write inbound chunk");
     }
     if writer.is_write_vectored() {
+        #[cfg(target_env = "musl")]
+        if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS
+            && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS
+        {
+            // Musl benefits from keeping tiny small-upload batches off the 96-slot IoSlice
+            // staging path while still using write_vectored for single-chunk uploads.
+            return write_chunk_batch_vectored::<_, TINY_UPLOAD_BATCH_IOVECS>(
+                writer,
+                chunks,
+                front_offset,
+                policy,
+            )
+            .await;
+        }
         match policy.max_iovecs {
             SMALL_UPLOAD_BATCH_IOVECS => {
                 return write_chunk_batch_vectored::<_, SMALL_UPLOAD_BATCH_IOVECS>(
