@@ -8,8 +8,8 @@ use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
 use super::frame::{
-    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN,
-    SMALL_DATA_FRAME_FLUSH_THRESHOLD, should_flush_frame,
+    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, SMALL_PAYLOAD_LEN,
+    should_flush_frame,
 };
 
 const MAX_PENDING_COMPACT_FRAMES: usize = 64;
@@ -138,9 +138,10 @@ fn build_frame_header(cmd: u8, stream_id: u32, payload_len: usize) -> [u8; 7] {
 }
 
 fn compact_contention_strategy(cmd: u8, payload_len: usize) -> CompactContentionStrategy {
-    // Tiny PSH frames already require an immediate flush, so the pending compact queue
-    // adds per-frame allocation/notification cost without much batching benefit.
-    if cmd == CMD_PSH && payload_len > SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+    // Under contention, 1 KiB-class PSH frames are large enough that queueing them behind the
+    // current writer often costs less than repeated lock handoffs and flushes. Sub-1 KiB payloads
+    // stay inline to avoid adding allocation/notification overhead to truly tiny writes.
+    if cmd == CMD_PSH && payload_len >= SMALL_PAYLOAD_LEN {
         CompactContentionStrategy::Queue
     } else {
         CompactContentionStrategy::Inline
@@ -533,19 +534,19 @@ mod tests {
     #[test]
     fn small_flush_bound_psh_frames_stay_inline_under_contention() {
         assert_eq!(
-            compact_contention_strategy(CMD_PSH, 1024),
+            compact_contention_strategy(CMD_PSH, 512),
             CompactContentionStrategy::Inline
         );
         assert_eq!(
-            compact_contention_strategy(CMD_PSH, SMALL_DATA_FRAME_FLUSH_THRESHOLD),
+            compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN - 1),
             CompactContentionStrategy::Inline
         );
     }
 
     #[test]
-    fn larger_psh_frames_still_use_pending_queue_under_contention() {
+    fn kilobyte_and_larger_psh_frames_use_pending_queue_under_contention() {
         assert_eq!(
-            compact_contention_strategy(CMD_PSH, SMALL_DATA_FRAME_FLUSH_THRESHOLD + 1),
+            compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN),
             CompactContentionStrategy::Queue
         );
         assert_eq!(
