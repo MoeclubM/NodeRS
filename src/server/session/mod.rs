@@ -906,6 +906,9 @@ mod tests {
         assert!(large.max_bytes > medium.max_bytes);
         assert!(download_coalesce_target(1024).is_some());
         assert!(download_coalesce_target(8 * 1024).is_none());
+        #[cfg(target_env = "musl")]
+        assert_eq!(download_coalesce_target(32 * 1024), Some(48 * 1024));
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(
             download_coalesce_target(32 * 1024),
             Some(MAX_FRAME_PAYLOAD_LEN)
@@ -1054,9 +1057,15 @@ mod tests {
             .await
             .expect("coalesce immediate large read");
 
+        #[cfg(target_env = "musl")]
+        assert_eq!(filled, 48 * 1024);
+        #[cfg(not(target_env = "musl"))]
         assert_eq!(filled, 56 * 1024);
         assert!(!saw_eof);
         assert!(buffer[..32 * 1024].iter().all(|byte| *byte == 1));
+        #[cfg(target_env = "musl")]
+        assert!(buffer[32 * 1024..48 * 1024].iter().all(|byte| *byte == 2));
+        #[cfg(not(target_env = "musl"))]
         assert!(buffer[32 * 1024..56 * 1024].iter().all(|byte| *byte == 2));
     }
 
