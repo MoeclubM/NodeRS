@@ -168,14 +168,10 @@ fn build_frame_header(cmd: u8, stream_id: u32, payload_len: usize) -> [u8; 7] {
 }
 
 fn compact_contention_strategy(cmd: u8, payload_len: usize) -> CompactContentionStrategy {
-    // GNU throughput regresses when exact-1 KiB PSH frames pay the pending-queue allocation and
-    // notification cost under contention. Musl still benefits from queueing at that size, so keep
-    // the lower threshold there and only require strictly larger payloads on other targets.
-    #[cfg(target_env = "musl")]
-    let queue_psh = payload_len >= SMALL_PAYLOAD_LEN;
-    #[cfg(not(target_env = "musl"))]
-    let queue_psh = payload_len > SMALL_PAYLOAD_LEN;
-    if cmd == CMD_PSH && queue_psh {
+    // Under contention, 1 KiB-class PSH frames are large enough that queueing them behind the
+    // current writer often costs less than repeated lock handoffs and flushes. Sub-1 KiB payloads
+    // stay inline to avoid adding allocation/notification overhead to truly tiny writes.
+    if cmd == CMD_PSH && payload_len >= SMALL_PAYLOAD_LEN {
         CompactContentionStrategy::Queue
     } else {
         CompactContentionStrategy::Inline
@@ -665,23 +661,12 @@ mod tests {
             compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN - 1),
             CompactContentionStrategy::Inline
         );
-        #[cfg(not(target_env = "musl"))]
-        assert_eq!(
-            compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN),
-            CompactContentionStrategy::Inline
-        );
     }
 
     #[test]
     fn kilobyte_and_larger_psh_frames_use_pending_queue_under_contention() {
-        #[cfg(target_env = "musl")]
         assert_eq!(
             compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN),
-            CompactContentionStrategy::Queue
-        );
-        #[cfg(not(target_env = "musl"))]
-        assert_eq!(
-            compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN + 1),
             CompactContentionStrategy::Queue
         );
         assert_eq!(
