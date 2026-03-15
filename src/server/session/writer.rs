@@ -9,8 +9,8 @@ use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
 use super::frame::{
-    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, SMALL_PAYLOAD_LEN,
-    should_flush_frame,
+    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, should_flush_frame,
 };
 
 const MAX_PENDING_COMPACT_FRAMES: usize = 64;
@@ -168,10 +168,14 @@ fn build_frame_header(cmd: u8, stream_id: u32, payload_len: usize) -> [u8; 7] {
 }
 
 fn compact_contention_strategy(cmd: u8, payload_len: usize) -> CompactContentionStrategy {
-    // Under contention, 1 KiB-class PSH frames are large enough that queueing them behind the
-    // current writer often costs less than repeated lock handoffs and flushes. Sub-1 KiB payloads
-    // stay inline to avoid adding allocation/notification overhead to truly tiny writes.
-    if cmd == CMD_PSH && payload_len >= SMALL_PAYLOAD_LEN {
+    // GNU has historically done better when flush-bound <=4 KiB PSH frames stay inline under
+    // contention; queueing those tiny compact frames adds allocation and notification overhead
+    // without enough batching payoff. Musl still benefits from the tighter 1 KiB threshold.
+    #[cfg(target_env = "musl")]
+    let queue_psh = payload_len >= super::frame::SMALL_PAYLOAD_LEN;
+    #[cfg(not(target_env = "musl"))]
+    let queue_psh = payload_len > SMALL_DATA_FRAME_FLUSH_THRESHOLD;
+    if cmd == CMD_PSH && queue_psh {
         CompactContentionStrategy::Queue
     } else {
         CompactContentionStrategy::Inline
@@ -658,15 +662,26 @@ mod tests {
             CompactContentionStrategy::Inline
         );
         assert_eq!(
-            compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN - 1),
+            compact_contention_strategy(CMD_PSH, super::super::frame::SMALL_PAYLOAD_LEN - 1),
+            CompactContentionStrategy::Inline
+        );
+        #[cfg(not(target_env = "musl"))]
+        assert_eq!(
+            compact_contention_strategy(CMD_PSH, SMALL_DATA_FRAME_FLUSH_THRESHOLD),
             CompactContentionStrategy::Inline
         );
     }
 
     #[test]
     fn kilobyte_and_larger_psh_frames_use_pending_queue_under_contention() {
+        #[cfg(target_env = "musl")]
         assert_eq!(
-            compact_contention_strategy(CMD_PSH, SMALL_PAYLOAD_LEN),
+            compact_contention_strategy(CMD_PSH, super::super::frame::SMALL_PAYLOAD_LEN),
+            CompactContentionStrategy::Queue
+        );
+        #[cfg(not(target_env = "musl"))]
+        assert_eq!(
+            compact_contention_strategy(CMD_PSH, SMALL_DATA_FRAME_FLUSH_THRESHOLD + 1),
             CompactContentionStrategy::Queue
         );
         assert_eq!(
