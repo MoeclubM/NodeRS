@@ -907,10 +907,7 @@ mod tests {
         assert!(download_coalesce_target(1024).is_some());
         assert!(download_coalesce_target(8 * 1024).is_none());
         #[cfg(target_env = "musl")]
-        assert_eq!(
-            download_coalesce_target(32 * 1024),
-            Some(MAX_FRAME_PAYLOAD_LEN)
-        );
+        assert_eq!(download_coalesce_target(32 * 1024), Some(56 * 1024));
         #[cfg(not(target_env = "musl"))]
         assert_eq!(
             download_coalesce_target(32 * 1024),
