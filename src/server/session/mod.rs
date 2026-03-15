@@ -1214,6 +1214,7 @@ mod tests {
         assert_eq!(total, policy.max_bytes);
     }
 
+    #[cfg(not(target_env = "musl"))]
     #[tokio::test]
     async fn single_chunk_upload_batch_uses_scalar_write_fast_path() {
         let chunks = std::collections::VecDeque::from([test_chunk(b"hello")]);
@@ -1226,6 +1227,21 @@ mod tests {
         assert_eq!(written, 5);
         assert_eq!(writer.scalar_writes, 1);
         assert_eq!(writer.vectored_writes, 0);
+    }
+
+    #[cfg(target_env = "musl")]
+    #[tokio::test]
+    async fn single_chunk_upload_batch_keeps_vectored_write_path_on_musl() {
+        let chunks = std::collections::VecDeque::from([test_chunk(b"hello")]);
+        let mut writer = WriteModeRecorder::default();
+
+        let written = write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(5))
+            .await
+            .expect("write single chunk batch");
+
+        assert_eq!(written, 5);
+        assert_eq!(writer.scalar_writes, 0);
+        assert_eq!(writer.vectored_writes, 1);
     }
 
     #[tokio::test]
