@@ -71,7 +71,11 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: benchmark-ab-versions
-          path: target/benchmark-ab
+          path: |
+            target/benchmark-ab/report.md
+            target/benchmark-ab/summary.json
+            target/benchmark-ab/benchmark-ab-report.json
+            target/benchmark-ab/benchmark-ab-report.csv
           if-no-files-found: error
 
   runtime-matrix:
@@ -124,5 +128,8 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: benchmark-runtime-matrix
-          path: target/runtime-matrix
+          path: |
+            target/runtime-matrix/report.md
+            target/runtime-matrix/summary.json
+            target/runtime-matrix/runtime-matrix-report.json
           if-no-files-found: error
