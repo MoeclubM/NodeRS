@@ -371,6 +371,57 @@ node_config_path() {
   printf '%s\n' "${CONFIG_DIR%/}/nodes/${1}.toml"
 }
 
+openrc_node_service_path() {
+  printf '%s\n' "${OPENRC_DIR%/}/${SERVICE_NAME}-${1}"
+}
+
+openrc_node_service_pid_path() {
+  printf '%s\n' "${RUN_DIR%/}/${SERVICE_NAME}-${1}.pid"
+}
+
+openrc_node_service_log_path() {
+  printf '%s\n' "${LOG_DIR%/}/${SERVICE_NAME}-${1}.log"
+}
+
+render_openrc_service_file() {
+  local target node_id config_path service_user service_group pid_path log_path
+  target="$1"
+  node_id="$2"
+  config_path="$3"
+  service_user="$4"
+  service_group="$5"
+  pid_path="$(openrc_node_service_pid_path "$node_id")"
+  log_path="$(openrc_node_service_log_path "$node_id")"
+
+  cat > "$target" <<EOF
+#!/sbin/openrc-run
+
+name="${SERVICE_NAME}-${node_id}"
+description="NodeRS-AnyTLS service for node ${node_id}"
+command="${PREFIX}/bin/noders-anytls"
+command_args="${config_path}"
+command_user="${service_user}:${service_group}"
+directory="${STATE_DIR}"
+pidfile="${pid_path}"
+supervisor="supervise-daemon"
+respawn_delay="2"
+respawn_max="0"
+output_log="${log_path}"
+error_log="${log_path}"
+
+depend() {
+  need net
+  after firewall
+}
+
+start_pre() {
+  checkpath --directory --owner ${service_user}:${service_group} --mode 0755 "${STATE_DIR}" "${RUN_DIR}" "${LOG_DIR}"
+  checkpath --file --owner ${service_user}:${service_group} --mode 0644 "${log_path}"
+}
+EOF
+  chmod 0755 "$target"
+}
+
 generate_self_signed_certificate() {
   local server_name cert_path key_path tmp_config cert_dir
   server_name="$1"
