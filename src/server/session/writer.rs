@@ -106,6 +106,18 @@ impl FrameWriter {
         let header = build_frame_header(cmd, stream_id, payload_len);
         buffer[..7].copy_from_slice(&header);
 
+        if let Ok(mut writer) = self.inner.try_lock() {
+            writer
+                .write_all(&buffer[..7 + payload_len])
+                .await
+                .context("write prefixed session frame")?;
+            return self.flush_after_write(&mut *writer, cmd, payload_len).await;
+        }
+        if payload_len >= 32 * 1024 {
+            return self
+                .enqueue_pending_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice(), false)
+                .await;
+        }
         let mut writer = self.inner.lock().await;
         writer
             .write_all(&buffer[..7 + payload_len])
@@ -120,13 +132,25 @@ impl FrameWriter {
         cmd: u8,
         payload: &[u8],
     ) -> anyhow::Result<()> {
+        self.enqueue_pending_frame(
+            compact_frame_buffer(header, payload).into_boxed_slice(),
+            should_flush_frame(cmd, payload.len()),
+        )
+        .await
+    }
+
+    async fn enqueue_pending_frame(
+        &self,
+        buffer: Box<[u8]>,
+        needs_flush: bool,
+    ) -> anyhow::Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         enqueue_pending_compact_frame(
             &self.pending_compact,
             &self.pending_compact_len,
             PendingCompactFrame {
-                buffer: compact_frame_buffer(header, payload).into_boxed_slice(),
-                needs_flush: should_flush_frame(cmd, payload.len()),
+                buffer,
+                needs_flush,
                 done: done_tx,
             },
         )?;
