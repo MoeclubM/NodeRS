@@ -12,6 +12,7 @@ NO_RESTART=0
 TMP_ROOT=""
 BACKUP_BINARY=""
 RESTART_STATE="pending"
+SERVICE_MANAGER="none"
 declare -a DISCOVERED_UNITS=()
 declare -a ACTIVE_UNITS=()
 declare -a RESTARTED_UNITS=()
@@ -234,32 +235,54 @@ ensure_existing_installation() {
 discover_units() {
   DISCOVERED_UNITS=()
 
-  if ! command -v systemctl >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1; then
+    SERVICE_MANAGER="systemd"
+
+    local unit_path unit_name
+    shopt -s nullglob
+    for unit_path in /etc/systemd/system/${SERVICE_NAME}.service /etc/systemd/system/${SERVICE_NAME}-*.service; do
+      [[ -f "$unit_path" ]] || continue
+      unit_name="$(basename "$unit_path" .service)"
+      DISCOVERED_UNITS+=("$unit_name")
+    done
+    shopt -u nullglob
     return
   fi
 
-  local unit_path unit_name
-  shopt -s nullglob
-  for unit_path in /etc/systemd/system/${SERVICE_NAME}.service /etc/systemd/system/${SERVICE_NAME}-*.service; do
-    [[ -f "$unit_path" ]] || continue
-    unit_name="$(basename "$unit_path" .service)"
-    DISCOVERED_UNITS+=("$unit_name")
-  done
-  shopt -u nullglob
+  if command -v rc-service >/dev/null 2>&1; then
+    SERVICE_MANAGER="openrc"
+
+    local service_path unit_name
+    shopt -s nullglob
+    for service_path in /etc/init.d/${SERVICE_NAME} /etc/init.d/${SERVICE_NAME}-*; do
+      [[ -f "$service_path" ]] || continue
+      unit_name="$(basename "$service_path")"
+      DISCOVERED_UNITS+=("$unit_name")
+    done
+    shopt -u nullglob
+  fi
 }
 
 discover_active_units() {
   ACTIVE_UNITS=()
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return
-  fi
 
   local unit_name
-  for unit_name in "${DISCOVERED_UNITS[@]}"; do
-    if systemctl is-active --quiet "$unit_name"; then
-      ACTIVE_UNITS+=("$unit_name")
-    fi
-  done
+  case "$SERVICE_MANAGER" in
+    systemd)
+      for unit_name in "${DISCOVERED_UNITS[@]}"; do
+        if systemctl is-active --quiet "$unit_name"; then
+          ACTIVE_UNITS+=("$unit_name")
+        fi
+      done
+      ;;
+    openrc)
+      for unit_name in "${DISCOVERED_UNITS[@]}"; do
+        if rc-service "$unit_name" status >/dev/null 2>&1; then
+          ACTIVE_UNITS+=("$unit_name")
+        fi
+      done
+      ;;
+  esac
 }
 
 backup_current_binary() {
@@ -291,9 +314,9 @@ restart_active_units() {
     return 0
   }
 
-  if ! command -v systemctl >/dev/null 2>&1; then
-    RESTART_STATE="skipped-no-systemd"
-    echo "Binary upgraded; systemd not detected, so services were not restarted."
+  if [[ "$SERVICE_MANAGER" == "none" ]]; then
+    RESTART_STATE="skipped-no-service-manager"
+    echo "Binary upgraded; no supported service manager was detected, so services were not restarted."
     return 0
   fi
 
@@ -305,11 +328,13 @@ restart_active_units() {
 
   if [[ ${#DISCOVERED_UNITS[@]} -eq 0 ]]; then
     RESTART_STATE="no-services"
-    echo "Binary upgraded; no NodeRS-AnyTLS systemd units were found."
+    echo "Binary upgraded; no NodeRS-AnyTLS ${SERVICE_MANAGER} units were found."
     return 0
   fi
 
-  systemctl daemon-reload
+  if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+    systemctl daemon-reload
+  fi
 
   if [[ ${#ACTIVE_UNITS[@]} -eq 0 ]]; then
     RESTART_STATE="no-active-services"
@@ -320,14 +345,25 @@ restart_active_units() {
   local unit_name
   for unit_name in "${ACTIVE_UNITS[@]}"; do
     echo "Restarting $unit_name"
-    if ! systemctl restart "$unit_name"; then
-      echo "Restart failed for $unit_name; rolling binary back." >&2
-      restore_previous_binary
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      for unit_name in "${ACTIVE_UNITS[@]}"; do
-        systemctl restart "$unit_name" >/dev/null 2>&1 || true
-      done
-      exit 1
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+      if ! systemctl restart "$unit_name"; then
+        echo "Restart failed for $unit_name; rolling binary back." >&2
+        restore_previous_binary
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        for unit_name in "${ACTIVE_UNITS[@]}"; do
+          systemctl restart "$unit_name" >/dev/null 2>&1 || true
+        done
+        exit 1
+      fi
+    else
+      if ! rc-service "$unit_name" restart >/dev/null 2>&1 && ! rc-service "$unit_name" start >/dev/null 2>&1; then
+        echo "Restart failed for $unit_name; rolling binary back." >&2
+        restore_previous_binary
+        for unit_name in "${ACTIVE_UNITS[@]}"; do
+          rc-service "$unit_name" restart >/dev/null 2>&1 || rc-service "$unit_name" start >/dev/null 2>&1 || true
+        done
+        exit 1
+      fi
     fi
     RESTARTED_UNITS+=("$unit_name")
   done
@@ -346,8 +382,8 @@ EOF
     skipped-no-restart)
       echo "  Restart: skipped"
       ;;
-    skipped-no-systemd)
-      echo "  Restart: skipped because systemd was not detected"
+    skipped-no-service-manager)
+      echo "  Restart: skipped because no supported service manager was detected"
       ;;
     skipped-non-root)
       echo "  Restart: skipped because the upgrader was not run as root"
