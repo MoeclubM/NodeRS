@@ -51,6 +51,8 @@ Install mode:
   The script can run directly from the repo/raw URL and will download the Linux
   release bundle automatically. If it is already running inside an unpacked
   release bundle, it installs from local files without downloading again.
+  On non-systemd Linux hosts with OpenRC available, it automatically switches
+  to the OpenRC installer.
 
 Uninstall mode:
   Pass `--uninstall` to remove one node or the whole installation.
@@ -76,7 +78,7 @@ Options:
                               HTTP-01 listener address, default: [::]:80
   --uninstall                 Remove installed service(s), binary, and related files
   --all                       Used with --uninstall to remove all nodes and all data
-  --no-service                Skip systemd service installation
+  --no-service                Skip service installation
   -h, --help                  Show this help message
 
 Examples:
@@ -190,6 +192,29 @@ release_layout_present() {
   [[ -f "$COMMON_LIB_PATH" ]]
 }
 
+should_use_openrc() {
+  ! command -v systemctl >/dev/null 2>&1 &&
+  command -v rc-service >/dev/null 2>&1 &&
+  command -v rc-update >/dev/null 2>&1 &&
+  command -v start-stop-daemon >/dev/null 2>&1
+}
+
+delegate_to_openrc_if_needed() {
+  local openrc_script
+  if ! should_use_openrc; then
+    return 1
+  fi
+
+  openrc_script="$SCRIPT_DIR/install-openrc.sh"
+  if [[ ! -f "$openrc_script" ]]; then
+    echo "OpenRC was detected, but $openrc_script is missing." >&2
+    exit 1
+  fi
+
+  echo "systemd not detected; switching to the OpenRC installer." >&2
+  exec bash "$openrc_script" "$@"
+}
+
 resolve_release_tag() {
   if [[ "$VERSION" != "latest" ]]; then
     printf '%s\n' "$VERSION"
@@ -220,7 +245,11 @@ bootstrap_release() {
   curl -fL -o "$archive_path" "https://github.com/${REPOSITORY}/releases/download/${tag}/${package_name}.tar.gz"
   tar -xzf "$archive_path" -C "$TMP_ROOT"
   package_root="$TMP_ROOT/$package_name"
-  bundle_script="$package_root/install.sh"
+  if should_use_openrc; then
+    bundle_script="$package_root/install-openrc.sh"
+  else
+    bundle_script="$package_root/install.sh"
+  fi
   [[ -d "$package_root" && -f "$bundle_script" && -f "$package_root/lib/install-common.sh" ]] || {
     echo "Release package layout is invalid under $package_root" >&2
     exit 1
@@ -417,6 +446,8 @@ main() {
   load_common_or_bootstrap "$@"
   parse_args "$@"
   validate_args
+
+  delegate_to_openrc_if_needed "$@" || true
 
   if [[ "$UNINSTALL" -eq 1 ]]; then
     uninstall
