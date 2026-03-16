@@ -13,11 +13,12 @@ Pure Rust AnyTLS node for Xboard `UniProxy`.
 ### Before you install
 
 - `--panel-token` must be the Xboard global `server_token` used by `/api/v1/server/UniProxy/*`
-- Standard Linux hosts with `systemd` should use `install.sh`
-- Alpine, OpenRC, and other non-`systemd` hosts should use `install-openrc.sh`
+- `install.sh` is the default entry point on Linux
+- If the host does not provide `systemd` but does provide `OpenRC`, `install.sh` automatically switches to the OpenRC installer
+- `install-openrc.sh` is still available if you want to call the OpenRC installer directly
 - On `glibc` hosts the installer prefers the GNU build; on Alpine, other `musl` hosts, or `glibc < 2.17`, it falls back to the `musl` bundle automatically
 
-### Install one node on systemd
+### Install one node
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -43,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 
 ### Install on Alpine / OpenRC / non-systemd hosts
 
-Use the OpenRC installer when the host does not provide `systemd`.
+`install.sh` now auto-detects `OpenRC`, so this direct installer is optional.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install-openrc.sh | bash -s -- \
