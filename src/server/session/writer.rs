@@ -8,6 +8,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
+#[cfg(target_env = "musl")]
+use super::frame::MEDIUM_PAYLOAD_LEN;
 use super::frame::{
     CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, SMALL_PAYLOAD_LEN,
     should_flush_frame,
@@ -106,29 +108,21 @@ impl FrameWriter {
         let header = build_frame_header(cmd, stream_id, payload_len);
         buffer[..7].copy_from_slice(&header);
 
-        let frame = &buffer[..7 + payload_len];
-        let queue_large_prefixed = payload_len >= 32 * 1024;
-        if queue_large_prefixed
-            && (self.pending_compact_len.load(Ordering::Acquire) != 0
-                || self.pending_compact_driver.load(Ordering::Acquire))
-        {
-            // When the single pending-frame driver is already active, enqueue another large
-            // prefixed frame instead of contending for the same writer lock again.
-            return self.enqueue_prefixed_frame(frame).await;
-        }
         if let Ok(mut writer) = self.inner.try_lock() {
             writer
-                .write_all(frame)
+                .write_all(&buffer[..7 + payload_len])
                 .await
                 .context("write prefixed session frame")?;
             return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
-        if queue_large_prefixed {
-            return self.enqueue_prefixed_frame(frame).await;
+        if payload_len >= MEDIUM_PAYLOAD_LEN {
+            return self
+                .enqueue_pending_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice(), false)
+                .await;
         }
         let mut writer = self.inner.lock().await;
         writer
-            .write_all(frame)
+            .write_all(&buffer[..7 + payload_len])
             .await
             .context("write prefixed session frame")?;
         self.flush_after_write(&mut *writer, cmd, payload_len).await
@@ -186,12 +180,6 @@ impl FrameWriter {
         }
         done_rx.await.context("await compact frame completion")??;
         Ok(())
-    }
-
-    #[cfg(target_env = "musl")]
-    async fn enqueue_prefixed_frame(&self, frame: &[u8]) -> anyhow::Result<()> {
-        self.enqueue_pending_frame(frame.to_vec().into_boxed_slice(), false)
-            .await
     }
 
     async fn flush_after_write<W>(
