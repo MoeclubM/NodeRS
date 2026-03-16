@@ -25,10 +25,11 @@ use super::frame::{
 use super::writer::write_prefixed_frame;
 use super::writer::{FrameWriter, write_frame};
 
-#[cfg(target_env = "musl")]
 const TINY_UPLOAD_BATCH_IOVECS: usize = 4;
 #[cfg(target_env = "musl")]
 const INLINE_MUSL_UPLOAD_BATCH_BYTES: usize = 4 * SMALL_PAYLOAD_LEN;
+#[cfg(not(target_env = "musl"))]
+const INLINE_UPLOAD_BATCH_BYTES: usize = 2 * SMALL_PAYLOAD_LEN;
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
@@ -237,19 +238,21 @@ where
             .context("write inbound chunk");
     }
     if writer.is_write_vectored() {
+        if chunks.len() > 1 && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS {
+            #[cfg(target_env = "musl")]
+            let mut buffer = [0u8; INLINE_MUSL_UPLOAD_BATCH_BYTES];
+            #[cfg(not(target_env = "musl"))]
+            let mut buffer = [0u8; INLINE_UPLOAD_BATCH_BYTES];
+            if let Some(total) = fill_chunk_batch_inline(chunks, front_offset, &mut buffer, policy)
+            {
+                return writer
+                    .write(&buffer[..total])
+                    .await
+                    .context("write inbound chunk batch");
+            }
+        }
         #[cfg(target_env = "musl")]
         if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS {
-            if chunks.len() > 1 && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS {
-                let mut buffer = [0u8; INLINE_MUSL_UPLOAD_BATCH_BYTES];
-                if let Some(total) =
-                    fill_chunk_batch_inline(chunks, front_offset, &mut buffer, policy)
-                {
-                    return writer
-                        .write(&buffer[..total])
-                        .await
-                        .context("write inbound chunk batch");
-                }
-            }
             if chunks.len() <= TINY_UPLOAD_BATCH_IOVECS {
                 // Musl benefits from keeping tiny small-upload batches off the 80-slot IoSlice
                 // staging path while still using write_vectored for single-chunk uploads.
@@ -311,7 +314,6 @@ where
         .context("write inbound chunk")
 }
 
-#[cfg(target_env = "musl")]
 fn fill_chunk_batch_inline(
     chunks: &VecDeque<BufferedChunk>,
     front_offset: usize,
