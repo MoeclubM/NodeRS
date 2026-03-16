@@ -15,11 +15,7 @@ use super::frame::{
 
 const MAX_PENDING_COMPACT_FRAMES: usize = 64;
 
-enum PendingResultSender {
-    Ack(oneshot::Sender<anyhow::Result<()>>),
-    #[cfg(any(test, target_env = "musl"))]
-    Recycle(oneshot::Sender<anyhow::Result<Vec<u8>>>),
-}
+type PendingResultSender = oneshot::Sender<anyhow::Result<()>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactContentionStrategy {
@@ -34,8 +30,7 @@ enum PendingDrain {
 }
 
 struct PendingCompactFrame {
-    buffer: Vec<u8>,
-    frame_len: usize,
+    buffer: Box<[u8]>,
     needs_flush: bool,
     done: PendingResultSender,
 }
@@ -48,6 +43,12 @@ pub(super) struct FrameWriter {
     // Tracking the queue length atomically avoids taking the mutex in that case.
     pending_compact_len: Arc<AtomicUsize>,
     pending_compact_driver: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_env = "musl")]
+    pending_prefixed: Arc<SyncMutex<VecDeque<PendingCompactFrame>>>,
+    #[cfg(target_env = "musl")]
+    pending_prefixed_len: Arc<AtomicUsize>,
+    #[cfg(target_env = "musl")]
+    pending_prefixed_driver: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FrameWriter {
@@ -57,6 +58,12 @@ impl FrameWriter {
             pending_compact: Arc::new(SyncMutex::new(VecDeque::new())),
             pending_compact_len: Arc::new(AtomicUsize::new(0)),
             pending_compact_driver: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(target_env = "musl")]
+            pending_prefixed: Arc::new(SyncMutex::new(VecDeque::new())),
+            #[cfg(target_env = "musl")]
+            pending_prefixed_len: Arc::new(AtomicUsize::new(0)),
+            #[cfg(target_env = "musl")]
+            pending_prefixed_driver: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -92,7 +99,7 @@ impl FrameWriter {
         &self,
         cmd: u8,
         stream_id: u32,
-        buffer: &mut Vec<u8>,
+        buffer: &mut [u8],
         payload_len: usize,
     ) -> anyhow::Result<()> {
         if payload_len > MAX_FRAME_PAYLOAD_LEN {
@@ -119,17 +126,9 @@ impl FrameWriter {
             return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
         if payload_len >= 32 * 1024 {
-            let queued = std::mem::take(buffer);
-            match self.enqueue_prefixed_frame(queued, 7 + payload_len).await {
-                Ok(recycled) => {
-                    *buffer = recycled;
-                    return Ok(());
-                }
-                Err(error) => {
-                    *buffer = vec![0u8; 7 + MAX_FRAME_PAYLOAD_LEN];
-                    return Err(error);
-                }
-            }
+            return self
+                .enqueue_prefixed_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice())
+                .await;
         }
         let mut writer = self.inner.lock().await;
         writer
@@ -145,16 +144,26 @@ impl FrameWriter {
         cmd: u8,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        let buffer = compact_frame_buffer(header, payload);
+        self.enqueue_pending_frame(
+            compact_frame_buffer(header, payload).into_boxed_slice(),
+            should_flush_frame(cmd, payload.len()),
+        )
+        .await
+    }
+
+    async fn enqueue_pending_frame(
+        &self,
+        buffer: Box<[u8]>,
+        needs_flush: bool,
+    ) -> anyhow::Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         enqueue_pending_compact_frame(
             &self.pending_compact,
             &self.pending_compact_len,
             PendingCompactFrame {
                 buffer,
-                frame_len: 7 + payload.len(),
-                needs_flush: should_flush_frame(cmd, payload.len()),
-                done: PendingResultSender::Ack(done_tx),
+                needs_flush,
+                done: done_tx,
             },
         )?;
 
@@ -184,30 +193,25 @@ impl FrameWriter {
     }
 
     #[cfg(target_env = "musl")]
-    async fn enqueue_prefixed_frame(
-        &self,
-        buffer: Vec<u8>,
-        frame_len: usize,
-    ) -> anyhow::Result<Vec<u8>> {
+    async fn enqueue_prefixed_frame(&self, buffer: Box<[u8]>) -> anyhow::Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         enqueue_pending_compact_frame(
-            &self.pending_compact,
-            &self.pending_compact_len,
+            &self.pending_prefixed,
+            &self.pending_prefixed_len,
             PendingCompactFrame {
                 buffer,
-                frame_len,
                 needs_flush: false,
-                done: PendingResultSender::Recycle(done_tx),
+                done: done_tx,
             },
         )?;
 
-        if claim_pending_compact_driver(&self.pending_compact_driver) {
+        if claim_pending_compact_driver(&self.pending_prefixed_driver) {
             let drive_result = async {
                 let mut writer = self.inner.lock().await;
                 drive_pending_compact_frames(
-                    &self.pending_compact,
-                    &self.pending_compact_len,
-                    &self.pending_compact_driver,
+                    &self.pending_prefixed,
+                    &self.pending_prefixed_len,
+                    &self.pending_prefixed_driver,
                     &mut *writer,
                 )
                 .await
@@ -215,14 +219,15 @@ impl FrameWriter {
             .await;
             if let Err(error) = drive_result {
                 fail_pending_compact_frames(
-                    &self.pending_compact,
-                    &self.pending_compact_len,
+                    &self.pending_prefixed,
+                    &self.pending_prefixed_len,
                     &error,
                 );
                 return Err(error);
             }
         }
-        done_rx.await.context("await prefixed frame completion")??
+        done_rx.await.context("await prefixed frame completion")??;
+        Ok(())
     }
 
     async fn flush_after_write<W>(
@@ -244,8 +249,26 @@ impl FrameWriter {
             PendingDrain::None => false,
             PendingDrain::Drained { needs_flush } => needs_flush,
         };
+        #[cfg(target_env = "musl")]
+        let pending_prefixed_needs_flush = match drain_pending_compact_frames_if_any(
+            &self.pending_prefixed,
+            &self.pending_prefixed_len,
+            writer,
+        )
+        .await?
+        {
+            PendingDrain::None => false,
+            PendingDrain::Drained { needs_flush } => needs_flush,
+        };
+        #[cfg(not(target_env = "musl"))]
+        let pending_prefixed_needs_flush = false;
         if should_flush_frame(cmd, payload_len) || pending_needs_flush {
             writer.flush().await.context("flush session frame")?;
+        } else if pending_prefixed_needs_flush {
+            writer
+                .flush()
+                .await
+                .context("flush prefixed session frame")?;
         }
         Ok(())
     }
@@ -265,7 +288,7 @@ pub(super) async fn write_prefixed_frame(
     writer: &FrameWriter,
     cmd: u8,
     stream_id: u32,
-    buffer: &mut Vec<u8>,
+    buffer: &mut [u8],
     payload_len: usize,
 ) -> anyhow::Result<()> {
     writer
@@ -347,29 +370,13 @@ where
     match write_result {
         Ok(()) => {
             for frame in frames {
-                match frame.done {
-                    PendingResultSender::Ack(done) => {
-                        let _ = done.send(Ok(()));
-                    }
-                    #[cfg(any(test, target_env = "musl"))]
-                    PendingResultSender::Recycle(done) => {
-                        let _ = done.send(Ok(frame.buffer));
-                    }
-                }
+                let _ = frame.done.send(Ok(()));
             }
         }
         Err(error) => {
             let message = error.to_string();
             for frame in frames {
-                match frame.done {
-                    PendingResultSender::Ack(done) => {
-                        let _ = done.send(Err(anyhow::anyhow!(message.clone())));
-                    }
-                    #[cfg(any(test, target_env = "musl"))]
-                    PendingResultSender::Recycle(done) => {
-                        let _ = done.send(Err(anyhow::anyhow!(message.clone())));
-                    }
-                }
+                let _ = frame.done.send(Err(anyhow::anyhow!(message.clone())));
             }
             return Err(error);
         }
@@ -427,15 +434,7 @@ fn fail_pending_compact_frames(
     pending_len.fetch_sub(frames.len(), Ordering::AcqRel);
     let message = error.to_string();
     for frame in frames {
-        match frame.done {
-            PendingResultSender::Ack(done) => {
-                let _ = done.send(Err(anyhow::anyhow!(message.clone())));
-            }
-            #[cfg(any(test, target_env = "musl"))]
-            PendingResultSender::Recycle(done) => {
-                let _ = done.send(Err(anyhow::anyhow!(message.clone())));
-            }
-        }
+        let _ = frame.done.send(Err(anyhow::anyhow!(message.clone())));
     }
 }
 
@@ -476,7 +475,7 @@ where
     if writer.is_write_vectored() {
         let mut buffers: [&[u8]; MAX_PENDING_COMPACT_FRAMES] = std::array::from_fn(|_| &[][..]);
         for (index, frame) in frames.iter().enumerate() {
-            buffers[index] = &frame.buffer[..frame.frame_len];
+            buffers[index] = frame.buffer.as_ref();
         }
         return write_frame_buffers(
             writer,
@@ -487,7 +486,7 @@ where
     }
     for frame in frames {
         writer
-            .write_all(&frame.buffer[..frame.frame_len])
+            .write_all(&frame.buffer)
             .await
             .context("write pending compact session frame")?;
     }
@@ -681,10 +680,9 @@ mod tests {
     fn pending_compact_frame(len: usize, needs_flush: bool) -> PendingCompactFrame {
         let (done, _rx) = oneshot::channel();
         PendingCompactFrame {
-            buffer: vec![7u8; len],
-            frame_len: len,
+            buffer: vec![7u8; len].into_boxed_slice(),
             needs_flush,
-            done: PendingResultSender::Ack(done),
+            done,
         }
     }
 
@@ -724,38 +722,6 @@ mod tests {
         assert_eq!(writer.bytes.len(), 1024);
         assert_eq!(writer.write_vectored_calls, 1);
         assert_eq!(pending_len.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn draining_recycled_pending_frame_returns_full_buffer_without_writing_tail() {
-        let (done, done_rx) = oneshot::channel();
-        let mut buffer = vec![0u8; 64];
-        buffer[..32].fill(9);
-        buffer[32..].fill(3);
-        let pending = SyncMutex::new(VecDeque::from([PendingCompactFrame {
-            buffer,
-            frame_len: 32,
-            needs_flush: false,
-            done: PendingResultSender::Recycle(done),
-        }]));
-        let pending_len = AtomicUsize::new(1);
-        let mut writer = MockWriter {
-            vectored: true,
-            ..Default::default()
-        };
-
-        let needs_flush = drain_pending_compact_frames(&pending, &pending_len, &mut writer)
-            .await
-            .expect("drain recycled frame");
-        assert_eq!(needs_flush, PendingDrain::Drained { needs_flush: false });
-        assert_eq!(writer.bytes, vec![9u8; 32]);
-        let recycled = done_rx
-            .await
-            .expect("recycled buffer completion")
-            .expect("recycled buffer result");
-        assert_eq!(recycled.len(), 64);
-        assert_eq!(&recycled[..32], &[9u8; 32]);
-        assert_eq!(&recycled[32..], &[3u8; 32]);
     }
 
     #[tokio::test]
