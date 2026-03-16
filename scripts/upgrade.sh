@@ -7,6 +7,7 @@ COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
+OPENRC_DIR="/etc/init.d"
 RUN_DIR="/run/noders-anytls"
 LOG_DIR="/var/log/noders-anytls"
 SERVICE_NAME="noders-anytls"
@@ -20,6 +21,7 @@ OPENRC_SERVICE_USER="noders-anytls"
 OPENRC_SERVICE_GROUP="noders-anytls"
 declare -a DISCOVERED_UNITS=()
 declare -a ACTIVE_UNITS=()
+declare -a RESTART_TARGET_UNITS=()
 declare -a RESTARTED_UNITS=()
 
 if [[ -f "$COMMON_LIB_PATH" ]]; then
@@ -290,6 +292,28 @@ discover_active_units() {
   esac
 }
 
+openrc_unit_enabled() {
+  [[ -e "/etc/runlevels/default/$1" ]]
+}
+
+discover_restart_targets() {
+  RESTART_TARGET_UNITS=()
+
+  local unit_name
+  case "$SERVICE_MANAGER" in
+    systemd)
+      RESTART_TARGET_UNITS=("${ACTIVE_UNITS[@]}")
+      ;;
+    openrc)
+      for unit_name in "${DISCOVERED_UNITS[@]}"; do
+        if rc-service "$unit_name" status >/dev/null 2>&1 || openrc_unit_enabled "$unit_name"; then
+          RESTART_TARGET_UNITS+=("$unit_name")
+        fi
+      done
+      ;;
+  esac
+}
+
 backup_current_binary() {
   need_cmd mktemp
   TMP_ROOT="${TMP_ROOT:-$(mktemp -d)}"
@@ -334,6 +358,24 @@ repair_openrc_permissions() {
   done
 }
 
+refresh_openrc_unit_scripts() {
+  [[ "$SERVICE_MANAGER" == "openrc" ]] || return 0
+  [[ "$(id -u)" -eq 0 ]] || return 0
+
+  discover_openrc_service_account
+
+  local unit_name node_id service_path config_path
+  for unit_name in "${DISCOVERED_UNITS[@]}"; do
+    [[ "$unit_name" == "${SERVICE_NAME}-"* ]] || continue
+    node_id="${unit_name#${SERVICE_NAME}-}"
+    [[ -n "$node_id" ]] || continue
+    service_path="${OPENRC_DIR%/}/${unit_name}"
+    config_path="$(node_config_path "$node_id")"
+    [[ -f "$config_path" ]] || continue
+    render_openrc_service_file "$service_path" "$node_id" "$config_path" "$OPENRC_SERVICE_USER" "$OPENRC_SERVICE_GROUP"
+  done
+}
+
 install_from_bundle() {
   local staging_dir
   staging_dir="$1"
@@ -373,21 +415,25 @@ restart_active_units() {
     systemctl daemon-reload
   fi
 
-  if [[ ${#ACTIVE_UNITS[@]} -eq 0 ]]; then
+  if [[ ${#RESTART_TARGET_UNITS[@]} -eq 0 ]]; then
     RESTART_STATE="no-active-services"
-    echo "Binary upgraded; no active NodeRS-AnyTLS services needed a restart."
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+      echo "Binary upgraded; no enabled or running NodeRS-AnyTLS services needed a restart."
+    else
+      echo "Binary upgraded; no active NodeRS-AnyTLS services needed a restart."
+    fi
     return 0
   fi
 
   local unit_name
-  for unit_name in "${ACTIVE_UNITS[@]}"; do
+  for unit_name in "${RESTART_TARGET_UNITS[@]}"; do
     echo "Restarting $unit_name"
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
       if ! systemctl restart "$unit_name"; then
         echo "Restart failed for $unit_name; rolling binary back." >&2
         restore_previous_binary
         systemctl daemon-reload >/dev/null 2>&1 || true
-        for unit_name in "${ACTIVE_UNITS[@]}"; do
+        for unit_name in "${RESTART_TARGET_UNITS[@]}"; do
           systemctl restart "$unit_name" >/dev/null 2>&1 || true
         done
         exit 1
@@ -396,7 +442,7 @@ restart_active_units() {
       if ! rc-service "$unit_name" restart >/dev/null 2>&1 && ! rc-service "$unit_name" start >/dev/null 2>&1; then
         echo "Restart failed for $unit_name; rolling binary back." >&2
         restore_previous_binary
-        for unit_name in "${ACTIVE_UNITS[@]}"; do
+        for unit_name in "${RESTART_TARGET_UNITS[@]}"; do
           rc-service "$unit_name" restart >/dev/null 2>&1 || rc-service "$unit_name" start >/dev/null 2>&1 || true
         done
         exit 1
@@ -454,7 +500,9 @@ main() {
   ensure_existing_installation
   discover_units
   repair_openrc_permissions
+  refresh_openrc_unit_scripts
   discover_active_units
+  discover_restart_targets
   backup_current_binary
   install_from_bundle "$SCRIPT_DIR"
   restart_active_units
