@@ -222,7 +222,7 @@ impl FrameWriter {
                 return Err(error);
             }
         }
-        Ok(done_rx.await.context("await prefixed frame completion")??)
+        done_rx.await.context("await prefixed frame completion")??
     }
 
     async fn flush_after_write<W>(
