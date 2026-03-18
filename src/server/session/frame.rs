@@ -34,9 +34,12 @@ pub(super) const LARGE_UPLOAD_BATCH_IOVECS: usize = 42;
 pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 pub(super) const LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
-pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
+pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 4096;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
-pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 512 * 1024;
+// This queue doubles as the effective upload window between the AnyTLS session and the
+// outbound TCP socket. 512 KiB was enough to cap weak-link uploads around 24 Mbps in the
+// bundled 80 ms + jitter benchmark profile, so keep materially more BDP headroom here.
+pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PayloadTier {
