@@ -146,7 +146,12 @@ impl BufferedChunk {
         self.payload
     }
 
-    pub(super) fn split_off(self, at: usize) -> Self {
+    pub(super) fn release_written(&mut self, len: usize) {
+        self.permit.consume(len);
+    }
+
+    pub(super) fn split_off(mut self, at: usize) -> Self {
+        self.permit.consume(at);
         let bytes = self.payload.into_vec();
         let bytes = bytes[at..].to_vec();
         Self {
@@ -398,6 +403,15 @@ impl ByteBudgetPermit {
     fn new(budget: Arc<ByteBudget>, len: usize) -> Self {
         Self { budget, len }
     }
+
+    fn consume(&mut self, len: usize) {
+        let released = len.min(self.len);
+        if released == 0 {
+            return;
+        }
+        self.len -= released;
+        self.budget.release(released);
+    }
 }
 
 impl Drop for ByteBudgetPermit {
@@ -595,6 +609,31 @@ mod tests {
         };
         drop(chunk);
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn split_off_releases_consumed_prefix_budget() {
+        let (sender, mut rx) = bounded_inbound_channel(8, 4);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
+            .expect("send chunk");
+
+        let chunk = match rx.recv().await.expect("receive chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let _remaining = chunk.split_off(1);
+
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![5])).is_ok(),
+            "split-off prefix bytes should release matching budget"
+        );
+        assert!(
+            sender
+                .try_send_data(PayloadBuffer::new(vec![6, 7]))
+                .is_err(),
+            "only the unread tail budget should remain reserved"
+        );
     }
 
     #[test]

@@ -1176,13 +1176,13 @@ mod tests {
         assert_eq!(front_offset, 1);
         assert!(
             sender.try_send_data(PayloadBuffer::new(vec![3; 4])).is_ok(),
-            "only the fully consumed chunk budget should have been released"
+            "partially written bytes should release matching budget immediately"
         );
         assert!(
             sender
-                .try_send_data(PayloadBuffer::new(vec![4; 1]))
+                .try_send_data(PayloadBuffer::new(vec![4; 2]))
                 .is_err(),
-            "the partially consumed chunk budget must stay reserved"
+            "the unread tail of the partially consumed chunk must stay reserved"
         );
     }
 
