@@ -96,6 +96,7 @@ def socks5_connect(
     elif atyp == 4:
         recv_exact(sock, 16)
     recv_exact(sock, 2)
+    sock.settimeout(None)
     return sock, (time.perf_counter() - started) * 1000.0
 
 
@@ -204,6 +205,7 @@ def worker_download(
     _ = chunk_size
     started = time.perf_counter()
     sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
+    sock.settimeout(1.0)
     stats.connect_ms = connect_ms
     measurement_window.mark_connected()
     measure_start, stop_time = measurement_window.wait()
@@ -212,7 +214,10 @@ def worker_download(
             now = time.perf_counter()
             if now >= stop_time:
                 break
-            chunk = sock.recv(131072)
+            try:
+                chunk = sock.recv(131072)
+            except (socket.timeout, TimeoutError):
+                continue
             if not chunk:
                 break
             if stats.first_byte_ms is None:
