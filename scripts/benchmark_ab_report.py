@@ -435,7 +435,6 @@ def run_compare_socks(
         str(case.parallel),
         "--chunk-size",
         str(case.chunk_size),
-        "--insecure",
     ]
     if case.capture_curve:
         command.extend(["--curve-file", str(curve_path), "--sample-interval", str(curve_sample_interval)])
