@@ -140,8 +140,13 @@ def write_curve_report(
 
     now = min(time.perf_counter(), stop_time)
     total_bytes = sum(item.bytes for item in stats)
-    if not samples or total_bytes != last_bytes:
-        interval_seconds = max(now - last_sample, 1e-6)
+    trailing_interval = max(now - last_sample, 0.0)
+    min_trailing_interval = max(sample_interval * 0.25, 0.05)
+    if not samples or (
+        total_bytes != last_bytes
+        and trailing_interval >= min_trailing_interval
+    ):
+        interval_seconds = max(trailing_interval, 1e-6)
         samples.append(
             {
                 "elapsed_seconds": round(min(max(now - measure_start, 0.0), measurement_seconds), 3),
