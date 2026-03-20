@@ -393,15 +393,18 @@ def summarize_curve(samples: list[dict[str, object]]) -> dict[str, object]:
     if not samples:
         return {
             "curve_points": 0,
+            "curve_head_mbps": None,
             "curve_avg_mbps": None,
             "curve_peak_mbps": None,
             "curve_min_mbps": None,
             "curve_tail_mbps": None,
         }
     mbps_values = [float(sample["mbps"]) for sample in samples]
+    head_values = mbps_values[: min(5, len(mbps_values))]
     tail_values = mbps_values[-min(5, len(mbps_values)) :]
     return {
         "curve_points": len(samples),
+        "curve_head_mbps": round(sum(head_values) / len(head_values), 2),
         "curve_avg_mbps": round(sum(mbps_values) / len(mbps_values), 2),
         "curve_peak_mbps": round(max(mbps_values), 2),
         "curve_min_mbps": round(min(mbps_values), 2),
@@ -830,6 +833,16 @@ def safe_delta(current: float | None, baseline: float | None) -> str:
     return f"{((current - baseline) / baseline) * 100:+.2f}%"
 
 
+def median_value(values: list[float | None]) -> float | None:
+    usable = sorted(value for value in values if value is not None)
+    if not usable:
+        return None
+    middle = len(usable) // 2
+    if len(usable) % 2 == 1:
+        return usable[middle]
+    return (usable[middle - 1] + usable[middle]) / 2.0
+
+
 def flatten_rows_for_csv(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     flattened: list[dict[str, object]] = []
     for row in rows:
@@ -895,6 +908,7 @@ def write_outputs(
         "| --- | " + " | ".join(["---"] * len(impl_order)) + " | --- | --- |",
     ]
     throughput_summary_rows: list[dict[str, object]] = []
+    benchmark_notes: list[dict[str, object]] = []
     for case in throughput_group:
         scenario_rows = rows_by_scenario.get(case.name, {})
         current_mbps = scenario_rows.get(current_impl, {}).get("mbps")
@@ -961,6 +975,34 @@ def write_outputs(
                         "first_byte_ms": first_byte_ms,
                     }
                 )
+            first_byte_values = [
+                float(value)
+                for value in (
+                    scenario_rows.get(impl, {}).get("first_byte_ms")
+                    for impl in impl_order
+                )
+                if value is not None
+            ]
+            first_byte_median = median_value(first_byte_values)
+            if first_byte_median is not None and first_byte_median > 0:
+                for impl in impl_order:
+                    row = scenario_rows.get(impl)
+                    if not row or row.get("first_byte_ms") is None:
+                        continue
+                    first_byte_ms = float(row["first_byte_ms"])
+                    if first_byte_ms >= max(first_byte_median * 3.0, 1000.0):
+                        benchmark_notes.append(
+                            {
+                                "scenario": case.name,
+                                "impl": impl,
+                                "severity": "warn",
+                                "kind": "first_byte_outlier",
+                                "message": (
+                                    f"first byte {first_byte_ms:.2f} ms is "
+                                    f"{first_byte_ms / first_byte_median:.2f}x peer median {first_byte_median:.2f} ms"
+                                ),
+                            }
+                        )
 
     stability_summary_rows: list[dict[str, object]] = []
     if stability_group:
@@ -999,8 +1041,8 @@ def write_outputs(
                 "",
                 "## Long Connection Curve Summary",
                 "",
-                "| Scenario | Implementation | Avg Mbps | Peak Mbps | Min Mbps | Tail Avg Mbps | Samples |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| Scenario | Implementation | Head Avg Mbps | Avg Mbps | Peak Mbps | Min Mbps | Tail Avg Mbps | Samples |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for case in curve_group:
@@ -1009,6 +1051,7 @@ def write_outputs(
                 row = scenario_rows.get(impl)
                 lines.append(
                     f"| `{case.name}` | `{impl}` | "
+                    f"{f'{row.get('curve_head_mbps'):.2f}' if row and isinstance(row.get('curve_head_mbps'), (int, float)) else 'n/a'} | "
                     f"{f'{row.get('curve_avg_mbps'):.2f}' if row and isinstance(row.get('curve_avg_mbps'), (int, float)) else 'n/a'} | "
                     f"{f'{row.get('curve_peak_mbps'):.2f}' if row and isinstance(row.get('curve_peak_mbps'), (int, float)) else 'n/a'} | "
                     f"{f'{row.get('curve_min_mbps'):.2f}' if row and isinstance(row.get('curve_min_mbps'), (int, float)) else 'n/a'} | "
@@ -1019,6 +1062,7 @@ def write_outputs(
                     {
                         "scenario": case.name,
                         "impl": impl,
+                        "curve_head_mbps": row.get("curve_head_mbps") if row else None,
                         "curve_avg_mbps": row.get("curve_avg_mbps") if row else None,
                         "curve_peak_mbps": row.get("curve_peak_mbps") if row else None,
                         "curve_min_mbps": row.get("curve_min_mbps") if row else None,
@@ -1026,6 +1070,31 @@ def write_outputs(
                         "curve_points": row.get("curve_points") if row else None,
                     }
                 )
+                if row and isinstance(row.get("curve_min_mbps"), (int, float)) and float(row["curve_min_mbps"]) <= 0.0:
+                    benchmark_notes.append(
+                        {
+                            "scenario": case.name,
+                            "impl": impl,
+                            "severity": "warn",
+                            "kind": "zero_throughput_window",
+                            "message": "curve reached 0 Mbps in at least one sample window",
+                        }
+                    )
+                if row and isinstance(row.get("curve_head_mbps"), (int, float)) and isinstance(row.get("curve_tail_mbps"), (int, float)):
+                    head_mbps = float(row["curve_head_mbps"])
+                    tail_mbps = float(row["curve_tail_mbps"])
+                    if tail_mbps > 0 and head_mbps / tail_mbps <= 0.75:
+                        benchmark_notes.append(
+                            {
+                                "scenario": case.name,
+                                "impl": impl,
+                                "severity": "info",
+                                "kind": "slow_start",
+                                "message": (
+                                    f"head avg {head_mbps:.2f} Mbps is {head_mbps / tail_mbps:.2%} of tail avg {tail_mbps:.2f} Mbps"
+                                ),
+                            }
+                        )
 
             current_tail = scenario_rows.get(current_impl, {}).get("curve_tail_mbps")
             previous_tail_values = [
@@ -1071,6 +1140,21 @@ def write_outputs(
                 f"{row['current_vs_sing_box_tail']} |"
             )
 
+    if benchmark_notes:
+        lines.extend(
+            [
+                "",
+                "## Benchmark Notes",
+                "",
+                "| Severity | Scenario | Implementation | Note |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        for note in benchmark_notes:
+            lines.append(
+                f"| {note['severity']} | `{note['scenario']}` | `{note['impl']}` | {note['message']} |"
+            )
+
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (output_dir / "summary.json").write_text(
         json.dumps(
@@ -1080,6 +1164,7 @@ def write_outputs(
                 "stability": stability_summary_rows,
                 "curve_summary": curve_summary_rows,
                 "curve_tail_comparison": curve_tail_rows,
+                "notes": benchmark_notes,
             },
             indent=2,
         ),
