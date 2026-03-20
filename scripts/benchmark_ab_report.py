@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from statistics import median
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -130,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-connection-seconds", type=int, default=30)
     parser.add_argument("--idle-seconds", type=int, default=95)
     parser.add_argument("--curve-sample-interval", type=float, default=1.0)
+    parser.add_argument("--lossy-repeats", type=int, default=3)
     return parser.parse_args()
 
 
@@ -419,10 +421,12 @@ def run_compare_socks(
     case: Case,
     curve_sample_interval: float,
     logs_dir: pathlib.Path,
+    log_prefix: str | None = None,
 ) -> dict[str, object]:
-    stdout_path = logs_dir / f"{case.name}.stdout.log"
-    stderr_path = logs_dir / f"{case.name}.stderr.log"
-    curve_path = logs_dir / f"{case.name}.curve.json"
+    prefix = log_prefix or case.name
+    stdout_path = logs_dir / f"{prefix}.stdout.log"
+    stderr_path = logs_dir / f"{prefix}.stderr.log"
+    curve_path = logs_dir / f"{prefix}.curve.json"
     command = [
         sys.executable,
         str(COMPARE_SOCKS),
@@ -463,6 +467,50 @@ def run_compare_socks(
     metrics["stderr_log"] = str(stderr_path)
     metrics["status"] = "pass"
     return metrics
+
+
+def aggregate_case_attempts(case: Case, attempts: list[dict[str, object]]) -> dict[str, object]:
+    if len(attempts) == 1:
+        attempt = dict(attempts[0])
+        attempt["attempt_count"] = 1
+        return attempt
+
+    representative = sorted(
+        attempts,
+        key=lambda item: float(item.get("mbps", 0.0)),
+    )[len(attempts) // 2]
+    aggregated = dict(representative)
+    aggregated["attempt_count"] = len(attempts)
+    aggregated["attempts"] = attempts
+
+    float_keys = [
+        "mbps",
+        "pps",
+        "connect_ms",
+        "first_byte_ms",
+        "curve_head_mbps",
+        "curve_avg_mbps",
+        "curve_peak_mbps",
+        "curve_min_mbps",
+        "curve_tail_mbps",
+    ]
+    int_keys = [
+        "bytes",
+        "curve_points",
+    ]
+
+    for key in float_keys:
+        values = [float(value) for value in (attempt.get(key) for attempt in attempts) if value is not None]
+        if values:
+            aggregated[key] = round(float(median(values)), 2)
+    for key in int_keys:
+        values = [int(value) for value in (attempt.get(key) for attempt in attempts) if value is not None]
+        if values:
+            aggregated[key] = int(round(float(median(values))))
+
+    aggregated["status"] = "pass"
+    aggregated["scenario"] = case.name
+    return aggregated
 
 
 def write_node_config(
@@ -607,6 +655,7 @@ def benchmark_impl(
     output_dir: pathlib.Path,
     curve_sample_interval: float = 1.0,
     enable_netem: bool = False,
+    lossy_repeats: int = 3,
 ) -> list[dict[str, object]]:
     impl_dir = output_dir / implementation.label
     impl_dir.mkdir(parents=True, exist_ok=True)
@@ -672,36 +721,48 @@ def benchmark_impl(
 
             rows: list[dict[str, object]] = []
             for case in cases:
-                with applied_netem(case.netem_profile, enable_netem):
-                    if case.mode == "download":
-                        with started_process(
-                            [
-                                str(bench_binary),
-                                "source",
-                                "--listen",
-                                f"127.0.0.1:{source_port}",
-                                "--chunk-size",
-                                str(case.chunk_size),
-                            ],
-                            stdout_path=impl_dir / f"{case.name}.source.stdout.log",
-                            stderr_path=impl_dir / f"{case.name}.source.stderr.log",
-                            ready_port=source_port,
-                        ):
+                attempt_count = max(1, lossy_repeats if case.netem_profile else 1)
+                case_attempts: list[dict[str, object]] = []
+                for attempt_index in range(attempt_count):
+                    log_prefix = (
+                        case.name
+                        if attempt_count == 1
+                        else f"{case.name}.attempt-{attempt_index + 1}"
+                    )
+                    with applied_netem(case.netem_profile, enable_netem):
+                        if case.mode == "download":
+                            with started_process(
+                                [
+                                    str(bench_binary),
+                                    "source",
+                                    "--listen",
+                                    f"127.0.0.1:{source_port}",
+                                    "--chunk-size",
+                                    str(case.chunk_size),
+                                ],
+                                stdout_path=impl_dir / f"{log_prefix}.source.stdout.log",
+                                stderr_path=impl_dir / f"{log_prefix}.source.stderr.log",
+                                ready_port=source_port,
+                            ):
+                                metrics = run_compare_socks(
+                                    proxies=proxies,
+                                    target=f"127.0.0.1:{source_port}",
+                                    case=case,
+                                    curve_sample_interval=curve_sample_interval,
+                                    logs_dir=impl_dir,
+                                    log_prefix=log_prefix,
+                                )
+                        else:
                             metrics = run_compare_socks(
                                 proxies=proxies,
-                                target=f"127.0.0.1:{source_port}",
+                                target=f"127.0.0.1:{sink_port}",
                                 case=case,
                                 curve_sample_interval=curve_sample_interval,
                                 logs_dir=impl_dir,
+                                log_prefix=log_prefix,
                             )
-                    else:
-                        metrics = run_compare_socks(
-                            proxies=proxies,
-                            target=f"127.0.0.1:{sink_port}",
-                            case=case,
-                            curve_sample_interval=curve_sample_interval,
-                            logs_dir=impl_dir,
-                        )
+                    case_attempts.append(metrics)
+                metrics = aggregate_case_attempts(case, case_attempts)
                 rows.append(
                     {
                         "impl": implementation.label,
@@ -1080,6 +1141,27 @@ def write_outputs(
                             "message": "curve reached 0 Mbps in at least one sample window",
                         }
                     )
+                if row and isinstance(row.get("attempts"), list) and len(row["attempts"]) > 1:
+                    mbps_values = [
+                        float(attempt["mbps"])
+                        for attempt in row["attempts"]
+                        if attempt.get("mbps") is not None
+                    ]
+                    if mbps_values:
+                        spread = (max(mbps_values) - min(mbps_values)) / max(mbps_values)
+                        if spread >= 0.25:
+                            benchmark_notes.append(
+                                {
+                                    "scenario": case.name,
+                                    "impl": impl,
+                                    "severity": "info",
+                                    "kind": "lossy_variance",
+                                    "message": (
+                                        f"lossy repeats spread {spread:.2%} "
+                                        f"across {len(mbps_values)} attempts"
+                                    ),
+                                }
+                            )
                 if row and isinstance(row.get("curve_head_mbps"), (int, float)) and isinstance(row.get("curve_tail_mbps"), (int, float)):
                     head_mbps = float(row["curve_head_mbps"])
                     tail_mbps = float(row["curve_tail_mbps"])
@@ -1226,6 +1308,7 @@ def main() -> int:
             output_dir=output_dir / "logs",
             curve_sample_interval=args.curve_sample_interval,
             enable_netem=args.enable_netem,
+            lossy_repeats=args.lossy_repeats,
         )
         result_rows.extend(rows)
 
