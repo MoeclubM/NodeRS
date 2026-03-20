@@ -4,10 +4,12 @@ use rand::RngExt;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use serde::Serialize;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -92,6 +94,8 @@ struct ClientOptions {
     parallel: usize,
     chunk_size: usize,
     insecure: bool,
+    curve_file: Option<PathBuf>,
+    sample_interval: Duration,
 }
 
 impl ClientOptions {
@@ -207,6 +211,22 @@ struct BenchSummary {
     handshake_ms: Option<f64>,
     synack_ms: Option<f64>,
     first_byte_ms: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct CurveSample {
+    elapsed_seconds: f64,
+    total_bytes: u64,
+    mbps: f64,
+}
+
+#[derive(Serialize)]
+struct CurveReport {
+    mode: String,
+    parallel: usize,
+    chunk_size: usize,
+    sample_interval_seconds: f64,
+    samples: Vec<CurveSample>,
 }
 
 impl BenchSummary {
@@ -721,11 +741,37 @@ fn tcp_forward_delay(impairment: ImpairmentProfile) -> Option<Duration> {
 }
 
 async fn run_client(options: ClientOptions) -> anyhow::Result<BenchSummary> {
+    let states = (0..options.parallel)
+        .map(|worker_id| SessionState::new(worker_id as u32 + 1))
+        .collect::<Vec<_>>();
+    let curve_done = Arc::new(Notify::new());
+    let curve_sampler = options.curve_file.clone().map(|curve_file| {
+        let states = states.clone();
+        let curve_done = curve_done.clone();
+        let mode = options.mode;
+        let parallel = options.parallel;
+        let chunk_size = options.chunk_size;
+        let sample_interval = options.sample_interval;
+        tokio::spawn(async move {
+            write_curve_report(
+                curve_file,
+                mode,
+                parallel,
+                chunk_size,
+                sample_interval,
+                states,
+                curve_done,
+            )
+            .await
+        })
+    });
+
     let mut tasks = Vec::with_capacity(options.parallel);
     for worker_id in 0..options.parallel {
         let options = options.clone();
+        let state = states[worker_id].clone();
         tasks.push(tokio::spawn(
-            async move { run_worker(worker_id, options).await },
+            async move { run_worker(worker_id, options, state).await },
         ));
     }
 
@@ -753,6 +799,11 @@ async fn run_client(options: ClientOptions) -> anyhow::Result<BenchSummary> {
         }
     }
 
+    curve_done.notify_waiters();
+    if let Some(task) = curve_sampler {
+        task.await.context("join benchmark curve sampler")??;
+    }
+
     Ok(BenchSummary {
         mode: options.mode,
         parallel: options.parallel,
@@ -765,6 +816,76 @@ async fn run_client(options: ClientOptions) -> anyhow::Result<BenchSummary> {
         synack_ms: average_ms(&synack_values),
         first_byte_ms: average_ms(&first_byte_values),
     })
+}
+
+fn total_curve_bytes(mode: BenchMode, states: &[Arc<SessionState>]) -> u64 {
+    states
+        .iter()
+        .map(|state| match mode {
+            BenchMode::Upload | BenchMode::UdpUpload => state.upload_bytes.load(Ordering::Relaxed),
+            BenchMode::Download | BenchMode::UdpDownload => {
+                state.download_bytes.load(Ordering::Relaxed)
+            }
+            BenchMode::Idle => 0,
+        })
+        .sum()
+}
+
+async fn write_curve_report(
+    curve_file: PathBuf,
+    mode: BenchMode,
+    parallel: usize,
+    chunk_size: usize,
+    sample_interval: Duration,
+    states: Vec<Arc<SessionState>>,
+    done: Arc<Notify>,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let interval = sample_interval.max(Duration::from_millis(100));
+    let mut samples = Vec::new();
+    let mut last_bytes = 0u64;
+    let mut last_sample = start;
+
+    loop {
+        tokio::select! {
+            _ = sleep(interval) => {
+                let now = Instant::now();
+                let total_bytes = total_curve_bytes(mode, &states);
+                let elapsed = now.duration_since(start).as_secs_f64();
+                let interval_seconds = now.duration_since(last_sample).as_secs_f64().max(1e-6);
+                samples.push(CurveSample {
+                    elapsed_seconds: (elapsed * 1000.0).round() / 1000.0,
+                    total_bytes,
+                    mbps: (((total_bytes - last_bytes) as f64) * 8.0 / interval_seconds / 1_000_000.0 * 100.0).round() / 100.0,
+                });
+                last_bytes = total_bytes;
+                last_sample = now;
+            }
+            _ = done.notified() => {
+                let now = Instant::now();
+                let total_bytes = total_curve_bytes(mode, &states);
+                if samples.is_empty() || total_bytes != last_bytes {
+                    let elapsed = now.duration_since(start).as_secs_f64();
+                    let interval_seconds = now.duration_since(last_sample).as_secs_f64().max(1e-6);
+                    samples.push(CurveSample {
+                        elapsed_seconds: (elapsed * 1000.0).round() / 1000.0,
+                        total_bytes,
+                        mbps: (((total_bytes - last_bytes) as f64) * 8.0 / interval_seconds / 1_000_000.0 * 100.0).round() / 100.0,
+                    });
+                }
+                let report = CurveReport {
+                    mode: mode.label().to_string(),
+                    parallel,
+                    chunk_size,
+                    sample_interval_seconds: interval.as_secs_f64(),
+                    samples,
+                };
+                std::fs::write(&curve_file, serde_json::to_vec_pretty(&report)?)
+                    .with_context(|| format!("write curve report {}", curve_file.display()))?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn run_scenarios(options: ScenarioOptions) -> anyhow::Result<()> {
@@ -888,10 +1009,16 @@ fn build_client_options(
         parallel: parallel.max(1),
         chunk_size,
         insecure: options.insecure,
+        curve_file: None,
+        sample_interval: Duration::from_secs(1),
     }
 }
 
-async fn run_worker(worker_id: usize, options: ClientOptions) -> anyhow::Result<WorkerResult> {
+async fn run_worker(
+    worker_id: usize,
+    options: ClientOptions,
+    state: Arc<SessionState>,
+) -> anyhow::Result<WorkerResult> {
     let user = options.user_for(worker_id).to_string();
     let tcp_started = Instant::now();
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(options.server))
@@ -917,7 +1044,6 @@ async fn run_worker(worker_id: usize, options: ClientOptions) -> anyhow::Result<
     send_settings(&writer).await?;
 
     let stream_id = worker_id as u32 + 1;
-    let state = SessionState::new(stream_id);
     let (payload_tx, mut payload_rx) = if matches!(options.mode, BenchMode::UdpDownload) {
         let (tx, rx) = mpsc::channel(256);
         (Some(tx), Some(rx))
@@ -1414,6 +1540,8 @@ fn parse_client_args(args: Vec<String>) -> anyhow::Result<ClientOptions> {
     let mut parallel = DEFAULT_PARALLEL;
     let mut chunk_size = DEFAULT_CHUNK_SIZE;
     let mut insecure = false;
+    let mut curve_file = None;
+    let mut sample_interval = 1.0;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -1440,6 +1568,10 @@ fn parse_client_args(args: Vec<String>) -> anyhow::Result<ClientOptions> {
             "--chunk-size" => {
                 chunk_size = next_value(&mut iter, "--chunk-size")?.parse::<usize>()?
             }
+            "--curve-file" => curve_file = Some(PathBuf::from(next_value(&mut iter, "--curve-file")?)),
+            "--sample-interval" => {
+                sample_interval = next_value(&mut iter, "--sample-interval")?.parse::<f64>()?
+            }
             "--insecure" => insecure = true,
             other => bail!("unsupported flag {other}"),
         }
@@ -1461,6 +1593,8 @@ fn parse_client_args(args: Vec<String>) -> anyhow::Result<ClientOptions> {
         parallel: parallel.max(1),
         chunk_size: normalize_chunk_size(mode, chunk_size),
         insecure,
+        curve_file,
+        sample_interval: Duration::from_secs_f64(sample_interval.max(0.1)),
     })
 }
 
@@ -1672,60 +1806,5 @@ fn non_zero_metric(value: u64) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_users_csv() {
-        let parsed = parse_users("u1,u2, u3 ").expect("users");
-        assert_eq!(parsed, vec!["u1", "u2", "u3"]);
-    }
-
-    #[test]
-    fn parse_client_args_accepts_multiple_users() {
-        let parsed = parse_client_args(vec![
-            "--server".into(),
-            "127.0.0.1:443".into(),
-            "--sni".into(),
-            "example.com".into(),
-            "--users".into(),
-            "u1,u2".into(),
-            "--target".into(),
-            "127.0.0.1:80".into(),
-            "--mode".into(),
-            "udp-download".into(),
-        ])
-        .expect("parse client");
-        assert_eq!(parsed.users, vec!["u1", "u2"]);
-        assert!(matches!(parsed.mode, BenchMode::UdpDownload));
-        assert_eq!(parsed.chunk_size, 1400);
-    }
-
-    #[test]
-    fn encode_uot_request_marks_connect_mode() {
-        let encoded = encode_uot_request(&SocksTarget::Domain("example.com".into(), 53))
-            .expect("encode request");
-        assert_eq!(encoded[0], 1);
-        assert_eq!(encoded[1], 0x03);
-    }
-
-    #[test]
-    fn parse_scenario_args_builds_targets() {
-        let parsed = parse_scenario_args(vec![
-            "--server".into(),
-            "127.0.0.1:443".into(),
-            "--sni".into(),
-            "example.com".into(),
-            "--user".into(),
-            "u1".into(),
-            "--tcp-upload-target".into(),
-            "127.0.0.1:80".into(),
-            "--udp-download-target".into(),
-            "127.0.0.1:53".into(),
-        ])
-        .expect("parse scenario");
-        assert!(parsed.tcp_upload_target.is_some());
-        assert!(parsed.udp_download_target.is_some());
-        assert_eq!(parsed.parallel, DEFAULT_SCENARIO_PARALLEL);
-    }
-}
+#[path = "bench_anytls/tests.rs"]
+mod tests;

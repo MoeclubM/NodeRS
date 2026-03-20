@@ -10,7 +10,6 @@ import re
 import shutil
 import socket
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -22,12 +21,13 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-COMPARE_SOCKS = ROOT / "scripts" / "benchmark_compare_socks.py"
 USERS = [f"bench-user-uuid-{index:02d}" for index in range(1, 5)]
-RESULT_RE = re.compile(
-    r"mode=(?P<mode>\S+) parallel=(?P<parallel>\d+) chunk=(?P<chunk>\d+) "
-    r"bytes=(?P<bytes>\d+) mbps=(?P<mbps>[0-9.]+) pps=(?P<pps>[0-9.]+)"
+BENCH_RESULT_RE = re.compile(
+    r"mode=(?P<mode>\S+) parallel=(?P<parallel>\d+) users=(?P<users>\d+) duration=(?P<duration>\d+)s "
+    r"uploaded=(?P<uploaded_mib>\d+) MiB \((?P<uploaded_mbps>[0-9.]+) Mbps\) "
+    r"downloaded=(?P<downloaded_mib>\d+) MiB \((?P<downloaded_mbps>[0-9.]+) Mbps\)"
 )
+BENCH_METRIC_RE = re.compile(r"avg (?P<label>tcp connect|tls handshake|stream synack|first byte): (?P<value>[0-9.]+) ms")
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,8 @@ class Case:
     chunk_size: int
     seconds: int
     netem_profile: str | None = None
+    category: str = "throughput"
+    capture_curve: bool = False
 
 
 @dataclass
@@ -47,21 +49,56 @@ class Implementation:
     ref: str
     commit: str
     binary: pathlib.Path
-    bench_binary: pathlib.Path | None = None
 
 
-CASES = [
-    Case("upload-size-1024", "upload", 1, 1024, 4),
-    Case("download-size-1024", "download", 1, 1024, 4),
-    Case("upload-size-32768", "upload", 1, 32768, 4),
-    Case("download-size-32768", "download", 1, 32768, 4),
-    Case("upload-concurrency-small", "upload", 16, 1024, 6),
-    Case("download-concurrency-small", "download", 16, 1024, 6),
-    Case("upload-concurrency-large", "upload", 16, 32768, 6),
-    Case("download-concurrency-large", "download", 16, 32768, 6),
-    Case("upload-concurrency-small-lossy", "upload", 16, 1024, 8, "lossy-small"),
-    Case("download-concurrency-small-lossy", "download", 16, 1024, 8, "lossy-small"),
-]
+def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
+    long_connection_seconds = max(5, long_connection_seconds)
+    idle_seconds = max(5, idle_seconds)
+    return [
+        Case(
+            "upload-long-connection",
+            "upload",
+            1,
+            32768,
+            long_connection_seconds,
+            capture_curve=True,
+        ),
+        Case(
+            "download-long-connection",
+            "download",
+            1,
+            32768,
+            long_connection_seconds,
+            capture_curve=True,
+        ),
+        Case(
+            "upload-long-connection-lossy",
+            "upload",
+            1,
+            32768,
+            long_connection_seconds,
+            "lossy-small",
+            capture_curve=True,
+        ),
+        Case(
+            "download-long-connection-lossy",
+            "download",
+            1,
+            32768,
+            long_connection_seconds,
+            "lossy-small",
+            capture_curve=True,
+        ),
+        Case(
+            f"idle-keepalive-{idle_seconds}s",
+            "idle",
+            4,
+            1024,
+            idle_seconds,
+            category="stability",
+        ),
+    ]
+
 
 NETEM_PROFILES = {
     "lossy-small": ["delay", "15ms", "3ms", "loss", "0.5%"],
@@ -70,10 +107,22 @@ NETEM_PROFILES = {
 FIXED_COMPARE_TAGS = ["v0.0.23", "v0.0.18"]
 
 
+def throughput_cases(cases: list[Case]) -> list[Case]:
+    return [case for case in cases if case.category == "throughput"]
+
+
+def stability_cases(cases: list[Case]) -> list[Case]:
+    return [case for case in cases if case.category == "stability"]
+
+
+def curve_cases(cases: list[Case]) -> list[Case]:
+    return [case for case in cases if case.capture_curve]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current NodeRS, previous tags, and sing-box on Linux.")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--target", default="x86_64-unknown-linux-gnu")
+    parser.add_argument("--target", default="x86_64-unknown-linux-musl")
     parser.add_argument(
         "--compare-count",
         type=int,
@@ -83,6 +132,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
+    parser.add_argument("--long-connection-seconds", type=int, default=30)
+    parser.add_argument("--idle-seconds", type=int, default=95)
+    parser.add_argument("--curve-sample-interval", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -171,60 +223,6 @@ def wait_tcp(host: str, port: int, timeout_seconds: float = 20.0) -> None:
                 last_error = error
         time.sleep(0.2)
     raise RuntimeError(f"port {host}:{port} not ready: {last_error}")
-
-
-def read_mem(pid: int) -> tuple[int, int]:
-    rss_kb = 0
-    private_kb = 0
-    status = pathlib.Path(f"/proc/{pid}/status")
-    if status.exists():
-        for line in status.read_text(encoding="utf-8").splitlines():
-            if line.startswith("VmRSS:"):
-                rss_kb = int(line.split()[1])
-                break
-    smaps = pathlib.Path(f"/proc/{pid}/smaps_rollup")
-    if smaps.exists():
-        for line in smaps.read_text(encoding="utf-8").splitlines():
-            if line.startswith("Private_Clean:") or line.startswith("Private_Dirty:"):
-                private_kb += int(line.split()[1])
-    return rss_kb, private_kb
-
-
-class MemorySampler:
-    def __init__(self, pid: int):
-        self.pid = pid
-        self.samples: list[tuple[int, int]] = []
-
-    def sample(self) -> None:
-        try:
-            self.samples.append(read_mem(self.pid))
-        except Exception:
-            return
-
-    def summary(self) -> dict[str, float]:
-        if not self.samples:
-            return {
-                "peak_rss_mb": 0.0,
-                "avg_rss_mb": 0.0,
-                "peak_private_mb": 0.0,
-                "avg_private_mb": 0.0,
-            }
-        rss_values = [rss for rss, _ in self.samples]
-        private_values = [private for _, private in self.samples]
-        return {
-            "peak_rss_mb": round(max(rss_values) / 1024, 2),
-            "avg_rss_mb": round(sum(rss_values) / len(rss_values) / 1024, 2),
-            "peak_private_mb": round(max(private_values) / 1024, 2),
-            "avg_private_mb": round(sum(private_values) / len(private_values) / 1024, 2),
-        }
-
-
-def collect_idle_memory(pid: int) -> dict[str, float]:
-    sampler = MemorySampler(pid)
-    for _ in range(10):
-        sampler.sample()
-        time.sleep(0.2)
-    return sampler.summary()
 
 
 @contextmanager
@@ -366,7 +364,6 @@ def started_process(
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
     ready_port: int | None = None,
-    ready_delay: float | None = None,
     cwd: pathlib.Path | None = None,
 ):
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -386,8 +383,6 @@ def started_process(
         try:
             if ready_port is not None:
                 wait_tcp("127.0.0.1", ready_port)
-            elif ready_delay is not None:
-                time.sleep(ready_delay)
             yield process
         finally:
             if process.poll() is None:
@@ -399,23 +394,85 @@ def started_process(
                     process.wait(timeout=5)
 
 
-def run_compare_socks(
+def summarize_curve(samples: list[dict[str, object]]) -> dict[str, object]:
+    if not samples:
+        return {
+            "curve_points": 0,
+            "curve_avg_mbps": None,
+            "curve_peak_mbps": None,
+            "curve_min_mbps": None,
+            "curve_tail_mbps": None,
+        }
+    mbps_values = [float(sample["mbps"]) for sample in samples]
+    tail_values = mbps_values[-min(5, len(mbps_values)) :]
+    return {
+        "curve_points": len(samples),
+        "curve_avg_mbps": round(sum(mbps_values) / len(mbps_values), 2),
+        "curve_peak_mbps": round(max(mbps_values), 2),
+        "curve_min_mbps": round(min(mbps_values), 2),
+        "curve_tail_mbps": round(sum(tail_values) / len(tail_values), 2),
+    }
+
+
+def parse_bench_client_output(text: str) -> dict[str, object]:
+    match = BENCH_RESULT_RE.search(text)
+    if not match:
+        raise RuntimeError(f"unexpected bench_anytls client output: {text!r}")
+
+    metrics: dict[str, object] = {
+        "mode": match.group("mode"),
+        "parallel": int(match.group("parallel")),
+        "users": int(match.group("users")),
+        "duration": int(match.group("duration")),
+        "uploaded_mib": int(match.group("uploaded_mib")),
+        "downloaded_mib": int(match.group("downloaded_mib")),
+        "uploaded_mbps": float(match.group("uploaded_mbps")),
+        "downloaded_mbps": float(match.group("downloaded_mbps")),
+        "bytes": 0,
+        "mbps": 0.0,
+        "pps": 0.0,
+    }
+    if metrics["mode"] == "upload":
+        metrics["bytes"] = int(metrics["uploaded_mib"]) * 1024 * 1024
+        metrics["mbps"] = float(metrics["uploaded_mbps"])
+    elif metrics["mode"] == "download":
+        metrics["bytes"] = int(metrics["downloaded_mib"]) * 1024 * 1024
+        metrics["mbps"] = float(metrics["downloaded_mbps"])
+
+    label_map = {
+        "tcp connect": "connect_ms",
+        "tls handshake": "handshake_ms",
+        "stream synack": "synack_ms",
+        "first byte": "first_byte_ms",
+    }
+    for metric_match in BENCH_METRIC_RE.finditer(text):
+        metrics[label_map[metric_match.group("label")]] = float(metric_match.group("value"))
+    return metrics
+
+
+def run_bench_client_case(
     *,
-    server_pid: int,
-    proxies: list[str],
-    target: str,
+    bench_binary: pathlib.Path,
+    server_port: int,
+    target_port: int,
     case: Case,
+    curve_sample_interval: float,
     logs_dir: pathlib.Path,
 ) -> dict[str, object]:
     stdout_path = logs_dir / f"{case.name}.stdout.log"
     stderr_path = logs_dir / f"{case.name}.stderr.log"
+    curve_path = logs_dir / f"{case.name}.curve.json"
     command = [
-        sys.executable,
-        str(COMPARE_SOCKS),
-        "--proxies",
-        ",".join(proxies),
+        str(bench_binary),
+        "client",
+        "--server",
+        f"127.0.0.1:{server_port}",
+        "--sni",
+        "localhost",
+        "--users",
+        ",".join(USERS),
         "--target",
-        target,
+        f"127.0.0.1:{target_port}",
         "--mode",
         case.mode,
         "--seconds",
@@ -424,38 +481,32 @@ def run_compare_socks(
         str(case.parallel),
         "--chunk-size",
         str(case.chunk_size),
+        "--insecure",
     ]
-    sampler = MemorySampler(server_pid)
+    if case.capture_curve:
+        command.extend(["--curve-file", str(curve_path), "--sample-interval", str(curve_sample_interval)])
     with open(stdout_path, "w", encoding="utf-8") as stdout_file, open(
         stderr_path,
         "w",
         encoding="utf-8",
     ) as stderr_file:
         process = subprocess.Popen(command, stdout=stdout_file, stderr=stderr_file, text=True)
-        while process.poll() is None:
-            sampler.sample()
-            time.sleep(0.2)
+        process.wait()
     if process.returncode != 0:
         raise RuntimeError(
             f"{case.name} failed:\nSTDOUT:\n{stdout_path.read_text(encoding='utf-8', errors='ignore')}\n"
             f"STDERR:\n{stderr_path.read_text(encoding='utf-8', errors='ignore')}"
         )
-    text = stdout_path.read_text(encoding="utf-8", errors="ignore")
-    match = RESULT_RE.search(text)
-    if not match:
-        raise RuntimeError(f"unexpected compare_socks output for {case.name}: {text!r}")
-    result = {
-        "mode": match.group("mode"),
-        "parallel": int(match.group("parallel")),
-        "chunk_size": int(match.group("chunk")),
-        "bytes": int(match.group("bytes")),
-        "mbps": float(match.group("mbps")),
-        "pps": float(match.group("pps")),
-        "stdout_log": str(stdout_path),
-        "stderr_log": str(stderr_path),
-    }
-    result.update(sampler.summary())
-    return result
+    metrics = parse_bench_client_output(stdout_path.read_text(encoding="utf-8", errors="ignore"))
+    if case.capture_curve and curve_path.exists():
+        curve = json.loads(curve_path.read_text(encoding="utf-8"))
+        metrics["curve_samples"] = curve.get("samples", [])
+        metrics["curve_log"] = str(curve_path)
+        metrics.update(summarize_curve(metrics["curve_samples"]))
+    metrics["stdout_log"] = str(stdout_path)
+    metrics["stderr_log"] = str(stderr_path)
+    metrics["status"] = "pass"
+    return metrics
 
 
 def write_node_config(
@@ -535,71 +586,15 @@ def write_sing_server_config(
     )
 
 
-def write_sing_client_config(path: pathlib.Path, *, socks_port: int, server_port: int, user: str) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "log": {"level": "warn"},
-                "inbounds": [
-                    {
-                        "type": "socks",
-                        "tag": "socks-in",
-                        "listen": "127.0.0.1",
-                        "listen_port": socks_port,
-                    }
-                ],
-                "outbounds": [
-                    {
-                        "type": "anytls",
-                        "tag": "proxy",
-                        "server": "127.0.0.1",
-                        "server_port": server_port,
-                        "password": user,
-                        "tls": {"enabled": True, "server_name": "localhost", "insecure": True},
-                    }
-                ],
-                "route": {"final": "proxy"},
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-def start_sing_clients(
-    stack: ExitStack,
-    *,
-    sing_binary: pathlib.Path,
-    work_dir: pathlib.Path,
-    server_port: int,
-    label: str,
-) -> list[str]:
-    proxies: list[str] = []
-    socks_ports = [reserve_port() for _ in USERS]
-    for index, socks_port in enumerate(socks_ports):
-        config_path = work_dir / f"{label}-client-{index}.json"
-        write_sing_client_config(config_path, socks_port=socks_port, server_port=server_port, user=USERS[index])
-        stack.enter_context(
-            started_process(
-                [str(sing_binary), "run", "-c", str(config_path)],
-                stdout_path=work_dir / f"{label}-client-{index}.stdout.log",
-                stderr_path=work_dir / f"{label}-client-{index}.stderr.log",
-                ready_port=socks_port,
-            )
-        )
-        proxies.append(f"127.0.0.1:{socks_port}")
-    return proxies
-
-
 def benchmark_impl(
     implementation: Implementation,
     *,
+    cases: list[Case],
     bench_binary: pathlib.Path,
-    sing_binary: pathlib.Path,
     output_dir: pathlib.Path,
+    curve_sample_interval: float = 1.0,
     enable_netem: bool = False,
-) -> tuple[dict[str, float], list[dict[str, object]]]:
-    effective_bench_binary = implementation.bench_binary or bench_binary
+) -> list[dict[str, object]]:
     impl_dir = output_dir / implementation.label
     impl_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"benchmark-{implementation.label}-") as temp_dir:
@@ -612,7 +607,7 @@ def benchmark_impl(
         with ExitStack() as stack:
             stack.enter_context(
                 started_process(
-                    [str(effective_bench_binary), "sink", "--listen", f"127.0.0.1:{sink_port}"],
+                    [str(bench_binary), "sink", "--listen", f"127.0.0.1:{sink_port}"],
                     stdout_path=impl_dir / "sink.stdout.log",
                     stderr_path=impl_dir / "sink.stderr.log",
                     ready_port=sink_port,
@@ -627,7 +622,7 @@ def benchmark_impl(
                     cert_path=cert_path,
                     key_path=key_path,
                 )
-                server_proc = stack.enter_context(
+                stack.enter_context(
                     started_process(
                         [str(implementation.binary), "run", "-c", str(server_config)],
                         stdout_path=impl_dir / "server.stdout.log",
@@ -645,7 +640,7 @@ def benchmark_impl(
                     key_path=key_path,
                 )
                 stack.enter_context(MockPanel(panel_port, server_port))
-                server_proc = stack.enter_context(
+                stack.enter_context(
                     started_process(
                         [str(implementation.binary), str(node_config)],
                         stdout_path=impl_dir / "server.stdout.log",
@@ -654,30 +649,13 @@ def benchmark_impl(
                     )
                 )
 
-            proxies = start_sing_clients(
-                stack,
-                sing_binary=sing_binary,
-                work_dir=work_dir,
-                server_port=server_port,
-                label=implementation.label,
-            )
-            idle_memory = collect_idle_memory(server_proc.pid)
-
             rows: list[dict[str, object]] = []
-            for case in CASES:
+            for case in cases:
                 with applied_netem(case.netem_profile, enable_netem):
-                    if case.mode == "upload":
-                        metrics = run_compare_socks(
-                            server_pid=server_proc.pid,
-                            proxies=proxies,
-                            target=f"127.0.0.1:{sink_port}",
-                            case=case,
-                            logs_dir=impl_dir,
-                        )
-                    else:
+                    if case.mode == "download":
                         with started_process(
                             [
-                                str(effective_bench_binary),
+                                str(bench_binary),
                                 "source",
                                 "--listen",
                                 f"127.0.0.1:{source_port}",
@@ -688,13 +666,23 @@ def benchmark_impl(
                             stderr_path=impl_dir / f"{case.name}.source.stderr.log",
                             ready_port=source_port,
                         ):
-                            metrics = run_compare_socks(
-                                server_pid=server_proc.pid,
-                                proxies=proxies,
-                                target=f"127.0.0.1:{source_port}",
+                            metrics = run_bench_client_case(
+                                bench_binary=bench_binary,
+                                server_port=server_port,
+                                target_port=source_port,
                                 case=case,
+                                curve_sample_interval=curve_sample_interval,
                                 logs_dir=impl_dir,
                             )
+                    else:
+                        metrics = run_bench_client_case(
+                            bench_binary=bench_binary,
+                            server_port=server_port,
+                            target_port=sink_port,
+                            case=case,
+                            curve_sample_interval=curve_sample_interval,
+                            logs_dir=impl_dir,
+                        )
                 rows.append(
                     {
                         "impl": implementation.label,
@@ -706,7 +694,7 @@ def benchmark_impl(
                     }
                 )
 
-        return idle_memory, rows
+        return rows
 
 
 def binary_path(target_dir: pathlib.Path, target: str, name: str) -> pathlib.Path:
@@ -736,10 +724,6 @@ def build_current_variant(
     ]
     run_checked(command, env=env)
     return binary_path(target_dir, target, "noders-anytls"), binary_path(target_dir, target, "bench_anytls")
-
-
-def build_current(output_dir: pathlib.Path, target: str) -> tuple[pathlib.Path, pathlib.Path]:
-    return build_current_variant(output_dir, target, label=f"{target}-default")
 
 
 def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Path:
@@ -823,31 +807,50 @@ def safe_delta(current: float | None, baseline: float | None) -> str:
     return f"{((current - baseline) / baseline) * 100:+.2f}%"
 
 
+def flatten_rows_for_csv(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    flattened: list[dict[str, object]] = []
+    for row in rows:
+        flattened_row: dict[str, object] = {}
+        for key, value in row.items():
+            if key == "curve_samples":
+                continue
+            if isinstance(value, (list, dict)):
+                flattened_row[key] = json.dumps(value, ensure_ascii=True)
+            else:
+                flattened_row[key] = value
+        flattened.append(flattened_row)
+    return flattened
+
+
 def write_outputs(
     *,
     output_dir: pathlib.Path,
+    cases: list[Case],
     current_impl: str,
     previous_tags: list[str],
     sing_version: str,
-    idle_rows: list[dict[str, object]],
     result_rows: list[dict[str, object]],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    throughput_group = throughput_cases(cases)
+    stability_group = stability_cases(cases)
+    curve_group = curve_cases(cases)
+    latency_group = list(throughput_group)
     raw_json = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "current_impl": current_impl,
         "previous_tags": previous_tags,
         "sing_box_version": sing_version,
-        "cases": [case.__dict__ for case in CASES],
-        "idle_memory": idle_rows,
+        "cases": [case.__dict__ for case in cases],
         "results": result_rows,
     }
     (output_dir / "benchmark-ab-report.json").write_text(json.dumps(raw_json, indent=2), encoding="utf-8")
 
+    csv_rows = flatten_rows_for_csv(result_rows)
     with open(output_dir / "benchmark-ab-report.csv", "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=sorted({key for row in result_rows for key in row}))
+        writer = csv.DictWriter(handle, fieldnames=sorted({key for row in csv_rows for key in row}))
         writer.writeheader()
-        writer.writerows(result_rows)
+        writer.writerows(csv_rows)
 
     rows_by_scenario: dict[str, dict[str, dict[str, object]]] = {}
     for row in result_rows:
@@ -860,14 +863,16 @@ def write_outputs(
         f"- Current: `{current_impl}`",
         f"- Previous tags: {', '.join(f'`{tag}`' for tag in previous_tags) if previous_tags else 'none'}",
         f"- Sing-box: `{sing_version}`",
+        f"- Long connection seconds: `{max((case.seconds for case in curve_group), default=0)}`",
+        f"- Idle seconds: `{max((case.seconds for case in stability_group), default=0)}`",
         "",
-        "## Throughput",
+        "## Real Connection Throughput",
         "",
         "| Scenario | " + " | ".join(impl_order) + " | Current vs Best Prev | Current vs Sing-box |",
         "| --- | " + " | ".join(["---"] * len(impl_order)) + " | --- | --- |",
     ]
-    summary_rows: list[dict[str, object]] = []
-    for case in CASES:
+    throughput_summary_rows: list[dict[str, object]] = []
+    for case in throughput_group:
         scenario_rows = rows_by_scenario.get(case.name, {})
         current_mbps = scenario_rows.get(current_impl, {}).get("mbps")
         previous_values = [
@@ -886,7 +891,7 @@ def write_outputs(
             f"{safe_delta(float(current_mbps) if current_mbps is not None else None, best_previous)} | "
             f"{safe_delta(float(current_mbps) if current_mbps is not None else None, float(sing_mbps) if sing_mbps is not None else None)} |"
         )
-        summary_rows.append(
+        throughput_summary_rows.append(
             {
                 "scenario": case.name,
                 "current_mbps": current_mbps,
@@ -903,37 +908,187 @@ def write_outputs(
             }
         )
 
-    lines.extend(
-        [
-            "",
-            "## Idle Memory",
-            "",
-            "| Implementation | Peak RSS MB | Avg RSS MB | Peak Private MB | Avg Private MB |",
-            "| --- | --- | --- | --- | --- |",
-        ]
-    )
-    for impl in impl_order:
-        row = next((item for item in idle_rows if item["impl"] == impl), None)
-        if row is None:
-            lines.append(f"| `{impl}` | n/a | n/a | n/a | n/a |")
-            continue
-        lines.append(
-            f"| `{impl}` | {row['peak_rss_mb']:.2f} | {row['avg_rss_mb']:.2f} | "
-            f"{row['peak_private_mb']:.2f} | {row['avg_private_mb']:.2f} |"
+    latency_summary_rows: list[dict[str, object]] = []
+    if latency_group:
+        lines.extend(
+            [
+                "",
+                "## Real Connection Latency",
+                "",
+                "| Scenario | Implementation | Avg TCP Connect ms | Avg TLS Handshake ms | Avg Stream Synack ms | Avg First Byte ms |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
         )
+        for case in latency_group:
+            scenario_rows = rows_by_scenario.get(case.name, {})
+            for impl in impl_order:
+                row = scenario_rows.get(impl)
+                connect_ms = row.get("connect_ms") if row else None
+                handshake_ms = row.get("handshake_ms") if row else None
+                synack_ms = row.get("synack_ms") if row else None
+                first_byte_ms = row.get("first_byte_ms") if row else None
+                lines.append(
+                    f"| `{case.name}` | `{impl}` | "
+                    f"{f'{connect_ms:.2f}' if isinstance(connect_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{handshake_ms:.2f}' if isinstance(handshake_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{synack_ms:.2f}' if isinstance(synack_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{first_byte_ms:.2f}' if isinstance(first_byte_ms, (int, float)) else 'n/a'} |"
+                )
+                latency_summary_rows.append(
+                    {
+                        "scenario": case.name,
+                        "impl": impl,
+                        "connect_ms": connect_ms,
+                        "handshake_ms": handshake_ms,
+                        "synack_ms": synack_ms,
+                        "first_byte_ms": first_byte_ms,
+                    }
+                )
+
+    stability_summary_rows: list[dict[str, object]] = []
+    if stability_group:
+        lines.extend(
+            [
+                "",
+                "## Long Connection Stability",
+                "",
+                "| Scenario | Implementation | Status | Avg Stream Synack ms | Avg TCP Connect ms | Avg TLS Handshake ms |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for case in stability_group:
+            for impl in impl_order:
+                row = rows_by_scenario.get(case.name, {}).get(impl)
+                status = row.get("status", "n/a") if row else "n/a"
+                synack_ms = row.get("synack_ms") if row else None
+                connect_ms = row.get("connect_ms") if row else None
+                handshake_ms = row.get("handshake_ms") if row else None
+                lines.append(
+                    f"| `{case.name}` | `{impl}` | {status} | "
+                    f"{f'{synack_ms:.2f}' if isinstance(synack_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{connect_ms:.2f}' if isinstance(connect_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{handshake_ms:.2f}' if isinstance(handshake_ms, (int, float)) else 'n/a'} |"
+                )
+                stability_summary_rows.append(
+                    {
+                        "scenario": case.name,
+                        "impl": impl,
+                        "status": status,
+                        "synack_ms": synack_ms,
+                        "connect_ms": connect_ms,
+                        "handshake_ms": handshake_ms,
+                    }
+                )
+
+    curve_summary_rows: list[dict[str, object]] = []
+    curve_tail_rows: list[dict[str, object]] = []
+    if curve_group:
+        lines.extend(
+            [
+                "",
+                "## Long Connection Curve Summary",
+                "",
+                "| Scenario | Implementation | Avg Mbps | Peak Mbps | Min Mbps | Tail Avg Mbps | Samples |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for case in curve_group:
+            scenario_rows = rows_by_scenario.get(case.name, {})
+            for impl in impl_order:
+                row = scenario_rows.get(impl)
+                lines.append(
+                    f"| `{case.name}` | `{impl}` | "
+                    f"{f'{row.get('curve_avg_mbps'):.2f}' if row and isinstance(row.get('curve_avg_mbps'), (int, float)) else 'n/a'} | "
+                    f"{f'{row.get('curve_peak_mbps'):.2f}' if row and isinstance(row.get('curve_peak_mbps'), (int, float)) else 'n/a'} | "
+                    f"{f'{row.get('curve_min_mbps'):.2f}' if row and isinstance(row.get('curve_min_mbps'), (int, float)) else 'n/a'} | "
+                    f"{f'{row.get('curve_tail_mbps'):.2f}' if row and isinstance(row.get('curve_tail_mbps'), (int, float)) else 'n/a'} | "
+                    f"{row.get('curve_points', 'n/a') if row else 'n/a'} |"
+                )
+                curve_summary_rows.append(
+                    {
+                        "scenario": case.name,
+                        "impl": impl,
+                        "curve_avg_mbps": row.get("curve_avg_mbps") if row else None,
+                        "curve_peak_mbps": row.get("curve_peak_mbps") if row else None,
+                        "curve_min_mbps": row.get("curve_min_mbps") if row else None,
+                        "curve_tail_mbps": row.get("curve_tail_mbps") if row else None,
+                        "curve_points": row.get("curve_points") if row else None,
+                    }
+                )
+
+            current_tail = scenario_rows.get(current_impl, {}).get("curve_tail_mbps")
+            previous_tail_values = [
+                float(scenario_rows[tag]["curve_tail_mbps"])
+                for tag in previous_tags
+                if tag in scenario_rows and scenario_rows[tag].get("curve_tail_mbps") is not None
+            ]
+            best_previous_tail = max(previous_tail_values) if previous_tail_values else None
+            sing_tail = scenario_rows.get("SingBox", {}).get("curve_tail_mbps")
+            curve_tail_rows.append(
+                {
+                    "scenario": case.name,
+                    "current_tail_mbps": current_tail,
+                    "best_previous_tail_mbps": best_previous_tail,
+                    "sing_box_tail_mbps": sing_tail,
+                    "current_vs_best_previous_tail": safe_delta(
+                        float(current_tail) if current_tail is not None else None,
+                        best_previous_tail,
+                    ),
+                    "current_vs_sing_box_tail": safe_delta(
+                        float(current_tail) if current_tail is not None else None,
+                        float(sing_tail) if sing_tail is not None else None,
+                    ),
+                }
+            )
+
+        lines.extend(
+            [
+                "",
+                "## Long Connection Tail Comparison",
+                "",
+                "| Scenario | Current Tail Mbps | Best Prev Tail Mbps | Sing-box Tail Mbps | Current vs Best Prev | Current vs Sing-box |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for row in curve_tail_rows:
+            lines.append(
+                f"| `{row['scenario']}` | "
+                f"{f'{row['current_tail_mbps']:.2f}' if isinstance(row['current_tail_mbps'], (int, float)) else 'n/a'} | "
+                f"{f'{row['best_previous_tail_mbps']:.2f}' if isinstance(row['best_previous_tail_mbps'], (int, float)) else 'n/a'} | "
+                f"{f'{row['sing_box_tail_mbps']:.2f}' if isinstance(row['sing_box_tail_mbps'], (int, float)) else 'n/a'} | "
+                f"{row['current_vs_best_previous_tail']} | "
+                f"{row['current_vs_sing_box_tail']} |"
+            )
 
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (output_dir / "summary.json").write_text(json.dumps(summary_rows, indent=2), encoding="utf-8")
+    (output_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "throughput": throughput_summary_rows,
+                "latency": latency_summary_rows,
+                "stability": stability_summary_rows,
+                "curve_summary": curve_summary_rows,
+                "curve_tail_comparison": curve_tail_rows,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
     args = parse_args()
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cases = build_cases(args.long_connection_seconds, args.idle_seconds)
 
     current_commit = git_output("rev-parse", "HEAD")
     previous_tags = select_previous_tags(args.compare_count)
-    current_node, bench_binary = build_current(output_dir, args.target)
+    current_node, bench_binary = build_current_variant(
+        output_dir,
+        args.target,
+        label=f"{args.target}-default",
+    )
     implementations = [
         Implementation(
             label="current",
@@ -965,25 +1120,24 @@ def main() -> int:
         )
     )
 
-    idle_rows: list[dict[str, object]] = []
     result_rows: list[dict[str, object]] = []
     for implementation in implementations:
-        idle_memory, rows = benchmark_impl(
+        rows = benchmark_impl(
             implementation,
+            cases=cases,
             bench_binary=bench_binary,
-            sing_binary=sing_binary,
             output_dir=output_dir / "logs",
+            curve_sample_interval=args.curve_sample_interval,
             enable_netem=args.enable_netem,
         )
-        idle_rows.append({"impl": implementation.label, **idle_memory})
         result_rows.extend(rows)
 
     write_outputs(
         output_dir=output_dir,
+        cases=cases,
         current_impl="current",
         previous_tags=previous_tags,
         sing_version=sing_version,
-        idle_rows=idle_rows,
         result_rows=result_rows,
     )
     print(output_dir / "report.md")
