@@ -1265,20 +1265,22 @@ def write_outputs(
                         if attempt.get("mbps") is not None
                     ]
                     if mbps_values:
-                        spread = (max(mbps_values) - min(mbps_values)) / max(mbps_values)
-                        if spread >= 0.25:
-                            benchmark_notes.append(
-                                {
-                                    "scenario": case.name,
-                                    "impl": impl,
-                                    "severity": "info",
-                                    "kind": "lossy_variance",
-                                    "message": (
-                                        f"lossy repeats spread {spread:.2%} "
-                                        f"across {len(mbps_values)} attempts"
-                                    ),
-                                }
-                            )
+                        max_mbps = max(mbps_values)
+                        if max_mbps > 0:
+                            spread = (max_mbps - min(mbps_values)) / max_mbps
+                            if spread >= 0.25:
+                                benchmark_notes.append(
+                                    {
+                                        "scenario": case.name,
+                                        "impl": impl,
+                                        "severity": "info",
+                                        "kind": "lossy_variance",
+                                        "message": (
+                                            f"lossy repeats spread {spread:.2%} "
+                                            f"across {len(mbps_values)} attempts"
+                                        ),
+                                    }
+                                )
                     lossy_repeat_rows.append(
                         {
                             "scenario": case.name,
