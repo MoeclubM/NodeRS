@@ -445,6 +445,11 @@ def attach_attempt_summary(target: dict[str, object], attempts: list[dict[str, o
     )
 
 
+def summarize_failure(stderr_text: str) -> str:
+    lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+    return lines[-1] if lines else "benchmark command failed"
+
+
 def run_compare_socks(
     *,
     proxies: list[str],
@@ -486,12 +491,17 @@ def run_compare_socks(
     ) as stderr_file:
         process = subprocess.Popen(command, stdout=stdout_file, stderr=stderr_file, text=True)
         process.wait()
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"{case.name} failed:\nSTDOUT:\n{stdout_path.read_text(encoding='utf-8', errors='ignore')}\n"
-            f"STDERR:\n{stderr_path.read_text(encoding='utf-8', errors='ignore')}"
-        )
-    metrics = json.loads(stdout_path.read_text(encoding="utf-8", errors="ignore"))
+    stdout_text = stdout_path.read_text(encoding="utf-8", errors="ignore")
+    stderr_text = stderr_path.read_text(encoding="utf-8", errors="ignore")
+    if process.returncode == 0:
+        metrics = json.loads(stdout_text)
+        metrics["status"] = "pass"
+    else:
+        metrics = {
+            "status": "fail",
+            "error": summarize_failure(stderr_text),
+            "returncode": process.returncode,
+        }
     if case.capture_curve and curve_path.exists():
         curve = json.loads(curve_path.read_text(encoding="utf-8"))
         metrics["curve_samples"] = curve.get("samples", [])
@@ -499,22 +509,38 @@ def run_compare_socks(
         metrics.update(summarize_curve(metrics["curve_samples"]))
     metrics["stdout_log"] = str(stdout_path)
     metrics["stderr_log"] = str(stderr_path)
-    metrics["status"] = "pass"
     return metrics
 
 
 def aggregate_case_attempts(case: Case, attempts: list[dict[str, object]]) -> dict[str, object]:
+    successful_attempts = [attempt for attempt in attempts if attempt.get("status") == "pass"]
+    failed_attempts = [attempt for attempt in attempts if attempt.get("status") != "pass"]
+
     if len(attempts) == 1:
         attempt = dict(attempts[0])
         attempt["attempt_count"] = 1
+        attempt["successful_attempt_count"] = len(successful_attempts)
+        attempt["failed_attempt_count"] = len(failed_attempts)
+        return attempt
+
+    if not successful_attempts:
+        attempt = dict(attempts[0])
+        attempt["attempt_count"] = len(attempts)
+        attempt["successful_attempt_count"] = 0
+        attempt["failed_attempt_count"] = len(attempts)
+        attempt["attempts"] = attempts
+        attempt["status"] = "fail"
+        attempt["scenario"] = case.name
         return attempt
 
     representative = sorted(
-        attempts,
+        successful_attempts,
         key=lambda item: float(item.get("mbps", 0.0)),
-    )[len(attempts) // 2]
+    )[len(successful_attempts) // 2]
     aggregated = dict(representative)
     aggregated["attempt_count"] = len(attempts)
+    aggregated["successful_attempt_count"] = len(successful_attempts)
+    aggregated["failed_attempt_count"] = len(failed_attempts)
     aggregated["attempts"] = attempts
 
     float_keys = [
@@ -534,18 +560,26 @@ def aggregate_case_attempts(case: Case, attempts: list[dict[str, object]]) -> di
     ]
 
     for key in float_keys:
-        values = [float(value) for value in (attempt.get(key) for attempt in attempts) if value is not None]
+        values = [float(value) for value in (attempt.get(key) for attempt in successful_attempts) if value is not None]
         if values:
             aggregated[key] = round(float(median(values)), 2)
     for key in int_keys:
-        values = [int(value) for value in (attempt.get(key) for attempt in attempts) if value is not None]
+        values = [int(value) for value in (attempt.get(key) for attempt in successful_attempts) if value is not None]
         if values:
             aggregated[key] = int(round(float(median(values))))
 
     for key in ["mbps", "connect_ms", "first_byte_ms", "curve_tail_mbps"]:
-        attach_attempt_summary(aggregated, attempts, key)
+        attach_attempt_summary(aggregated, successful_attempts, key)
 
-    aggregated["status"] = "pass"
+    if failed_attempts:
+        aggregated["error"] = summarize_failure(
+            "\n".join(
+                str(attempt.get("error", ""))
+                for attempt in failed_attempts
+                if attempt.get("error")
+            )
+        )
+    aggregated["status"] = "partial" if failed_attempts else "pass"
     aggregated["scenario"] = case.name
     return aggregated
 
@@ -965,6 +999,19 @@ def format_metric_range(minimum: object, maximum: object, suffix: str = "") -> s
     return f"{minimum:.2f}-{maximum:.2f}{suffix}"
 
 
+def format_result_metric(row: dict[str, object] | None, key: str) -> str:
+    if row is None:
+        return "n/a"
+    value = row.get(key)
+    status = str(row.get("status", ""))
+    if isinstance(value, (int, float)):
+        suffix = " (partial)" if status == "partial" else ""
+        return f"{value:.2f}{suffix}"
+    if status == "fail":
+        return "fail"
+    return "n/a"
+
+
 def write_outputs(
     *,
     output_dir: pathlib.Path,
@@ -1031,8 +1078,28 @@ def write_outputs(
         sing_mbps = scenario_rows.get("SingBox", {}).get("mbps")
         cells = []
         for impl in impl_order:
-            value = scenario_rows.get(impl, {}).get("mbps")
-            cells.append(f"{value:.2f}" if isinstance(value, (int, float)) else "n/a")
+            row = scenario_rows.get(impl)
+            cells.append(format_result_metric(row, "mbps"))
+            if row and row.get("status") in {"fail", "partial"}:
+                successful_attempts = int(row.get("successful_attempt_count", 0))
+                attempt_count = int(row.get("attempt_count", 1))
+                status = str(row["status"])
+                benchmark_notes.append(
+                    {
+                        "scenario": case.name,
+                        "impl": impl,
+                        "severity": "warn" if status == "fail" else "info",
+                        "kind": f"{status}_attempts",
+                        "message": (
+                            f"{status} in {attempt_count - successful_attempts}/{attempt_count} attempts"
+                            + (
+                                f"; last error: {row.get('error')}"
+                                if row.get("error")
+                                else ""
+                            )
+                        ),
+                    }
+                )
         lines.append(
             f"| `{case.name}` | {' | '.join(cells)} | "
             f"{safe_delta(float(current_mbps) if current_mbps is not None else None, best_previous)} | "
@@ -1216,7 +1283,10 @@ def write_outputs(
                         {
                             "scenario": case.name,
                             "impl": impl,
+                            "status": row.get("status"),
                             "attempt_count": row.get("attempt_count"),
+                            "successful_attempt_count": row.get("successful_attempt_count"),
+                            "failed_attempt_count": row.get("failed_attempt_count"),
                             "median_mbps": row.get("mbps"),
                             "mbps_min": row.get("mbps_attempt_min"),
                             "mbps_max": row.get("mbps_attempt_max"),
@@ -1330,13 +1400,14 @@ def write_outputs(
                 "",
                 "## Lossy Repeat Stability",
                 "",
-                "| Scenario | Implementation | Attempts | Median Mbps | Mbps Range | Mbps Spread | Connect Range ms | First Byte Range ms | Tail Range Mbps |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Scenario | Implementation | Status | Success/Attempts | Median Mbps | Mbps Range | Mbps Spread | Connect Range ms | First Byte Range ms | Tail Range Mbps |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for row in lossy_repeat_rows:
             lines.append(
-                f"| `{row['scenario']}` | `{row['impl']}` | {row['attempt_count']} | "
+                f"| `{row['scenario']}` | `{row['impl']}` | {row['status']} | "
+                f"{row['successful_attempt_count']}/{row['attempt_count']} | "
                 f"{f'{row['median_mbps']:.2f}' if isinstance(row['median_mbps'], (int, float)) else 'n/a'} | "
                 f"{format_metric_range(row['mbps_min'], row['mbps_max'])} | "
                 f"{f'{row['mbps_spread_pct']:.2f}%' if isinstance(row['mbps_spread_pct'], (int, float)) else 'n/a'} | "
