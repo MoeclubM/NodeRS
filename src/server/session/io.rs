@@ -15,6 +15,8 @@ use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
 use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
+#[cfg(target_env = "musl")]
+use super::frame::LARGE_INBOUND_SEGMENT_LEN;
 use super::frame::{
     CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
     MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
@@ -65,15 +67,16 @@ where
             policy,
         );
         #[cfg(target_env = "musl")]
-        if !finished
-            && pending.is_none()
-            && chunks.len() == 1
-            && queued_bytes <= SMALL_PAYLOAD_LEN
-            && policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS
-        {
-            // Musl remains weakest on tiny concurrent uploads. Yield once when only a single
-            // 1 KiB-class chunk is ready so the immediately-following chunk can join the same
-            // inline batch without turning this into a blocking wait loop.
+        if should_yield_for_upload_batch_fill(
+            finished,
+            pending.is_none(),
+            chunks.len(),
+            queued_bytes,
+            policy,
+        ) {
+            // Musl remains the weakest weak-link upload target. Yield once when a fresh batch
+            // only has a single underfilled chunk so the immediately-following frame can join
+            // the same write without turning this into a blocking wait loop.
             tokio::task::yield_now().await;
             fill_ready_upload_batch(
                 &mut rx,
@@ -120,6 +123,30 @@ where
             return Ok(total);
         }
     }
+}
+
+#[cfg(target_env = "musl")]
+fn should_yield_for_upload_batch_fill(
+    finished: bool,
+    no_pending_chunk: bool,
+    chunk_count: usize,
+    queued_bytes: usize,
+    policy: super::frame::UploadBatchPolicy,
+) -> bool {
+    if finished
+        || !no_pending_chunk
+        || chunk_count != 1
+        || queued_bytes == 0
+        || queued_bytes >= policy.max_bytes
+    {
+        return false;
+    }
+
+    if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS {
+        return queued_bytes <= SMALL_PAYLOAD_LEN;
+    }
+
+    policy.max_iovecs == LARGE_UPLOAD_BATCH_IOVECS && queued_bytes <= LARGE_INBOUND_SEGMENT_LEN
 }
 
 fn fill_ready_upload_batch(

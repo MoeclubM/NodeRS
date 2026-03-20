@@ -24,7 +24,7 @@ pub(super) const SMALL_DOWNLOAD_COALESCE_WAIT: std::time::Duration =
 #[cfg(target_env = "musl")]
 pub(super) const MUSL_LARGE_DOWNLOAD_COALESCE_SPAN: usize = 24 * 1024;
 pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
-pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 192 * 1024;
+pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 256 * 1024;
 pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
 #[cfg(target_env = "musl")]
 pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 80;
@@ -37,9 +37,9 @@ pub(super) const LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 4096;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
 // This queue doubles as the effective upload window between the AnyTLS session and the
-// outbound TCP socket. 512 KiB was enough to cap weak-link uploads around 24 Mbps in the
-// bundled 80 ms + jitter benchmark profile, so keep materially more BDP headroom here.
-pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+// outbound TCP socket. 4 MiB removed the old 80 ms weak-link ceiling, but the current
+// 200 ms benchmark profile still benefits from more recovery headroom after loss bursts.
+pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PayloadTier {

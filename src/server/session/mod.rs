@@ -1206,6 +1206,8 @@ mod tests {
             test_chunk(&large),
             test_chunk(&large),
             test_chunk(&large),
+            test_chunk(&large),
+            test_chunk(&large),
         ]);
         let policy = chunk_batch_policy(&chunks);
         let slices = chunk_batch_slices(&chunks, 31 * 1024, policy);
@@ -1305,6 +1307,41 @@ mod tests {
         assert_eq!(transferred, 10);
         assert_eq!(writer.scalar_writes, 1);
         assert_eq!(writer.vectored_writes, 0);
+    }
+
+    #[cfg(target_env = "musl")]
+    #[tokio::test]
+    async fn musl_large_upload_batch_retries_after_one_scheduler_yield() {
+        let (tx, rx) = mpsc::channel(8);
+        let control = SessionControl::new();
+        let mut writer = WriteModeRecorder::default();
+        let payload = vec![7u8; 32 * 1024];
+
+        let sender = tokio::spawn({
+            let payload = payload.clone();
+            async move {
+                tx.send(InboundMessage::Data(test_chunk(&payload)))
+                    .await
+                    .expect("send second chunk");
+                tx.send(InboundMessage::Fin).await.expect("send fin");
+            }
+        });
+
+        let transferred = pump_inbound_to_remote(
+            Some(test_chunk(&payload)),
+            rx,
+            false,
+            &mut writer,
+            control,
+            None,
+        )
+        .await
+        .expect("pump inbound");
+
+        sender.await.expect("join sender");
+        assert_eq!(transferred, (payload.len() * 2) as u64);
+        assert_eq!(writer.scalar_writes, 0);
+        assert_eq!(writer.vectored_writes, 1);
     }
 
     #[tokio::test]
