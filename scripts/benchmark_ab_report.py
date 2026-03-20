@@ -131,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-connection-seconds", type=int, default=30)
     parser.add_argument("--idle-seconds", type=int, default=95)
     parser.add_argument("--curve-sample-interval", type=float, default=1.0)
+    parser.add_argument("--steady-state-warmup-seconds", type=float, default=3.0)
     parser.add_argument("--lossy-repeats", type=int, default=3)
     return parser.parse_args()
 
@@ -414,12 +415,34 @@ def summarize_curve(samples: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def attempt_values(attempts: list[dict[str, object]], key: str) -> list[float]:
+    return [
+        float(value)
+        for value in (attempt.get(key) for attempt in attempts)
+        if value is not None
+    ]
+
+
+def attach_attempt_summary(target: dict[str, object], attempts: list[dict[str, object]], key: str) -> None:
+    values = attempt_values(attempts, key)
+    if not values:
+        return
+    maximum = max(values)
+    target[f"{key}_attempt_min"] = round(min(values), 2)
+    target[f"{key}_attempt_max"] = round(maximum, 2)
+    target[f"{key}_attempt_spread_pct"] = round(
+        ((maximum - min(values)) / maximum) * 100.0 if maximum > 0 else 0.0,
+        2,
+    )
+
+
 def run_compare_socks(
     *,
     proxies: list[str],
     target: str,
     case: Case,
     curve_sample_interval: float,
+    steady_state_warmup_seconds: float,
     logs_dir: pathlib.Path,
     log_prefix: str | None = None,
 ) -> dict[str, object]:
@@ -442,6 +465,8 @@ def run_compare_socks(
         str(case.parallel),
         "--chunk-size",
         str(case.chunk_size),
+        "--measure-warmup-seconds",
+        str(max(steady_state_warmup_seconds, 0.0)),
     ]
     if case.capture_curve:
         command.extend(["--curve-file", str(curve_path), "--sample-interval", str(curve_sample_interval)])
@@ -507,6 +532,9 @@ def aggregate_case_attempts(case: Case, attempts: list[dict[str, object]]) -> di
         values = [int(value) for value in (attempt.get(key) for attempt in attempts) if value is not None]
         if values:
             aggregated[key] = int(round(float(median(values))))
+
+    for key in ["mbps", "connect_ms", "first_byte_ms", "curve_tail_mbps"]:
+        attach_attempt_summary(aggregated, attempts, key)
 
     aggregated["status"] = "pass"
     aggregated["scenario"] = case.name
@@ -654,6 +682,7 @@ def benchmark_impl(
     sing_binary: pathlib.Path,
     output_dir: pathlib.Path,
     curve_sample_interval: float = 1.0,
+    steady_state_warmup_seconds: float = 3.0,
     enable_netem: bool = False,
     lossy_repeats: int = 3,
 ) -> list[dict[str, object]]:
@@ -749,6 +778,7 @@ def benchmark_impl(
                                     target=f"127.0.0.1:{source_port}",
                                     case=case,
                                     curve_sample_interval=curve_sample_interval,
+                                    steady_state_warmup_seconds=steady_state_warmup_seconds,
                                     logs_dir=impl_dir,
                                     log_prefix=log_prefix,
                                 )
@@ -758,6 +788,7 @@ def benchmark_impl(
                                 target=f"127.0.0.1:{sink_port}",
                                 case=case,
                                 curve_sample_interval=curve_sample_interval,
+                                steady_state_warmup_seconds=steady_state_warmup_seconds,
                                 logs_dir=impl_dir,
                                 log_prefix=log_prefix,
                             )
@@ -919,6 +950,12 @@ def flatten_rows_for_csv(rows: list[dict[str, object]]) -> list[dict[str, object
     return flattened
 
 
+def format_metric_range(minimum: object, maximum: object, suffix: str = "") -> str:
+    if not isinstance(minimum, (int, float)) or not isinstance(maximum, (int, float)):
+        return "n/a"
+    return f"{minimum:.2f}-{maximum:.2f}{suffix}"
+
+
 def write_outputs(
     *,
     output_dir: pathlib.Path,
@@ -926,6 +963,7 @@ def write_outputs(
     current_impl: str,
     previous_tags: list[str],
     sing_version: str,
+    steady_state_warmup_seconds: float,
     result_rows: list[dict[str, object]],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -938,6 +976,7 @@ def write_outputs(
         "current_impl": current_impl,
         "previous_tags": previous_tags,
         "sing_box_version": sing_version,
+        "steady_state_warmup_seconds": steady_state_warmup_seconds,
         "cases": [case.__dict__ for case in cases],
         "results": result_rows,
     }
@@ -962,6 +1001,7 @@ def write_outputs(
         f"- Sing-box: `{sing_version}`",
         f"- Long connection seconds: `{max((case.seconds for case in curve_group), default=0)}`",
         f"- Idle seconds: `{max((case.seconds for case in stability_group), default=0)}`",
+        f"- Steady-state warmup seconds: `{max(steady_state_warmup_seconds, 0.0):.1f}`",
         "",
         "## Real Connection Throughput",
         "",
@@ -1096,6 +1136,7 @@ def write_outputs(
 
     curve_summary_rows: list[dict[str, object]] = []
     curve_tail_rows: list[dict[str, object]] = []
+    lossy_repeat_rows: list[dict[str, object]] = []
     if curve_group:
         lines.extend(
             [
@@ -1162,6 +1203,23 @@ def write_outputs(
                                     ),
                                 }
                             )
+                    lossy_repeat_rows.append(
+                        {
+                            "scenario": case.name,
+                            "impl": impl,
+                            "attempt_count": row.get("attempt_count"),
+                            "median_mbps": row.get("mbps"),
+                            "mbps_min": row.get("mbps_attempt_min"),
+                            "mbps_max": row.get("mbps_attempt_max"),
+                            "mbps_spread_pct": row.get("mbps_attempt_spread_pct"),
+                            "connect_ms_min": row.get("connect_ms_attempt_min"),
+                            "connect_ms_max": row.get("connect_ms_attempt_max"),
+                            "first_byte_ms_min": row.get("first_byte_ms_attempt_min"),
+                            "first_byte_ms_max": row.get("first_byte_ms_attempt_max"),
+                            "curve_tail_mbps_min": row.get("curve_tail_mbps_attempt_min"),
+                            "curve_tail_mbps_max": row.get("curve_tail_mbps_attempt_max"),
+                        }
+                    )
                 if row and isinstance(row.get("curve_head_mbps"), (int, float)) and isinstance(row.get("curve_tail_mbps"), (int, float)):
                     head_mbps = float(row["curve_head_mbps"])
                     tail_mbps = float(row["curve_tail_mbps"])
@@ -1203,6 +1261,41 @@ def write_outputs(
                 }
             )
 
+            if case.netem_profile:
+                current_row = scenario_rows.get(current_impl)
+                current_spread = (
+                    float(current_row["mbps_attempt_spread_pct"])
+                    if current_row and isinstance(current_row.get("mbps_attempt_spread_pct"), (int, float))
+                    else None
+                )
+                peer_spread_median = median_value(
+                    [
+                        float(scenario_rows[impl]["mbps_attempt_spread_pct"])
+                        for impl in impl_order
+                        if impl != current_impl
+                        and impl in scenario_rows
+                        and isinstance(scenario_rows[impl].get("mbps_attempt_spread_pct"), (int, float))
+                    ]
+                )
+                if (
+                    current_spread is not None
+                    and peer_spread_median is not None
+                    and current_spread >= 25.0
+                    and current_spread >= peer_spread_median * 2.0
+                ):
+                    benchmark_notes.append(
+                        {
+                            "scenario": case.name,
+                            "impl": current_impl,
+                            "severity": "warn",
+                            "kind": "lossy_instability",
+                            "message": (
+                                f"throughput repeat spread {current_spread:.2f}% exceeds "
+                                f"peer median {peer_spread_median:.2f}%"
+                            ),
+                        }
+                    )
+
         lines.extend(
             [
                 "",
@@ -1220,6 +1313,27 @@ def write_outputs(
                 f"{f'{row['sing_box_tail_mbps']:.2f}' if isinstance(row['sing_box_tail_mbps'], (int, float)) else 'n/a'} | "
                 f"{row['current_vs_best_previous_tail']} | "
                 f"{row['current_vs_sing_box_tail']} |"
+            )
+
+    if lossy_repeat_rows:
+        lines.extend(
+            [
+                "",
+                "## Lossy Repeat Stability",
+                "",
+                "| Scenario | Implementation | Attempts | Median Mbps | Mbps Range | Mbps Spread | Connect Range ms | First Byte Range ms | Tail Range Mbps |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for row in lossy_repeat_rows:
+            lines.append(
+                f"| `{row['scenario']}` | `{row['impl']}` | {row['attempt_count']} | "
+                f"{f'{row['median_mbps']:.2f}' if isinstance(row['median_mbps'], (int, float)) else 'n/a'} | "
+                f"{format_metric_range(row['mbps_min'], row['mbps_max'])} | "
+                f"{f'{row['mbps_spread_pct']:.2f}%' if isinstance(row['mbps_spread_pct'], (int, float)) else 'n/a'} | "
+                f"{format_metric_range(row['connect_ms_min'], row['connect_ms_max'])} | "
+                f"{format_metric_range(row['first_byte_ms_min'], row['first_byte_ms_max'])} | "
+                f"{format_metric_range(row['curve_tail_mbps_min'], row['curve_tail_mbps_max'])} |"
             )
 
     if benchmark_notes:
@@ -1246,6 +1360,7 @@ def write_outputs(
                 "stability": stability_summary_rows,
                 "curve_summary": curve_summary_rows,
                 "curve_tail_comparison": curve_tail_rows,
+                "lossy_repeat_summary": lossy_repeat_rows,
                 "notes": benchmark_notes,
             },
             indent=2,
@@ -1307,6 +1422,7 @@ def main() -> int:
             sing_binary=sing_binary,
             output_dir=output_dir / "logs",
             curve_sample_interval=args.curve_sample_interval,
+            steady_state_warmup_seconds=args.steady_state_warmup_seconds,
             enable_netem=args.enable_netem,
             lossy_repeats=args.lossy_repeats,
         )
@@ -1318,6 +1434,7 @@ def main() -> int:
         current_impl="current",
         previous_tags=previous_tags,
         sing_version=sing_version,
+        steady_state_warmup_seconds=args.steady_state_warmup_seconds,
         result_rows=result_rows,
     )
     print(output_dir / "report.md")

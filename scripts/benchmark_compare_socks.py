@@ -17,6 +17,43 @@ class WorkerStats:
     first_byte_ms: float | None = None
 
 
+class MeasurementWindow:
+    def __init__(self, worker_count: int, duration: float, warmup_seconds: float):
+        self.worker_count = max(worker_count, 1)
+        self.duration = max(duration, 0.1)
+        self.warmup_seconds = max(warmup_seconds, 0.0)
+        self._connected = 0
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self.measure_start: float | None = None
+        self.stop_time: float | None = None
+
+    def mark_connected(self) -> None:
+        with self._lock:
+            if self._ready.is_set():
+                return
+            self._connected += 1
+            if self._connected >= self.worker_count:
+                self.measure_start = time.perf_counter() + self.warmup_seconds
+                self.stop_time = self.measure_start + self.duration
+                self._ready.set()
+
+    def wait(self) -> tuple[float, float]:
+        self._ready.wait()
+        assert self.measure_start is not None
+        assert self.stop_time is not None
+        return self.measure_start, self.stop_time
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._ready.is_set():
+                return
+            now = time.perf_counter()
+            self.measure_start = now
+            self.stop_time = now
+            self._ready.set()
+
+
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
@@ -68,14 +105,23 @@ def write_curve_report(
     parallel: int,
     chunk_size: int,
     sample_interval: float,
+    measurement_window: MeasurementWindow,
     curve_file: str,
     stats: list[WorkerStats],
     done: threading.Event,
 ) -> None:
-    started = time.perf_counter()
-    last_sample = started
-    last_bytes = 0
     samples: list[dict[str, float | int]] = []
+    measure_start, stop_time = measurement_window.wait()
+    measurement_seconds = max(stop_time - measure_start, 0.0)
+    last_sample = measure_start
+    last_bytes = 0
+
+    while True:
+        remaining = measure_start - time.perf_counter()
+        if remaining <= 0:
+            break
+        if done.wait(min(remaining, 0.1)):
+            break
 
     while not done.wait(sample_interval):
         now = time.perf_counter()
@@ -83,7 +129,7 @@ def write_curve_report(
         interval_seconds = max(now - last_sample, 1e-6)
         samples.append(
             {
-                "elapsed_seconds": round(now - started, 3),
+                "elapsed_seconds": round(min(max(now - measure_start, 0.0), measurement_seconds), 3),
                 "total_bytes": total_bytes,
                 "mbps": round(((total_bytes - last_bytes) * 8.0) / interval_seconds / 1_000_000.0, 2),
             }
@@ -91,13 +137,13 @@ def write_curve_report(
         last_sample = now
         last_bytes = total_bytes
 
-    now = time.perf_counter()
+    now = min(time.perf_counter(), stop_time)
     total_bytes = sum(item.bytes for item in stats)
     if not samples or total_bytes != last_bytes:
         interval_seconds = max(now - last_sample, 1e-6)
         samples.append(
             {
-                "elapsed_seconds": round(now - started, 3),
+                "elapsed_seconds": round(min(max(now - measure_start, 0.0), measurement_seconds), 3),
                 "total_bytes": total_bytes,
                 "mbps": round(((total_bytes - last_bytes) * 8.0) / interval_seconds / 1_000_000.0, 2),
             }
@@ -110,6 +156,8 @@ def write_curve_report(
                 "parallel": parallel,
                 "chunk_size": chunk_size,
                 "sample_interval_seconds": sample_interval,
+                "warmup_seconds": measurement_window.warmup_seconds,
+                "measurement_seconds": measurement_seconds,
                 "samples": samples,
             },
             handle,
@@ -120,19 +168,24 @@ def write_curve_report(
 def worker_upload(
     proxy: tuple[str, int],
     target: tuple[str, int],
-    duration: float,
+    measurement_window: MeasurementWindow,
     chunk_size: int,
     stats: WorkerStats,
 ) -> None:
     sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
     stats.connect_ms = connect_ms
     payload = b"\0" * chunk_size
-    deadline = time.perf_counter() + duration
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
     try:
-        while time.perf_counter() < deadline:
+        while True:
+            now = time.perf_counter()
+            if now >= stop_time:
+                break
             sock.sendall(payload)
-            stats.bytes += len(payload)
-            stats.packets += 1
+            if now >= measure_start:
+                stats.bytes += len(payload)
+                stats.packets += 1
     finally:
         try:
             sock.shutdown(socket.SHUT_WR)
@@ -144,7 +197,7 @@ def worker_upload(
 def worker_download(
     proxy: tuple[str, int],
     target: tuple[str, int],
-    duration: float,
+    measurement_window: MeasurementWindow,
     chunk_size: int,
     stats: WorkerStats,
 ) -> None:
@@ -152,16 +205,21 @@ def worker_download(
     started = time.perf_counter()
     sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
     stats.connect_ms = connect_ms
-    deadline = time.perf_counter() + duration
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
     try:
-        while time.perf_counter() < deadline:
+        while True:
+            now = time.perf_counter()
+            if now >= stop_time:
+                break
             chunk = sock.recv(131072)
             if not chunk:
                 break
             if stats.first_byte_ms is None:
                 stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
-            stats.bytes += len(chunk)
-            stats.packets += 1
+            if time.perf_counter() >= measure_start:
+                stats.bytes += len(chunk)
+                stats.packets += 1
     finally:
         sock.close()
 
@@ -200,6 +258,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=32768)
     parser.add_argument("--curve-file")
     parser.add_argument("--sample-interval", type=float, default=1.0)
+    parser.add_argument("--measure-warmup-seconds", type=float, default=0.0)
     args = parser.parse_args()
 
     proxies: list[tuple[str, int]] = []
@@ -218,11 +277,15 @@ def main() -> None:
     stats = [WorkerStats() for _ in range(max(args.parallel, 1))]
     threads: list[threading.Thread] = []
     errors: list[BaseException] = []
-    started = time.perf_counter()
+    measurement_window = MeasurementWindow(
+        len(stats),
+        args.seconds,
+        args.measure_warmup_seconds if args.mode != "idle" else 0.0,
+    )
 
     curve_done = threading.Event()
     curve_thread = None
-    if args.curve_file:
+    if args.curve_file and args.mode != "idle":
         curve_thread = threading.Thread(
             target=write_curve_report,
             kwargs={
@@ -230,6 +293,7 @@ def main() -> None:
                 "parallel": max(args.parallel, 1),
                 "chunk_size": args.chunk_size,
                 "sample_interval": max(args.sample_interval, 0.1),
+                "measurement_window": measurement_window,
                 "curve_file": args.curve_file,
                 "stats": stats,
                 "done": curve_done,
@@ -241,9 +305,13 @@ def main() -> None:
     def run_worker(index: int) -> None:
         try:
             proxy = proxies[index % len(proxies)]
-            workers[args.mode](proxy, target, args.seconds, args.chunk_size, stats[index])
+            if args.mode == "idle":
+                worker_idle(proxy, target, args.seconds, args.chunk_size, stats[index])
+            else:
+                workers[args.mode](proxy, target, measurement_window, args.chunk_size, stats[index])
         except BaseException as error:
             errors.append(error)
+            measurement_window.cancel()
 
     for index in range(len(stats)):
         thread = threading.Thread(target=run_worker, args=(index,), daemon=True)
@@ -253,6 +321,7 @@ def main() -> None:
     for thread in threads:
         thread.join()
 
+    measurement_window.cancel()
     curve_done.set()
     if curve_thread is not None:
         curve_thread.join()
@@ -260,7 +329,7 @@ def main() -> None:
     if errors:
         raise errors[0]
 
-    elapsed = max(time.perf_counter() - started, 1e-6)
+    elapsed = max(args.seconds, 1e-6)
     total_bytes = sum(item.bytes for item in stats)
     total_packets = sum(item.packets for item in stats)
     print(
@@ -269,6 +338,10 @@ def main() -> None:
                 "mode": args.mode,
                 "parallel": len(stats),
                 "duration": round(args.seconds, 3),
+                "measure_warmup_seconds": round(
+                    args.measure_warmup_seconds if args.mode != "idle" else 0.0,
+                    3,
+                ),
                 "bytes": total_bytes,
                 "mbps": round(total_bytes * 8.0 / elapsed / 1_000_000.0, 2),
                 "pps": round(total_packets / elapsed, 2),
