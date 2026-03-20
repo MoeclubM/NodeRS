@@ -25,6 +25,10 @@ on:
         description: Throughput curve sampling interval in seconds
         required: false
         default: "1.0"
+      steady_state_warmup_seconds:
+        description: Warmup duration before long-connection throughput and curve sampling
+        required: false
+        default: "3.0"
       lossy_repeats:
         description: Repeat count for lossy benchmark cases; report uses median
         required: false
@@ -69,12 +73,14 @@ jobs:
           long_connection_seconds="${{ github.event.inputs.long_connection_seconds }}"
           idle_seconds="${{ github.event.inputs.idle_seconds }}"
           curve_sample_interval="${{ github.event.inputs.curve_sample_interval }}"
+          steady_state_warmup_seconds="${{ github.event.inputs.steady_state_warmup_seconds }}"
           lossy_repeats="${{ github.event.inputs.lossy_repeats }}"
           compare_count="${compare_count:-3}"
           sing_box_version="${sing_box_version:-latest}"
           long_connection_seconds="${long_connection_seconds:-30}"
           idle_seconds="${idle_seconds:-95}"
           curve_sample_interval="${curve_sample_interval:-1.0}"
+          steady_state_warmup_seconds="${steady_state_warmup_seconds:-3.0}"
           lossy_repeats="${lossy_repeats:-3}"
           python3 scripts/benchmark_ab_report.py \
             --output-dir target/benchmark-ab \
@@ -84,6 +90,7 @@ jobs:
             --long-connection-seconds "$long_connection_seconds" \
             --idle-seconds "$idle_seconds" \
             --curve-sample-interval "$curve_sample_interval" \
+            --steady-state-warmup-seconds "$steady_state_warmup_seconds" \
             --lossy-repeats "$lossy_repeats" \
             --enable-netem
 
