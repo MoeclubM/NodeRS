@@ -619,8 +619,14 @@ pub(super) fn advance_chunk_batch(
         };
         let remaining = front.len().saturating_sub(*front_offset);
         if written < remaining {
+            if let Some(front) = chunks.front_mut() {
+                front.release_written(written);
+            }
             *front_offset += written;
             break;
+        }
+        if let Some(front) = chunks.front_mut() {
+            front.release_written(remaining);
         }
         written -= remaining;
         chunks.pop_front();
