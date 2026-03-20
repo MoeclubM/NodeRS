@@ -13,6 +13,18 @@ on:
         description: sing-box release tag or latest
         required: false
         default: latest
+      long_connection_seconds:
+        description: Duration in seconds for long upload and download benchmark cases
+        required: false
+        default: "30"
+      idle_seconds:
+        description: Duration in seconds for idle keepalive stability cases
+        required: false
+        default: "95"
+      curve_sample_interval:
+        description: Throughput curve sampling interval in seconds
+        required: false
+        default: "1.0"
 
 concurrency:
   group: benchmark-ab-${{ github.ref }}
@@ -20,65 +32,6 @@ concurrency:
 
 jobs:
   version-compare:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y iproute2 openssl
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Fetch dependencies
-        run: cargo fetch --locked
-
-      - name: Run version comparison benchmark
-        run: |
-          compare_count="${{ github.event.inputs.compare_count }}"
-          sing_box_version="${{ github.event.inputs.sing_box_version }}"
-          compare_count="${compare_count:-3}"
-          sing_box_version="${sing_box_version:-latest}"
-          python3 scripts/benchmark_ab_report.py \
-            --output-dir target/benchmark-ab \
-            --target x86_64-unknown-linux-gnu \
-            --compare-count "$compare_count" \
-            --sing-version "$sing_box_version" \
-            --enable-netem
-
-      - name: Publish version comparison summary
-        if: always()
-        run: |
-          echo "## Version Compare" >> "$GITHUB_STEP_SUMMARY"
-          echo >> "$GITHUB_STEP_SUMMARY"
-          if [ -f target/benchmark-ab/report.md ]; then
-            cat target/benchmark-ab/report.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Benchmark report was not generated." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Upload version comparison artifact
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: benchmark-ab-versions
-          path: |
-            target/benchmark-ab/report.md
-            target/benchmark-ab/summary.json
-            target/benchmark-ab/benchmark-ab-report.json
-            target/benchmark-ab/benchmark-ab-report.csv
-          if-no-files-found: error
-
-  runtime-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -103,33 +56,47 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
 
-      - name: Run runtime matrix benchmark
+      - name: Run version comparison benchmark
         run: |
+          compare_count="${{ github.event.inputs.compare_count }}"
           sing_box_version="${{ github.event.inputs.sing_box_version }}"
+          long_connection_seconds="${{ github.event.inputs.long_connection_seconds }}"
+          idle_seconds="${{ github.event.inputs.idle_seconds }}"
+          curve_sample_interval="${{ github.event.inputs.curve_sample_interval }}"
+          compare_count="${compare_count:-3}"
           sing_box_version="${sing_box_version:-latest}"
-          python3 scripts/benchmark_runtime_matrix.py \
-            --output-dir target/runtime-matrix \
+          long_connection_seconds="${long_connection_seconds:-30}"
+          idle_seconds="${idle_seconds:-95}"
+          curve_sample_interval="${curve_sample_interval:-1.0}"
+          python3 scripts/benchmark_ab_report.py \
+            --output-dir target/benchmark-ab \
+            --target x86_64-unknown-linux-musl \
+            --compare-count "$compare_count" \
             --sing-version "$sing_box_version" \
+            --long-connection-seconds "$long_connection_seconds" \
+            --idle-seconds "$idle_seconds" \
+            --curve-sample-interval "$curve_sample_interval" \
             --enable-netem
 
-      - name: Publish runtime matrix summary
+      - name: Publish version comparison summary
         if: always()
         run: |
-          echo "## Runtime Matrix" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Version Compare" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
-          if [ -f target/runtime-matrix/report.md ]; then
-            cat target/runtime-matrix/report.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f target/benchmark-ab/report.md ]; then
+            cat target/benchmark-ab/report.md >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Runtime matrix report was not generated." >> "$GITHUB_STEP_SUMMARY"
+            echo "Benchmark report was not generated." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload runtime matrix artifact
+      - name: Upload version comparison artifact
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: benchmark-runtime-matrix
+          name: benchmark-ab-versions
           path: |
-            target/runtime-matrix/report.md
-            target/runtime-matrix/summary.json
-            target/runtime-matrix/runtime-matrix-report.json
+            target/benchmark-ab/report.md
+            target/benchmark-ab/summary.json
+            target/benchmark-ab/benchmark-ab-report.json
+            target/benchmark-ab/benchmark-ab-report.csv
           if-no-files-found: error
