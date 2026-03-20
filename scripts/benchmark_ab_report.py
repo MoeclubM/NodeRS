@@ -50,7 +50,7 @@ class Implementation:
 def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
     long_connection_seconds = max(5, long_connection_seconds)
     idle_seconds = max(5, idle_seconds)
-    return [
+    cases = [
         Case(
             "upload-long-connection",
             "upload",
@@ -68,24 +68,6 @@ def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
             capture_curve=True,
         ),
         Case(
-            "upload-long-connection-lossy",
-            "upload",
-            1,
-            32768,
-            long_connection_seconds,
-            "lossy-small",
-            capture_curve=True,
-        ),
-        Case(
-            "download-long-connection-lossy",
-            "download",
-            1,
-            32768,
-            long_connection_seconds,
-            "lossy-small",
-            capture_curve=True,
-        ),
-        Case(
             f"idle-keepalive-{idle_seconds}s",
             "idle",
             4,
@@ -94,13 +76,40 @@ def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
             category="stability",
         ),
     ]
+    for profile_name in NETEM_PROFILES:
+        cases.extend(
+            [
+                Case(
+                    f"upload-long-connection-{profile_name}",
+                    "upload",
+                    1,
+                    32768,
+                    long_connection_seconds,
+                    profile_name,
+                    capture_curve=True,
+                ),
+                Case(
+                    f"download-long-connection-{profile_name}",
+                    "download",
+                    1,
+                    32768,
+                    long_connection_seconds,
+                    profile_name,
+                    capture_curve=True,
+                ),
+            ]
+        )
+    return cases
 
 
 NETEM_PROFILES = {
-    "lossy-small": ["delay", "15ms", "3ms", "loss", "0.5%"],
+    "high-latency-lossy": ["delay", "200ms", "loss", "0.5%"],
+    "high-loss-low-latency-lossy": ["delay", "55ms", "loss", "20%"],
+    # Approximate a mostly-40 ms path with occasional high-delay spikes.
+    "jittery-lossy": ["delay", "40ms", "150ms", "distribution", "paretonormal", "loss", "6%"],
 }
 
-FIXED_COMPARE_TAGS = ["v0.0.23", "v0.0.18"]
+FIXED_COMPARE_TAGS = ["v0.0.23"]
 
 
 def throughput_cases(cases: list[Case]) -> list[Case]:
@@ -122,9 +131,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compare-count",
         type=int,
-        default=3,
-        help="Total number of previous tags to benchmark. The default keeps fixed baselines "
-        "v0.0.23 and v0.0.18, then adds the latest previous tag.",
+        default=2,
+        help="Total number of previous tags to benchmark. The default keeps the fixed baseline "
+        "v0.0.23, then adds the latest previous tag.",
     )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
@@ -132,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-seconds", type=int, default=95)
     parser.add_argument("--curve-sample-interval", type=float, default=1.0)
     parser.add_argument("--steady-state-warmup-seconds", type=float, default=3.0)
-    parser.add_argument("--lossy-repeats", type=int, default=3)
+    parser.add_argument("--lossy-repeats", type=int, default=2)
     return parser.parse_args()
 
 

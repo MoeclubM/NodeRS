@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       compare_count:
-        description: Total previous tags to compare; default is fixed v0.0.23/v0.0.18 plus the latest previous tag
+        description: Total previous tags to compare; default is fixed v0.0.23 plus the latest previous tag
         required: false
-        default: "3"
+        default: "2"
       sing_box_version:
         description: sing-box release tag or latest
         required: false
@@ -32,7 +32,7 @@ on:
       lossy_repeats:
         description: Repeat count for lossy benchmark cases; report uses median
         required: false
-        default: "3"
+        default: "2"
 
 concurrency:
   group: benchmark-ab-${{ github.ref }}
@@ -75,13 +75,13 @@ jobs:
           curve_sample_interval="${{ github.event.inputs.curve_sample_interval }}"
           steady_state_warmup_seconds="${{ github.event.inputs.steady_state_warmup_seconds }}"
           lossy_repeats="${{ github.event.inputs.lossy_repeats }}"
-          compare_count="${compare_count:-3}"
+          compare_count="${compare_count:-2}"
           sing_box_version="${sing_box_version:-latest}"
           long_connection_seconds="${long_connection_seconds:-30}"
           idle_seconds="${idle_seconds:-95}"
           curve_sample_interval="${curve_sample_interval:-1.0}"
           steady_state_warmup_seconds="${steady_state_warmup_seconds:-3.0}"
-          lossy_repeats="${lossy_repeats:-3}"
+          lossy_repeats="${lossy_repeats:-2}"
           python3 scripts/benchmark_ab_report.py \
             --output-dir target/benchmark-ab \
             --target x86_64-unknown-linux-musl \
