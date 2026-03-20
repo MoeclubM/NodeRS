@@ -101,4 +101,5 @@ jobs:
             target/benchmark-ab/summary.json
             target/benchmark-ab/benchmark-ab-report.json
             target/benchmark-ab/benchmark-ab-report.csv
+            target/benchmark-ab/logs
           if-no-files-found: warn
