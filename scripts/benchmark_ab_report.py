@@ -6,10 +6,10 @@ import csv
 import json
 import os
 import pathlib
-import re
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -21,13 +21,8 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+COMPARE_SOCKS = ROOT / "scripts" / "benchmark_compare_socks.py"
 USERS = [f"bench-user-uuid-{index:02d}" for index in range(1, 5)]
-BENCH_RESULT_RE = re.compile(
-    r"mode=(?P<mode>\S+) parallel=(?P<parallel>\d+) users=(?P<users>\d+) duration=(?P<duration>\d+)s "
-    r"uploaded=(?P<uploaded_mib>\d+) MiB \((?P<uploaded_mbps>[0-9.]+) Mbps\) "
-    r"downloaded=(?P<downloaded_mib>\d+) MiB \((?P<downloaded_mbps>[0-9.]+) Mbps\)"
-)
-BENCH_METRIC_RE = re.compile(r"avg (?P<label>tcp connect|tls handshake|stream synack|first byte): (?P<value>[0-9.]+) ms")
 
 
 @dataclass(frozen=True)
@@ -414,47 +409,10 @@ def summarize_curve(samples: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def parse_bench_client_output(text: str) -> dict[str, object]:
-    match = BENCH_RESULT_RE.search(text)
-    if not match:
-        raise RuntimeError(f"unexpected bench_anytls client output: {text!r}")
-
-    metrics: dict[str, object] = {
-        "mode": match.group("mode"),
-        "parallel": int(match.group("parallel")),
-        "users": int(match.group("users")),
-        "duration": int(match.group("duration")),
-        "uploaded_mib": int(match.group("uploaded_mib")),
-        "downloaded_mib": int(match.group("downloaded_mib")),
-        "uploaded_mbps": float(match.group("uploaded_mbps")),
-        "downloaded_mbps": float(match.group("downloaded_mbps")),
-        "bytes": 0,
-        "mbps": 0.0,
-        "pps": 0.0,
-    }
-    if metrics["mode"] == "upload":
-        metrics["bytes"] = int(metrics["uploaded_mib"]) * 1024 * 1024
-        metrics["mbps"] = float(metrics["uploaded_mbps"])
-    elif metrics["mode"] == "download":
-        metrics["bytes"] = int(metrics["downloaded_mib"]) * 1024 * 1024
-        metrics["mbps"] = float(metrics["downloaded_mbps"])
-
-    label_map = {
-        "tcp connect": "connect_ms",
-        "tls handshake": "handshake_ms",
-        "stream synack": "synack_ms",
-        "first byte": "first_byte_ms",
-    }
-    for metric_match in BENCH_METRIC_RE.finditer(text):
-        metrics[label_map[metric_match.group("label")]] = float(metric_match.group("value"))
-    return metrics
-
-
-def run_bench_client_case(
+def run_compare_socks(
     *,
-    bench_binary: pathlib.Path,
-    server_port: int,
-    target_port: int,
+    proxies: list[str],
+    target: str,
     case: Case,
     curve_sample_interval: float,
     logs_dir: pathlib.Path,
@@ -463,16 +421,12 @@ def run_bench_client_case(
     stderr_path = logs_dir / f"{case.name}.stderr.log"
     curve_path = logs_dir / f"{case.name}.curve.json"
     command = [
-        str(bench_binary),
-        "client",
-        "--server",
-        f"127.0.0.1:{server_port}",
-        "--sni",
-        "localhost",
-        "--users",
-        ",".join(USERS),
+        sys.executable,
+        str(COMPARE_SOCKS),
+        "--proxies",
+        ",".join(proxies),
         "--target",
-        f"127.0.0.1:{target_port}",
+        target,
         "--mode",
         case.mode,
         "--seconds",
@@ -497,7 +451,7 @@ def run_bench_client_case(
             f"{case.name} failed:\nSTDOUT:\n{stdout_path.read_text(encoding='utf-8', errors='ignore')}\n"
             f"STDERR:\n{stderr_path.read_text(encoding='utf-8', errors='ignore')}"
         )
-    metrics = parse_bench_client_output(stdout_path.read_text(encoding="utf-8", errors="ignore"))
+    metrics = json.loads(stdout_path.read_text(encoding="utf-8", errors="ignore"))
     if case.capture_curve and curve_path.exists():
         curve = json.loads(curve_path.read_text(encoding="utf-8"))
         metrics["curve_samples"] = curve.get("samples", [])
@@ -586,11 +540,68 @@ def write_sing_server_config(
     )
 
 
+def write_sing_client_config(path: pathlib.Path, *, socks_port: int, server_port: int, user: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "log": {"level": "warn"},
+                "inbounds": [
+                    {
+                        "type": "socks",
+                        "tag": "socks-in",
+                        "listen": "127.0.0.1",
+                        "listen_port": socks_port,
+                    }
+                ],
+                "outbounds": [
+                    {
+                        "type": "anytls",
+                        "tag": "proxy",
+                        "server": "127.0.0.1",
+                        "server_port": server_port,
+                        "password": user,
+                        "tls": {"enabled": True, "server_name": "localhost", "insecure": True},
+                    }
+                ],
+                "route": {"final": "proxy"},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def start_sing_clients(
+    stack: ExitStack,
+    *,
+    sing_binary: pathlib.Path,
+    work_dir: pathlib.Path,
+    logs_dir: pathlib.Path,
+    server_port: int,
+) -> list[str]:
+    proxies: list[str] = []
+    socks_ports = [reserve_port() for _ in USERS]
+    for index, socks_port in enumerate(socks_ports):
+        config_path = work_dir / f"client-{index}.json"
+        write_sing_client_config(config_path, socks_port=socks_port, server_port=server_port, user=USERS[index])
+        stack.enter_context(
+            started_process(
+                [str(sing_binary), "run", "-c", str(config_path)],
+                stdout_path=logs_dir / f"client-{index}.stdout.log",
+                stderr_path=logs_dir / f"client-{index}.stderr.log",
+                ready_port=socks_port,
+            )
+        )
+        proxies.append(f"127.0.0.1:{socks_port}")
+    return proxies
+
+
 def benchmark_impl(
     implementation: Implementation,
     *,
     cases: list[Case],
     bench_binary: pathlib.Path,
+    sing_binary: pathlib.Path,
     output_dir: pathlib.Path,
     curve_sample_interval: float = 1.0,
     enable_netem: bool = False,
@@ -649,6 +660,14 @@ def benchmark_impl(
                     )
                 )
 
+            proxies = start_sing_clients(
+                stack,
+                sing_binary=sing_binary,
+                work_dir=work_dir,
+                logs_dir=impl_dir,
+                server_port=server_port,
+            )
+
             rows: list[dict[str, object]] = []
             for case in cases:
                 with applied_netem(case.netem_profile, enable_netem):
@@ -666,19 +685,17 @@ def benchmark_impl(
                             stderr_path=impl_dir / f"{case.name}.source.stderr.log",
                             ready_port=source_port,
                         ):
-                            metrics = run_bench_client_case(
-                                bench_binary=bench_binary,
-                                server_port=server_port,
-                                target_port=source_port,
+                            metrics = run_compare_socks(
+                                proxies=proxies,
+                                target=f"127.0.0.1:{source_port}",
                                 case=case,
                                 curve_sample_interval=curve_sample_interval,
                                 logs_dir=impl_dir,
                             )
                     else:
-                        metrics = run_bench_client_case(
-                            bench_binary=bench_binary,
-                            server_port=server_port,
-                            target_port=sink_port,
+                        metrics = run_compare_socks(
+                            proxies=proxies,
+                            target=f"127.0.0.1:{sink_port}",
                             case=case,
                             curve_sample_interval=curve_sample_interval,
                             logs_dir=impl_dir,
@@ -915,8 +932,8 @@ def write_outputs(
                 "",
                 "## Real Connection Latency",
                 "",
-                "| Scenario | Implementation | Avg TCP Connect ms | Avg TLS Handshake ms | Avg Stream Synack ms | Avg First Byte ms |",
-                "| --- | --- | --- | --- | --- | --- |",
+                "| Scenario | Implementation | Avg Tunnel Connect ms | Avg First Byte ms |",
+                "| --- | --- | --- | --- |",
             ]
         )
         for case in latency_group:
@@ -924,14 +941,10 @@ def write_outputs(
             for impl in impl_order:
                 row = scenario_rows.get(impl)
                 connect_ms = row.get("connect_ms") if row else None
-                handshake_ms = row.get("handshake_ms") if row else None
-                synack_ms = row.get("synack_ms") if row else None
                 first_byte_ms = row.get("first_byte_ms") if row else None
                 lines.append(
                     f"| `{case.name}` | `{impl}` | "
                     f"{f'{connect_ms:.2f}' if isinstance(connect_ms, (int, float)) else 'n/a'} | "
-                    f"{f'{handshake_ms:.2f}' if isinstance(handshake_ms, (int, float)) else 'n/a'} | "
-                    f"{f'{synack_ms:.2f}' if isinstance(synack_ms, (int, float)) else 'n/a'} | "
                     f"{f'{first_byte_ms:.2f}' if isinstance(first_byte_ms, (int, float)) else 'n/a'} |"
                 )
                 latency_summary_rows.append(
@@ -939,8 +952,6 @@ def write_outputs(
                         "scenario": case.name,
                         "impl": impl,
                         "connect_ms": connect_ms,
-                        "handshake_ms": handshake_ms,
-                        "synack_ms": synack_ms,
                         "first_byte_ms": first_byte_ms,
                     }
                 )
@@ -952,31 +963,25 @@ def write_outputs(
                 "",
                 "## Long Connection Stability",
                 "",
-                "| Scenario | Implementation | Status | Avg Stream Synack ms | Avg TCP Connect ms | Avg TLS Handshake ms |",
-                "| --- | --- | --- | --- | --- | --- |",
+                "| Scenario | Implementation | Status | Avg Tunnel Connect ms |",
+                "| --- | --- | --- | --- |",
             ]
         )
         for case in stability_group:
             for impl in impl_order:
                 row = rows_by_scenario.get(case.name, {}).get(impl)
                 status = row.get("status", "n/a") if row else "n/a"
-                synack_ms = row.get("synack_ms") if row else None
                 connect_ms = row.get("connect_ms") if row else None
-                handshake_ms = row.get("handshake_ms") if row else None
                 lines.append(
                     f"| `{case.name}` | `{impl}` | {status} | "
-                    f"{f'{synack_ms:.2f}' if isinstance(synack_ms, (int, float)) else 'n/a'} | "
-                    f"{f'{connect_ms:.2f}' if isinstance(connect_ms, (int, float)) else 'n/a'} | "
-                    f"{f'{handshake_ms:.2f}' if isinstance(handshake_ms, (int, float)) else 'n/a'} |"
+                    f"{f'{connect_ms:.2f}' if isinstance(connect_ms, (int, float)) else 'n/a'} |"
                 )
                 stability_summary_rows.append(
                     {
                         "scenario": case.name,
                         "impl": impl,
                         "status": status,
-                        "synack_ms": synack_ms,
                         "connect_ms": connect_ms,
-                        "handshake_ms": handshake_ms,
                     }
                 )
 
@@ -1126,6 +1131,7 @@ def main() -> int:
             implementation,
             cases=cases,
             bench_binary=bench_binary,
+            sing_binary=sing_binary,
             output_dir=output_dir / "logs",
             curve_sample_interval=args.curve_sample_interval,
             enable_netem=args.enable_netem,

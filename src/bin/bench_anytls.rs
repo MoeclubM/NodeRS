@@ -770,9 +770,9 @@ async fn run_client(options: ClientOptions) -> anyhow::Result<BenchSummary> {
     for worker_id in 0..options.parallel {
         let options = options.clone();
         let state = states[worker_id].clone();
-        tasks.push(tokio::spawn(
-            async move { run_worker(worker_id, options, state).await },
-        ));
+        tasks.push(tokio::spawn(async move {
+            run_worker(worker_id, options, state).await
+        }));
     }
 
     let mut summary = WorkerResult::default();
@@ -1568,7 +1568,9 @@ fn parse_client_args(args: Vec<String>) -> anyhow::Result<ClientOptions> {
             "--chunk-size" => {
                 chunk_size = next_value(&mut iter, "--chunk-size")?.parse::<usize>()?
             }
-            "--curve-file" => curve_file = Some(PathBuf::from(next_value(&mut iter, "--curve-file")?)),
+            "--curve-file" => {
+                curve_file = Some(PathBuf::from(next_value(&mut iter, "--curve-file")?))
+            }
             "--sample-interval" => {
                 sample_interval = next_value(&mut iter, "--sample-interval")?.parse::<f64>()?
             }
