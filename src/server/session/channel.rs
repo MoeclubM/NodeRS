@@ -85,7 +85,6 @@ impl PayloadBuffer {
         self.bytes.clear();
     }
 
-    #[cfg(test)]
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
