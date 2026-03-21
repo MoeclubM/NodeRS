@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, ensure};
 use std::collections::VecDeque;
 use std::future::poll_fn;
