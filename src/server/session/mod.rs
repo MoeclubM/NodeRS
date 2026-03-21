@@ -526,6 +526,10 @@ async fn handle_stream(
                     }
                     let (session_side, app_bridge_side) = tokio::io::duplex(256 * 1024);
                     let (mut session_reader, mut session_writer) = split(session_side);
+                    // UOT keeps streaming through ChannelReader after the parser stage, so it can
+                    // release byte budget as bytes are copied onward instead of waiting for a
+                    // queued-tail handoff like the TCP upload path does.
+                    app_side.enable_budget_release_on_read();
                     let bridge_control = context.control.clone();
                     let bridge_task = tokio::spawn(async move {
                         pump_copy(
