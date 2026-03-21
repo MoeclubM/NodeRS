@@ -425,6 +425,7 @@ pub(super) struct ChannelReader {
     current: Option<BufferedChunk>,
     offset: usize,
     finished: bool,
+    release_budget_on_read: bool,
 }
 
 impl ChannelReader {
@@ -434,12 +435,21 @@ impl ChannelReader {
             current: None,
             offset: 0,
             finished: false,
+            release_budget_on_read: false,
         }
+    }
+
+    pub(super) fn enable_budget_release_on_read(&mut self) {
+        self.release_budget_on_read = true;
     }
 
     pub(super) fn into_parts(
         self,
     ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {
+        debug_assert!(
+            !self.release_budget_on_read,
+            "streaming readers should not be converted back into queued parts"
+        );
         let pending = self.current.and_then(|current| {
             if self.offset < current.len() {
                 Some(current.split_off(self.offset))
@@ -460,12 +470,15 @@ impl AsyncRead for ChannelReader {
         let mut wrote_any = false;
         loop {
             let offset = self.offset;
+            let release_budget_on_read = self.release_budget_on_read;
             if let Some(current) = self.current.as_mut() {
                 if offset < current.len() {
                     let remaining = &current.bytes()[offset..];
                     let to_copy = remaining.len().min(buf.remaining());
                     buf.put_slice(&remaining[..to_copy]);
-                    current.release_written(to_copy);
+                    if release_budget_on_read {
+                        current.release_written(to_copy);
+                    }
                     wrote_any = true;
                     let new_offset = offset + to_copy;
                     if new_offset >= current.len() {
@@ -654,18 +667,65 @@ mod tests {
         assert_eq!(small, [1]);
         assert_eq!(
             sender.budget.used.load(Ordering::Acquire),
+            4,
+            "parsing should keep the current chunk reserved until its unread tail is detached"
+        );
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![5])).is_err(),
+            "the parser must not free queue budget before the unread tail is handed off"
+        );
+
+        let (pending, _rx, finished) = reader.into_parts();
+        assert!(!finished, "reading a prefix must not finish the stream");
+        let pending = pending.expect("the unread tail should remain pending");
+        assert_eq!(pending.bytes(), &[2, 3, 4]);
+        assert_eq!(
+            sender.budget.used.load(Ordering::Acquire),
             3,
-            "the byte budget should shrink with the bytes already read"
+            "detaching the unread tail should release only the consumed prefix budget"
         );
         assert!(
             sender.try_send_data(PayloadBuffer::new(vec![5])).is_ok(),
-            "reading a prefix should immediately free matching budget"
+            "once the unread tail is detached, only its bytes should remain reserved"
+        );
+        assert!(
+            sender
+                .try_send_data(PayloadBuffer::new(vec![6, 7]))
+                .is_err(),
+            "the unread tail budget must still backpressure additional queued bytes"
+        );
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn channel_reader_can_release_budget_during_streaming_reads() {
+        let (sender, rx) = bounded_inbound_channel(8, 4);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
+            .expect("fill budget");
+
+        let mut reader = ChannelReader::new(rx);
+        reader.enable_budget_release_on_read();
+        let mut small = [0u8; 1];
+        reader
+            .read_exact(&mut small)
+            .await
+            .expect("read first byte");
+        assert_eq!(small, [1]);
+        assert_eq!(
+            sender.budget.used.load(Ordering::Acquire),
+            3,
+            "streaming readers should free budget as bytes are copied onward"
+        );
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![5])).is_ok(),
+            "streaming reads should unblock new queued bytes immediately"
         );
         assert!(
             sender
                 .try_send_data(PayloadBuffer::new(vec![6, 7, 8, 9]))
                 .is_err(),
-            "the unread tail of the current payload must remain reserved"
+            "only the unread tail of the current payload should remain reserved"
         );
     }
 
