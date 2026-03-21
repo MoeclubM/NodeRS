@@ -436,6 +436,19 @@ impl ChannelReader {
             finished: false,
         }
     }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {
+        let pending = self.current.and_then(|current| {
+            if self.offset < current.len() {
+                Some(current.split_off(self.offset))
+            } else {
+                None
+            }
+        });
+        (pending, self.rx, self.finished)
+    }
 }
 
 impl AsyncRead for ChannelReader {
