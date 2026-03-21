@@ -37,6 +37,8 @@ use frame::{
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
 
+const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
+
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const PAYLOAD_POOL_MAX_CACHED: usize = 512;
@@ -489,11 +491,45 @@ async fn forward_buffered_inbound_payload(
     // so forwarding the pooled buffer as a single unit avoids extra copies and fragmentation.
     match inbound.try_send_data(payload) {
         Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
-        Err(channel::TrySendError::Full(payload)) => tokio::select! {
-            _ = control.cancelled() => Ok(()),
-            result = inbound.send_data(payload) => result,
-        },
+        Err(channel::TrySendError::Full(payload)) => {
+            if payload.len() <= BACKPRESSURED_FORWARD_SEGMENT_LEN {
+                return tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                };
+            }
+            forward_backpressured_inbound_payload(
+                inbound,
+                control,
+                payload,
+                BACKPRESSURED_FORWARD_SEGMENT_LEN,
+            )
+            .await
+        }
     }
+}
+
+async fn forward_backpressured_inbound_payload(
+    inbound: &channel::InboundSender,
+    control: Arc<SessionControl>,
+    payload: PayloadBuffer,
+    segment_len: usize,
+) -> anyhow::Result<()> {
+    let segment_len = segment_len.max(1);
+    let bytes = payload.into_vec();
+    for segment in bytes.chunks(segment_len) {
+        let segment = PayloadBuffer::new(segment.to_vec());
+        match inbound.try_send_data(segment) {
+            Ok(()) | Err(channel::TrySendError::Closed) => {}
+            Err(channel::TrySendError::Full(segment)) => {
+                tokio::select! {
+                    _ = control.cancelled() => return Ok(()),
+                    result = inbound.send_data(segment) => result?,
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_stream(
@@ -688,7 +724,9 @@ mod tests {
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
         pump_copy, write_chunk_batch_for_test,
     };
-    use super::{forward_buffered_inbound_payload, read_exact_payload};
+    use super::{
+        BACKPRESSURED_FORWARD_SEGMENT_LEN, forward_buffered_inbound_payload, read_exact_payload,
+    };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
@@ -1103,14 +1141,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waits_for_whole_buffered_payload_budget_without_fragmenting() {
+    async fn keeps_whole_buffered_payload_when_queue_has_budget() {
         let payload_len = 48 * 1024;
-        let (inbound, mut rx) = bounded_inbound_channel(8, payload_len);
+        let (inbound, mut rx) = bounded_inbound_channel(8, payload_len * 2);
+        let control = SessionControl::new();
+        let payload = PayloadBuffer::new(vec![7u8; payload_len]);
+
+        forward_buffered_inbound_payload(&inbound, control, payload)
+            .await
+            .expect("forward buffered payload");
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("payload should arrive")
+            .expect("inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected data payload");
+        };
+        assert_eq!(first.len(), payload_len);
+        assert!(first.bytes().iter().all(|byte| *byte == 7));
+    }
+
+    #[tokio::test]
+    async fn backpressured_whole_payload_falls_back_to_segments() {
+        let payload_len = 48 * 1024;
+        let first_payload_len = 24 * 1024;
+        let budget_len = 40 * 1024;
+        let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
         inbound
-            .try_send_data(PayloadBuffer::new(vec![3u8; payload_len]))
+            .try_send_data(PayloadBuffer::new(vec![3u8; first_payload_len]))
             .expect("fill queue budget with first payload");
 
         let forward_task = tokio::spawn({
@@ -1126,24 +1188,39 @@ mod tests {
         let InboundMessage::Data(first) = first else {
             panic!("expected first data payload");
         };
-        assert_eq!(first.len(), payload_len);
+        assert_eq!(first.len(), first_payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 3));
         assert!(
             !forward_task.is_finished(),
-            "whole-payload forwarding should wait for enough budget instead of fragmenting"
+            "forwarding should still be blocked on queue budget"
         );
 
         drop(first);
 
         let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("second queued payload should arrive")
+            .expect("first fallback segment should arrive")
             .expect("second inbound message");
         let InboundMessage::Data(second) = second else {
             panic!("expected second data payload");
         };
-        assert_eq!(second.len(), payload_len);
+        assert_eq!(second.len(), BACKPRESSURED_FORWARD_SEGMENT_LEN);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
+        assert!(
+            !forward_task.is_finished(),
+            "one fallback segment should fit before the whole buffered payload would"
+        );
+        drop(second);
+
+        let third = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("second fallback segment should arrive")
+            .expect("third inbound message");
+        let InboundMessage::Data(third) = third else {
+            panic!("expected third data payload");
+        };
+        assert_eq!(third.len(), payload_len - BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        assert!(third.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
             .await
