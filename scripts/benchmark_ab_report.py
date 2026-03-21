@@ -233,13 +233,49 @@ def wait_tcp(host: str, port: int, timeout_seconds: float = 20.0) -> None:
 
 
 @contextmanager
-def applied_netem(profile: str | None, enabled: bool):
+def applied_netem(profile: str | None, enabled: bool, server_port: int | None = None):
     if not enabled or profile is None:
         yield
         return
     arguments = NETEM_PROFILES[profile]
     run_best_effort(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"])
-    run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "netem", *arguments])
+    if server_port is None:
+        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "netem", *arguments])
+    else:
+        # Scope weak-link shaping to the AnyTLS server port so source/sink/panel traffic stays
+        # off the impaired path. This keeps the benchmark focused on the tunnel connection.
+        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "handle", "1:", "prio", "bands", "4"])
+        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "parent", "1:1", "handle", "10:", "netem", *arguments])
+        for direction in ("dport", "sport"):
+            run_checked(
+                [
+                    "sudo",
+                    "tc",
+                    "filter",
+                    "add",
+                    "dev",
+                    "lo",
+                    "protocol",
+                    "ip",
+                    "parent",
+                    "1:0",
+                    "prio",
+                    "1",
+                    "u32",
+                    "match",
+                    "ip",
+                    "protocol",
+                    "6",
+                    "0xff",
+                    "match",
+                    "ip",
+                    direction,
+                    str(server_port),
+                    "0xffff",
+                    "flowid",
+                    "1:1",
+                ]
+            )
     time.sleep(0.2)
     try:
         yield
@@ -723,17 +759,21 @@ def start_sing_clients(
     work_dir: pathlib.Path,
     logs_dir: pathlib.Path,
     server_port: int,
+    client_count: int,
+    log_prefix: str,
 ) -> list[str]:
+    if client_count > len(USERS):
+        raise RuntimeError(f"benchmark requested {client_count} clients but only {len(USERS)} users are configured")
     proxies: list[str] = []
-    socks_ports = [reserve_port() for _ in USERS]
+    socks_ports = [reserve_port() for _ in range(client_count)]
     for index, socks_port in enumerate(socks_ports):
-        config_path = work_dir / f"client-{index}.json"
+        config_path = work_dir / f"{log_prefix}.client-{index}.json"
         write_sing_client_config(config_path, socks_port=socks_port, server_port=server_port, user=USERS[index])
         stack.enter_context(
             started_process(
                 [str(sing_binary), "run", "-c", str(config_path)],
-                stdout_path=logs_dir / f"client-{index}.stdout.log",
-                stderr_path=logs_dir / f"client-{index}.stderr.log",
+                stdout_path=logs_dir / f"{log_prefix}.client-{index}.stdout.log",
+                stderr_path=logs_dir / f"{log_prefix}.client-{index}.stderr.log",
                 ready_port=socks_port,
             )
         )
@@ -807,14 +847,6 @@ def benchmark_impl(
                     )
                 )
 
-            proxies = start_sing_clients(
-                stack,
-                sing_binary=sing_binary,
-                work_dir=work_dir,
-                logs_dir=impl_dir,
-                server_port=server_port,
-            )
-
             rows: list[dict[str, object]] = []
             for case in cases:
                 attempt_count = max(1, lossy_repeats if case.netem_profile else 1)
@@ -825,21 +857,33 @@ def benchmark_impl(
                         if attempt_count == 1
                         else f"{case.name}.attempt-{attempt_index + 1}"
                     )
-                    with applied_netem(case.netem_profile, enable_netem):
-                        if case.mode == "download":
-                            with started_process(
-                                [
-                                    str(bench_binary),
-                                    "source",
-                                    "--listen",
-                                    f"127.0.0.1:{source_port}",
-                                    "--chunk-size",
-                                    str(case.chunk_size),
-                                ],
-                                stdout_path=impl_dir / f"{log_prefix}.source.stdout.log",
-                                stderr_path=impl_dir / f"{log_prefix}.source.stderr.log",
-                                ready_port=source_port,
-                            ):
+                    with applied_netem(case.netem_profile, enable_netem, server_port):
+                        with ExitStack() as attempt_stack:
+                            proxies = start_sing_clients(
+                                attempt_stack,
+                                sing_binary=sing_binary,
+                                work_dir=work_dir,
+                                logs_dir=impl_dir,
+                                server_port=server_port,
+                                client_count=case.parallel,
+                                log_prefix=log_prefix,
+                            )
+                            if case.mode == "download":
+                                attempt_stack.enter_context(
+                                    started_process(
+                                        [
+                                            str(bench_binary),
+                                            "source",
+                                            "--listen",
+                                            f"127.0.0.1:{source_port}",
+                                            "--chunk-size",
+                                            str(case.chunk_size),
+                                        ],
+                                        stdout_path=impl_dir / f"{log_prefix}.source.stdout.log",
+                                        stderr_path=impl_dir / f"{log_prefix}.source.stderr.log",
+                                        ready_port=source_port,
+                                    )
+                                )
                                 metrics = run_compare_socks(
                                     proxies=proxies,
                                     target=f"127.0.0.1:{source_port}",
@@ -849,16 +893,16 @@ def benchmark_impl(
                                     logs_dir=impl_dir,
                                     log_prefix=log_prefix,
                                 )
-                        else:
-                            metrics = run_compare_socks(
-                                proxies=proxies,
-                                target=f"127.0.0.1:{sink_port}",
-                                case=case,
-                                curve_sample_interval=curve_sample_interval,
-                                steady_state_warmup_seconds=steady_state_warmup_seconds,
-                                logs_dir=impl_dir,
-                                log_prefix=log_prefix,
-                            )
+                            else:
+                                metrics = run_compare_socks(
+                                    proxies=proxies,
+                                    target=f"127.0.0.1:{sink_port}",
+                                    case=case,
+                                    curve_sample_interval=curve_sample_interval,
+                                    steady_state_warmup_seconds=steady_state_warmup_seconds,
+                                    logs_dir=impl_dir,
+                                    log_prefix=log_prefix,
+                                )
                     case_attempts.append(metrics)
                 metrics = aggregate_case_attempts(case, case_attempts)
                 rows.append(
