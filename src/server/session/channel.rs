@@ -224,6 +224,10 @@ impl InboundSender {
             .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
     }
 
+    pub(super) fn available_send_budget(&self) -> usize {
+        self.budget.available()
+    }
+
     fn try_reserve_send_budget(&self, len: usize) -> Result<ByteBudgetPermit, ()> {
         if len == 0 {
             return Ok(ByteBudgetPermit::new(self.budget.clone(), 0));
@@ -355,6 +359,10 @@ impl ByteBudget {
         let previous = self.used.fetch_sub(len, Ordering::AcqRel);
         debug_assert!(previous >= len);
         self.notify.notify_one();
+    }
+
+    fn available(&self) -> usize {
+        self.limit.saturating_sub(self.used.load(Ordering::Acquire))
     }
 }
 

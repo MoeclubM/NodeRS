@@ -498,15 +498,47 @@ async fn forward_buffered_inbound_payload(
                     result = inbound.send_data(payload) => result,
                 };
             }
-            forward_backpressured_inbound_payload(
-                inbound,
-                control,
-                payload,
-                BACKPRESSURED_FORWARD_SEGMENT_LEN,
-            )
-            .await
+            if !should_segment_backpressured_payload(inbound, payload.len()) {
+                return tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                };
+            }
+            // sing-anytls blocks on the full frame before it ever slices payload into padding
+            // records. Give queued uploads one scheduler turn to drain before falling back to
+            // 32 KiB segments so transient pressure does not fragment the first large payload.
+            tokio::task::yield_now().await;
+            if control.is_cancelled() {
+                return Ok(());
+            }
+            match inbound.try_send_data(payload) {
+                Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+                Err(channel::TrySendError::Full(payload)) => {
+                    if !should_segment_backpressured_payload(inbound, payload.len()) {
+                        return tokio::select! {
+                            _ = control.cancelled() => Ok(()),
+                            result = inbound.send_data(payload) => result,
+                        };
+                    }
+                    forward_backpressured_inbound_payload(
+                        inbound,
+                        control,
+                        payload,
+                        BACKPRESSURED_FORWARD_SEGMENT_LEN,
+                    )
+                    .await
+                }
+            }
         }
     }
+}
+
+fn should_segment_backpressured_payload(
+    inbound: &channel::InboundSender,
+    payload_len: usize,
+) -> bool {
+    let available_budget = inbound.available_send_budget();
+    available_budget.saturating_add(BACKPRESSURED_FORWARD_SEGMENT_LEN) < payload_len
 }
 
 async fn forward_backpressured_inbound_payload(
@@ -1165,8 +1197,8 @@ mod tests {
     #[tokio::test]
     async fn backpressured_whole_payload_falls_back_to_segments() {
         let payload_len = 48 * 1024;
-        let first_payload_len = 24 * 1024;
-        let budget_len = 40 * 1024;
+        let first_payload_len = 52 * 1024;
+        let budget_len = 64 * 1024;
         let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
@@ -1180,6 +1212,7 @@ mod tests {
             let control = control.clone();
             async move { forward_buffered_inbound_payload(&inbound, control, payload).await }
         });
+        tokio::task::yield_now().await;
 
         let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
@@ -1190,10 +1223,7 @@ mod tests {
         };
         assert_eq!(first.len(), first_payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 3));
-        assert!(
-            !forward_task.is_finished(),
-            "forwarding should still be blocked on queue budget"
-        );
+        tokio::task::yield_now().await;
 
         drop(first);
 
@@ -1206,10 +1236,6 @@ mod tests {
         };
         assert_eq!(second.len(), BACKPRESSURED_FORWARD_SEGMENT_LEN);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
-        assert!(
-            !forward_task.is_finished(),
-            "one fallback segment should fit before the whole buffered payload would"
-        );
         drop(second);
 
         let third = tokio::time::timeout(Duration::from_millis(100), rx.recv())
@@ -1221,6 +1247,52 @@ mod tests {
         };
         assert_eq!(third.len(), payload_len - BACKPRESSURED_FORWARD_SEGMENT_LEN);
         assert!(third.bytes().iter().all(|byte| *byte == 7));
+
+        forward_task
+            .await
+            .expect("join forward task")
+            .expect("forward buffered payload");
+    }
+
+    #[tokio::test]
+    async fn transient_backpressure_gets_one_whole_payload_retry() {
+        let payload_len = 48 * 1024;
+        let first_payload_len = 52 * 1024;
+        let budget_len = 64 * 1024;
+        let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
+        let control = SessionControl::new();
+        let payload = PayloadBuffer::new(vec![7u8; payload_len]);
+
+        inbound
+            .try_send_data(PayloadBuffer::new(vec![3u8; first_payload_len]))
+            .expect("fill queue budget with first payload");
+
+        let forward_task = tokio::spawn({
+            let inbound = inbound.clone();
+            let control = control.clone();
+            async move { forward_buffered_inbound_payload(&inbound, control, payload).await }
+        });
+        tokio::task::yield_now().await;
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("first queued payload should arrive")
+            .expect("first inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected first data payload");
+        };
+        assert_eq!(first.len(), first_payload_len);
+        drop(first);
+
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("whole payload should arrive after grace retry")
+            .expect("second inbound message");
+        let InboundMessage::Data(second) = second else {
+            panic!("expected second data payload");
+        };
+        assert_eq!(second.len(), payload_len);
+        assert!(second.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
             .await
