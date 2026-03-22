@@ -780,7 +780,8 @@ mod tests {
         pump_copy, write_chunk_batch_for_test,
     };
     use super::{
-        SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN, forward_buffered_inbound_payload,
+        SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN, WHOLE_PAYLOAD_RETRY_GRACE,
+        forward_buffered_inbound_payload,
         read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
@@ -1221,7 +1222,8 @@ mod tests {
     #[tokio::test]
     async fn backpressured_whole_payload_falls_back_to_segments() {
         let payload_len = 48 * 1024;
-        let first_payload_len = 64 * 1024;
+        let first_payload_len = 8 * 1024;
+        let blocker_payload_len = 56 * 1024;
         let budget_len = 64 * 1024;
         let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
         let control = SessionControl::new();
@@ -1230,6 +1232,9 @@ mod tests {
         inbound
             .try_send_data(PayloadBuffer::new(vec![3u8; first_payload_len]))
             .expect("fill queue budget with first payload");
+        inbound
+            .try_send_data(PayloadBuffer::new(vec![5u8; blocker_payload_len]))
+            .expect("keep severe backpressure active behind the first payload");
 
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
@@ -1249,21 +1254,22 @@ mod tests {
         assert!(first.bytes().iter().all(|byte| *byte == 3));
 
         drop(first);
+        tokio::time::sleep(WHOLE_PAYLOAD_RETRY_GRACE + Duration::from_millis(5)).await;
 
         let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("first fallback segment should arrive")
+            .expect("queued blocker payload should arrive")
             .expect("second inbound message");
         let InboundMessage::Data(second) = second else {
             panic!("expected second data payload");
         };
-        assert_eq!(second.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
-        assert!(second.bytes().iter().all(|byte| *byte == 7));
+        assert_eq!(second.len(), blocker_payload_len);
+        assert!(second.bytes().iter().all(|byte| *byte == 5));
         drop(second);
 
         let third = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("second fallback segment should arrive")
+            .expect("first fallback segment should arrive")
             .expect("third inbound message");
         let InboundMessage::Data(third) = third else {
             panic!("expected third data payload");
@@ -1274,16 +1280,27 @@ mod tests {
 
         let fourth = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("third fallback segment should arrive")
+            .expect("second fallback segment should arrive")
             .expect("fourth inbound message");
         let InboundMessage::Data(fourth) = fourth else {
             panic!("expected fourth data payload");
         };
+        assert_eq!(fourth.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        assert!(fourth.bytes().iter().all(|byte| *byte == 7));
+        drop(fourth);
+
+        let fifth = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("third fallback segment should arrive")
+            .expect("fifth inbound message");
+        let InboundMessage::Data(fifth) = fifth else {
+            panic!("expected fifth data payload");
+        };
         assert_eq!(
-            fourth.len(),
+            fifth.len(),
             payload_len - (SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN * 2)
         );
-        assert!(fourth.bytes().iter().all(|byte| *byte == 7));
+        assert!(fifth.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
             .await
