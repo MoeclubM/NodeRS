@@ -40,6 +40,7 @@ use writer::{FrameWriter, write_frame};
 const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
 const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
 const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
+const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -507,33 +508,34 @@ async fn forward_buffered_inbound_payload(
                     result = inbound.send_data(payload) => result,
                 };
             }
+            let mut payload = payload;
             if should_retry_whole_payload_after_backpressure(available_budget) {
-                // sing-anytls blocks on the full frame before it ever slices payload into
-                // padding records. Preserve that behavior for light transient pressure, but
-                // skip the grace retry when the queue is already nearly out of byte budget.
-                tokio::task::yield_now().await;
-                if control.is_cancelled() {
-                    return Ok(());
-                }
-                match inbound.try_send_data(payload) {
-                    Ok(()) | Err(channel::TrySendError::Closed) => return Ok(()),
-                    Err(channel::TrySendError::Full(payload)) => {
-                        let available_budget = inbound.available_send_budget();
-                        if !should_segment_backpressured_payload(available_budget, payload.len()) {
-                            return tokio::select! {
-                                _ = control.cancelled() => Ok(()),
-                                result = inbound.send_data(payload) => result,
-                            };
+                // Keep the whole-frame fast path alive for brief scheduler-scale contention so
+                // high-RTT uploads can still queue full payloads. Only fall back to segmentation
+                // after a short bounded grace window fails to clear the pressure.
+                let deadline = tokio::time::Instant::now() + WHOLE_PAYLOAD_RETRY_GRACE;
+                loop {
+                    tokio::task::yield_now().await;
+                    if control.is_cancelled() {
+                        return Ok(());
+                    }
+                    match inbound.try_send_data(payload) {
+                        Ok(()) | Err(channel::TrySendError::Closed) => return Ok(()),
+                        Err(channel::TrySendError::Full(next_payload)) => {
+                            payload = next_payload;
+                            if tokio::time::Instant::now() >= deadline {
+                                break;
+                            }
                         }
-                        return forward_backpressured_inbound_payload(
-                            inbound,
-                            control,
-                            payload,
-                            backpressured_payload_segment_len(available_budget),
-                        )
-                        .await;
                     }
                 }
+            }
+            let available_budget = inbound.available_send_budget();
+            if !should_segment_backpressured_payload(available_budget, payload.len()) {
+                return tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                };
             }
             forward_backpressured_inbound_payload(
                 inbound,
