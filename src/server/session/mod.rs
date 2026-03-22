@@ -1221,8 +1221,8 @@ mod tests {
     #[tokio::test]
     async fn backpressured_whole_payload_falls_back_to_segments() {
         let payload_len = 48 * 1024;
-        let first_payload_len = 8 * 1024;
-        let blocker_payload_len = 56 * 1024;
+        let first_payload_len = 4 * 1024;
+        let blocker_payload_len = 60 * 1024;
         let budget_len = 64 * 1024;
         let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
         let control = SessionControl::new();
