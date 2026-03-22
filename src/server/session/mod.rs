@@ -1266,11 +1266,22 @@ mod tests {
         let InboundMessage::Data(third) = third else {
             panic!("expected third data payload");
         };
-        assert_eq!(
-            third.len(),
-            payload_len - SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN
-        );
+        assert_eq!(third.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
         assert!(third.bytes().iter().all(|byte| *byte == 7));
+        drop(third);
+
+        let fourth = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("third fallback segment should arrive")
+            .expect("fourth inbound message");
+        let InboundMessage::Data(fourth) = fourth else {
+            panic!("expected fourth data payload");
+        };
+        assert_eq!(
+            fourth.len(),
+            payload_len - (SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN * 2)
+        );
+        assert!(fourth.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
             .await
