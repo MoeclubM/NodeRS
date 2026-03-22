@@ -242,15 +242,17 @@ def applied_netem(profile: str | None, enabled: bool, server_port: int | None = 
         return
     arguments = NETEM_PROFILES[profile]
     run_best_effort(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"])
-    if server_port is None:
-        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "netem", *arguments])
-    else:
+    applied_scoped_qdisc = False
+    if server_port is not None:
         # Scope weak-link shaping to the AnyTLS server port so source/sink/panel traffic stays
-        # off the impaired path. This keeps the benchmark focused on the tunnel connection.
-        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "handle", "1:", "prio", "bands", "4"])
-        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "parent", "1:1", "handle", "10:", "netem", *arguments])
+        # off the impaired path. Some local kernels (notably WSL builds) do not ship the `prio`
+        # qdisc, so fall back to shaping the full loopback path when scoped filters are unavailable.
+        scoped_setup = [
+            ["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "handle", "1:", "prio", "bands", "4"],
+            ["sudo", "tc", "qdisc", "replace", "dev", "lo", "parent", "1:1", "handle", "10:", "netem", *arguments],
+        ]
         for direction in ("dport", "sport"):
-            run_checked(
+            scoped_setup.append(
                 [
                     "sudo",
                     "tc",
@@ -279,6 +281,15 @@ def applied_netem(profile: str | None, enabled: bool, server_port: int | None = 
                     "1:1",
                 ]
             )
+        for command in scoped_setup:
+            result = run_best_effort(command)
+            if result.returncode != 0:
+                run_best_effort(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"])
+                break
+        else:
+            applied_scoped_qdisc = True
+    if not applied_scoped_qdisc:
+        run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "netem", *arguments])
     time.sleep(0.2)
     try:
         yield
@@ -1033,6 +1044,10 @@ def github_json(url: str) -> dict:
 
 def download_sing_box(output_dir: pathlib.Path, version: str) -> tuple[pathlib.Path, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if version != "latest":
+        cached_binary = output_dir / f"sing-box-{version}"
+        if cached_binary.exists():
+            return cached_binary, version
     if version == "latest":
         release = github_json("https://api.github.com/repos/SagerNet/sing-box/releases/latest")
     else:
