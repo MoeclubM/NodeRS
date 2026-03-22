@@ -38,6 +38,8 @@ use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
 
 const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
+const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
+const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -498,47 +500,66 @@ async fn forward_buffered_inbound_payload(
                     result = inbound.send_data(payload) => result,
                 };
             }
-            if !should_segment_backpressured_payload(inbound, payload.len()) {
+            let available_budget = inbound.available_send_budget();
+            if !should_segment_backpressured_payload(available_budget, payload.len()) {
                 return tokio::select! {
                     _ = control.cancelled() => Ok(()),
                     result = inbound.send_data(payload) => result,
                 };
             }
-            // sing-anytls blocks on the full frame before it ever slices payload into padding
-            // records. Give queued uploads one scheduler turn to drain before falling back to
-            // 32 KiB segments so transient pressure does not fragment the first large payload.
-            tokio::task::yield_now().await;
-            if control.is_cancelled() {
-                return Ok(());
-            }
-            match inbound.try_send_data(payload) {
-                Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
-                Err(channel::TrySendError::Full(payload)) => {
-                    if !should_segment_backpressured_payload(inbound, payload.len()) {
-                        return tokio::select! {
-                            _ = control.cancelled() => Ok(()),
-                            result = inbound.send_data(payload) => result,
-                        };
+            if should_retry_whole_payload_after_backpressure(available_budget) {
+                // sing-anytls blocks on the full frame before it ever slices payload into
+                // padding records. Preserve that behavior for light transient pressure, but
+                // skip the grace retry when the queue is already nearly out of byte budget.
+                tokio::task::yield_now().await;
+                if control.is_cancelled() {
+                    return Ok(());
+                }
+                match inbound.try_send_data(payload) {
+                    Ok(()) | Err(channel::TrySendError::Closed) => return Ok(()),
+                    Err(channel::TrySendError::Full(payload)) => {
+                        let available_budget = inbound.available_send_budget();
+                        if !should_segment_backpressured_payload(available_budget, payload.len()) {
+                            return tokio::select! {
+                                _ = control.cancelled() => Ok(()),
+                                result = inbound.send_data(payload) => result,
+                            };
+                        }
+                        return forward_backpressured_inbound_payload(
+                            inbound,
+                            control,
+                            payload,
+                            backpressured_payload_segment_len(available_budget),
+                        )
+                        .await;
                     }
-                    forward_backpressured_inbound_payload(
-                        inbound,
-                        control,
-                        payload,
-                        BACKPRESSURED_FORWARD_SEGMENT_LEN,
-                    )
-                    .await
                 }
             }
+            forward_backpressured_inbound_payload(
+                inbound,
+                control,
+                payload,
+                backpressured_payload_segment_len(available_budget),
+            )
+            .await
         }
     }
 }
 
-fn should_segment_backpressured_payload(
-    inbound: &channel::InboundSender,
-    payload_len: usize,
-) -> bool {
-    let available_budget = inbound.available_send_budget();
+fn should_segment_backpressured_payload(available_budget: usize, payload_len: usize) -> bool {
     available_budget.saturating_add(BACKPRESSURED_FORWARD_SEGMENT_LEN) < payload_len
+}
+
+fn should_retry_whole_payload_after_backpressure(available_budget: usize) -> bool {
+    available_budget >= WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET
+}
+
+fn backpressured_payload_segment_len(available_budget: usize) -> usize {
+    if available_budget < WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET {
+        SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN
+    } else {
+        BACKPRESSURED_FORWARD_SEGMENT_LEN
+    }
 }
 
 async fn forward_backpressured_inbound_payload(
@@ -1197,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn backpressured_whole_payload_falls_back_to_segments() {
         let payload_len = 48 * 1024;
-        let first_payload_len = 52 * 1024;
+        let first_payload_len = 64 * 1024;
         let budget_len = 64 * 1024;
         let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
         let control = SessionControl::new();
@@ -1223,7 +1244,6 @@ mod tests {
         };
         assert_eq!(first.len(), first_payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 3));
-        tokio::task::yield_now().await;
 
         drop(first);
 
@@ -1234,7 +1254,7 @@ mod tests {
         let InboundMessage::Data(second) = second else {
             panic!("expected second data payload");
         };
-        assert_eq!(second.len(), BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        assert_eq!(second.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
         drop(second);
 
@@ -1245,7 +1265,10 @@ mod tests {
         let InboundMessage::Data(third) = third else {
             panic!("expected third data payload");
         };
-        assert_eq!(third.len(), payload_len - BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        assert_eq!(
+            third.len(),
+            payload_len - SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN
+        );
         assert!(third.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
