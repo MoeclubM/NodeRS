@@ -42,6 +42,7 @@ const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
 const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
 const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
 const DISCARD_SCRATCH_LEN: usize = 8 * 1024;
+const UOT_BRIDGE_BUFFER_SIZE: usize = 1024 * 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -676,7 +677,8 @@ async fn handle_stream(
                     if context.send_synack {
                         write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
                     }
-                    let (session_side, app_bridge_side) = tokio::io::duplex(256 * 1024);
+                    let (session_side, app_bridge_side) =
+                        tokio::io::duplex(UOT_BRIDGE_BUFFER_SIZE);
                     let (mut session_reader, mut session_writer) = split(session_side);
                     // UOT keeps streaming through ChannelReader after the parser stage, so it can
                     // release byte budget as bytes are copied onward instead of waiting for a

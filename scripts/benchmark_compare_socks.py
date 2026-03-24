@@ -7,6 +7,11 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
+
+
+UDP_HEADER_RSV = b"\x00\x00"
+UDP_HEADER_FRAG = b"\x00"
 
 
 @dataclass
@@ -64,12 +69,49 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def socks5_connect(
-    proxy_host: str,
-    proxy_port: int,
-    target_host: str,
-    target_port: int,
-) -> tuple[socket.socket, float]:
+def recv_until(sock: socket.socket, marker: bytes, *, limit: int = 1024 * 1024) -> tuple[bytes, bytes]:
+    buffer = bytearray()
+    while marker not in buffer:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise EOFError("unexpected EOF while waiting for marker")
+        buffer.extend(chunk)
+        if len(buffer) > limit:
+            raise RuntimeError("marker not found before buffer limit")
+    index = buffer.index(marker) + len(marker)
+    return bytes(buffer[:index]), bytes(buffer[index:])
+
+
+def encode_socks5_address(host: str, port: int) -> bytes:
+    try:
+        addr = socket.inet_aton(host)
+        return b"\x01" + addr + port.to_bytes(2, "big")
+    except OSError:
+        encoded = host.encode("utf-8")
+        if len(encoded) > 255:
+            raise ValueError("domain name too long for SOCKS5")
+        return b"\x03" + bytes([len(encoded)]) + encoded + port.to_bytes(2, "big")
+
+
+def read_socks5_bound_address(sock: socket.socket) -> tuple[str, int]:
+    head = recv_exact(sock, 4)
+    if head[1] != 0x00:
+        raise RuntimeError(f"SOCKS request failed, reply={head[1]}")
+    atyp = head[3]
+    if atyp == 1:
+        host = socket.inet_ntoa(recv_exact(sock, 4))
+    elif atyp == 3:
+        length = recv_exact(sock, 1)[0]
+        host = recv_exact(sock, length).decode("utf-8")
+    elif atyp == 4:
+        host = socket.inet_ntop(socket.AF_INET6, recv_exact(sock, 16))
+    else:
+        raise RuntimeError(f"unsupported SOCKS address type {atyp}")
+    port = int.from_bytes(recv_exact(sock, 2), "big")
+    return host, port
+
+
+def socks5_negotiate(proxy_host: str, proxy_port: int) -> tuple[socket.socket, float]:
     started = time.perf_counter()
     sock = socket.create_connection((proxy_host, proxy_port), timeout=10)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -77,27 +119,25 @@ def socks5_connect(
     resp = recv_exact(sock, 2)
     if resp != b"\x05\x00":
         raise RuntimeError(f"SOCKS auth method failed: {resp!r}")
-    try:
-        addr = socket.inet_aton(target_host)
-        req = b"\x05\x01\x00\x01" + addr + target_port.to_bytes(2, "big")
-    except OSError:
-        host = target_host.encode("utf-8")
-        req = b"\x05\x01\x00\x03" + bytes([len(host)]) + host + target_port.to_bytes(2, "big")
-    sock.sendall(req)
-    head = recv_exact(sock, 4)
-    if head[1] != 0x00:
-        raise RuntimeError(f"SOCKS connect failed, reply={head[1]}")
-    atyp = head[3]
-    if atyp == 1:
-        recv_exact(sock, 4)
-    elif atyp == 3:
-        ln = recv_exact(sock, 1)[0]
-        recv_exact(sock, ln)
-    elif atyp == 4:
-        recv_exact(sock, 16)
-    recv_exact(sock, 2)
-    sock.settimeout(None)
     return sock, (time.perf_counter() - started) * 1000.0
+
+
+def socks5_connect(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> tuple[socket.socket, float]:
+    sock, connect_ms = socks5_negotiate(proxy_host, proxy_port)
+    sock.sendall(b"\x05\x01\x00" + encode_socks5_address(target_host, target_port))
+    read_socks5_bound_address(sock)
+    sock.settimeout(None)
+    return sock, connect_ms
+
+
+def socks5_udp_associate(proxy_host: str, proxy_port: int) -> tuple[socket.socket, tuple[str, int], float]:
+    sock, connect_ms = socks5_negotiate(proxy_host, proxy_port)
+    sock.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+    relay_host, relay_port = read_socks5_bound_address(sock)
+    if relay_host in {"0.0.0.0", "::"}:
+        relay_host = proxy_host
+    sock.settimeout(None)
+    return sock, (relay_host, relay_port), connect_ms
 
 
 def write_curve_report(
@@ -147,10 +187,7 @@ def write_curve_report(
     total_bytes = sum(item.bytes for item in stats)
     trailing_interval = max(now - last_sample, 0.0)
     min_trailing_interval = max(sample_interval * 0.25, 0.05)
-    if not samples or (
-        total_bytes != last_bytes
-        and trailing_interval >= min_trailing_interval
-    ):
+    if not samples or (total_bytes != last_bytes and trailing_interval >= min_trailing_interval):
         interval_seconds = max(trailing_interval, 1e-6)
         samples.append(
             {
@@ -176,6 +213,12 @@ def write_curve_report(
         )
 
 
+def record_bytes(stats: WorkerStats, *, measure_start: float, payload_len: int, packet_count: int = 1) -> None:
+    if time.perf_counter() >= measure_start:
+        stats.bytes += payload_len
+        stats.packets += packet_count
+
+
 def worker_upload(
     proxy: tuple[str, int],
     target: tuple[str, int],
@@ -190,24 +233,19 @@ def worker_upload(
     measurement_window.mark_connected()
     measure_start, stop_time = measurement_window.wait()
     try:
-        while True:
-            now = time.perf_counter()
-            if now >= stop_time:
-                break
+        while time.perf_counter() < stop_time:
             try:
                 sent = sock.send(payload)
             except (socket.timeout, TimeoutError):
                 continue
             if sent <= 0:
                 break
-            if now >= measure_start:
+            if time.perf_counter() >= measure_start:
                 stats.bytes += sent
                 stats.packets += 1
     finally:
-        try:
+        with contextlib_suppress(OSError):
             sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
         sock.close()
 
 
@@ -226,10 +264,7 @@ def worker_download(
     measurement_window.mark_connected()
     measure_start, stop_time = measurement_window.wait()
     try:
-        while True:
-            now = time.perf_counter()
-            if now >= stop_time:
-                break
+        while time.perf_counter() < stop_time:
             try:
                 chunk = sock.recv(131072)
             except (socket.timeout, TimeoutError):
@@ -243,6 +278,102 @@ def worker_download(
                 stats.packets += 1
     finally:
         sock.close()
+
+
+def build_udp_datagram(target_host: str, target_port: int, payload: bytes) -> bytes:
+    return UDP_HEADER_RSV + UDP_HEADER_FRAG + encode_socks5_address(target_host, target_port) + payload
+
+
+def parse_udp_datagram(packet: bytes) -> bytes:
+    if len(packet) < 4 or packet[:2] != UDP_HEADER_RSV or packet[2:3] != UDP_HEADER_FRAG:
+        raise RuntimeError("invalid SOCKS5 UDP packet header")
+    atyp = packet[3]
+    offset = 4
+    if atyp == 1:
+        offset += 4
+    elif atyp == 3:
+        if len(packet) < offset + 1:
+            raise RuntimeError("truncated SOCKS5 UDP domain header")
+        offset += 1 + packet[offset]
+    elif atyp == 4:
+        offset += 16
+    else:
+        raise RuntimeError(f"unsupported SOCKS5 UDP address type {atyp}")
+    offset += 2
+    if len(packet) < offset:
+        raise RuntimeError("truncated SOCKS5 UDP packet")
+    return packet[offset:]
+
+
+def open_udp_socket(relay: tuple[str, int]) -> socket.socket:
+    infos = socket.getaddrinfo(relay[0], relay[1], type=socket.SOCK_DGRAM)
+    family, socktype, proto, _, sockaddr = infos[0]
+    sock = socket.socket(family, socktype, proto)
+    sock.settimeout(1.0)
+    sock.connect(sockaddr)
+    return sock
+
+
+def worker_udp_upload(
+    proxy: tuple[str, int],
+    target: tuple[str, int],
+    measurement_window: MeasurementWindow,
+    chunk_size: int,
+    stats: WorkerStats,
+) -> None:
+    control, relay, connect_ms = socks5_udp_associate(proxy[0], proxy[1])
+    udp_sock = open_udp_socket(relay)
+    payload = b"\0" * chunk_size
+    packet = build_udp_datagram(target[0], target[1], payload)
+    stats.connect_ms = connect_ms
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
+    try:
+        while time.perf_counter() < stop_time:
+            try:
+                udp_sock.send(packet)
+            except (socket.timeout, TimeoutError):
+                continue
+            if time.perf_counter() >= measure_start:
+                stats.bytes += len(payload)
+                stats.packets += 1
+    finally:
+        udp_sock.close()
+        control.close()
+
+
+def worker_udp_download(
+    proxy: tuple[str, int],
+    target: tuple[str, int],
+    measurement_window: MeasurementWindow,
+    chunk_size: int,
+    stats: WorkerStats,
+) -> None:
+    _ = chunk_size
+    started = time.perf_counter()
+    control, relay, connect_ms = socks5_udp_associate(proxy[0], proxy[1])
+    udp_sock = open_udp_socket(relay)
+    udp_sock.send(build_udp_datagram(target[0], target[1], b"\0"))
+    stats.connect_ms = connect_ms
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
+    try:
+        while time.perf_counter() < stop_time:
+            try:
+                packet = udp_sock.recv(65535)
+            except (socket.timeout, TimeoutError):
+                continue
+            if not packet:
+                continue
+            payload = parse_udp_datagram(packet)
+            if stats.first_byte_ms is None:
+                stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+            if time.perf_counter() >= measure_start:
+                stats.bytes += len(payload)
+                stats.packets += 1
+    finally:
+        udp_sock.close()
+        control.close()
 
 
 def worker_idle(
@@ -262,6 +393,94 @@ def worker_idle(
         sock.close()
 
 
+def worker_http_upload(
+    proxy: tuple[str, int],
+    target: tuple[str, int],
+    measurement_window: MeasurementWindow,
+    chunk_size: int,
+    stats: WorkerStats,
+    *,
+    http_path: str,
+) -> None:
+    sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
+    sock.settimeout(1.0)
+    stats.connect_ms = connect_ms
+    headers = (
+        f"POST {http_path} HTTP/1.1\r\n"
+        f"Host: {target[0]}\r\n"
+        "Connection: close\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+    ).encode("ascii")
+    sock.sendall(headers)
+    payload = b"\0" * chunk_size
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
+    try:
+        while time.perf_counter() < stop_time:
+            try:
+                sent = sock.send(payload)
+            except (socket.timeout, TimeoutError):
+                continue
+            if sent <= 0:
+                break
+            if time.perf_counter() >= measure_start:
+                stats.bytes += sent
+                stats.packets += 1
+    finally:
+        with contextlib_suppress(OSError):
+            sock.shutdown(socket.SHUT_WR)
+        with contextlib_suppress(OSError, EOFError, RuntimeError):
+            recv_until(sock, b"\r\n\r\n")
+        sock.close()
+
+
+def worker_http_download(
+    proxy: tuple[str, int],
+    target: tuple[str, int],
+    measurement_window: MeasurementWindow,
+    chunk_size: int,
+    stats: WorkerStats,
+    *,
+    http_path: str,
+) -> None:
+    _ = chunk_size
+    started = time.perf_counter()
+    sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
+    sock.settimeout(1.0)
+    stats.connect_ms = connect_ms
+    request = (
+        f"GET {http_path} HTTP/1.1\r\n"
+        f"Host: {target[0]}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+    sock.sendall(request)
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
+    try:
+        _, remainder = recv_until(sock, b"\r\n\r\n")
+        if remainder and stats.first_byte_ms is None:
+            stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+        if remainder and time.perf_counter() >= measure_start:
+            stats.bytes += len(remainder)
+            stats.packets += 1
+        while time.perf_counter() < stop_time:
+            try:
+                chunk = sock.recv(131072)
+            except (socket.timeout, TimeoutError):
+                continue
+            if not chunk:
+                break
+            if stats.first_byte_ms is None:
+                stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+            if time.perf_counter() >= measure_start:
+                stats.bytes += len(chunk)
+                stats.packets += 1
+    finally:
+        sock.close()
+
+
 def average(values: list[float | None]) -> float | None:
     usable = [value for value in values if value is not None]
     if not usable:
@@ -269,17 +488,41 @@ def average(values: list[float | None]) -> float | None:
     return round(sum(usable) / len(usable), 2)
 
 
+def contextlib_suppress(*exceptions: type[BaseException]):
+    class _Suppress:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return exc_type is not None and issubclass(exc_type, exceptions)
+
+    return _Suppress()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--proxies", required=True, help="comma separated host:port list")
     parser.add_argument("--target", required=True, help="host:port")
-    parser.add_argument("--mode", choices=["upload", "download", "idle"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "upload",
+            "download",
+            "idle",
+            "udp-upload",
+            "udp-download",
+            "http-upload",
+            "http-download",
+        ],
+        required=True,
+    )
     parser.add_argument("--seconds", type=float, default=5)
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--chunk-size", type=int, default=32768)
     parser.add_argument("--curve-file")
     parser.add_argument("--sample-interval", type=float, default=1.0)
     parser.add_argument("--measure-warmup-seconds", type=float, default=0.0)
+    parser.add_argument("--http-path", default="/")
     args = parser.parse_args()
 
     proxies: list[tuple[str, int]] = []
@@ -288,12 +531,6 @@ def main() -> None:
         proxies.append((host, int(port)))
     target_host, target_port = args.target.rsplit(":", 1)
     target = (target_host, int(target_port))
-
-    workers = {
-        "upload": worker_upload,
-        "download": worker_download,
-        "idle": worker_idle,
-    }
 
     stats = [WorkerStats() for _ in range(max(args.parallel, 1))]
     threads: list[threading.Thread] = []
@@ -323,13 +560,38 @@ def main() -> None:
         )
         curve_thread.start()
 
+    tcp_workers: dict[str, Callable[[tuple[str, int], tuple[str, int], MeasurementWindow, int, WorkerStats], None]] = {
+        "upload": worker_upload,
+        "download": worker_download,
+        "udp-upload": worker_udp_upload,
+        "udp-download": worker_udp_download,
+    }
+
     def run_worker(index: int) -> None:
         try:
             proxy = proxies[index % len(proxies)]
             if args.mode == "idle":
                 worker_idle(proxy, target, args.seconds, args.chunk_size, stats[index])
+            elif args.mode == "http-upload":
+                worker_http_upload(
+                    proxy,
+                    target,
+                    measurement_window,
+                    args.chunk_size,
+                    stats[index],
+                    http_path=args.http_path,
+                )
+            elif args.mode == "http-download":
+                worker_http_download(
+                    proxy,
+                    target,
+                    measurement_window,
+                    args.chunk_size,
+                    stats[index],
+                    http_path=args.http_path,
+                )
             else:
-                workers[args.mode](proxy, target, measurement_window, args.chunk_size, stats[index])
+                tcp_workers[args.mode](proxy, target, measurement_window, args.chunk_size, stats[index])
         except BaseException as error:
             errors.append(error)
             measurement_window.cancel()
