@@ -24,14 +24,25 @@ ASSETS.mkdir(parents=True, exist_ok=True)
 RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 USERS = [f"bench-user-uuid-{index:02d}" for index in range(1, 5)]
-UPLOAD_CHUNK = 32768
 SAMPLE_INTERVAL = 1.0
+SMALL_TCP_CHUNK = 1024
+LARGE_TCP_CHUNK = 32768
+SMALL_UDP_CHUNK = 128
+LARGE_UDP_CHUNK = 1200
+SMALL_HTTP_CHUNK = 1024
+LARGE_HTTP_CHUNK = 32768
+MULTI_PARALLEL = 4
 
 PORTS = {
     "panel_current": 21080,
     "panel_v031": 21081,
-    "source": 29080,
-    "sink": 29081,
+    "tcp_source_small": 29080,
+    "tcp_sink": 29081,
+    "tcp_source_large": 29082,
+    "udp_source_small": 29090,
+    "udp_source_large": 29091,
+    "udp_sink": 29092,
+    "http_target": 29100,
     "current": 24443,
     "v031": 24444,
     "sing": 24445,
@@ -49,31 +60,95 @@ NETEM_PROFILES = {
 class Scenario:
     name: str
     mode: str
+    protocol: str
+    target_key: str
+    chunk_size: int
     profile: str | None = None
     attempts: int = 2
     parallel: int = 1
     seconds: int = 20
     warmup_seconds: float | None = None
     capture_curve: bool = True
+    http_path: str | None = None
+    size_label: str | None = None
 
 
-SCENARIOS = [
-    Scenario("upload-long-connection", "upload"),
-    Scenario("download-long-connection", "download"),
-    Scenario("idle-keepalive-65s", "idle", attempts=1, parallel=4, seconds=65, capture_curve=False),
-]
-for profile_name in NETEM_PROFILES:
-    SCENARIOS.extend(
-        [
+def build_default_scenarios() -> list[Scenario]:
+    scenarios = [
+        Scenario(
+            "idle-keepalive-65s",
+            "idle",
+            protocol="tcp",
+            target_key="tcp_sink",
+            chunk_size=1024,
+            attempts=1,
+            parallel=MULTI_PARALLEL,
+            seconds=65,
+            capture_curve=False,
+        )
+    ]
+
+    clean_matrix = [
+        ("tcp", "upload", "upload", "tcp_sink", SMALL_TCP_CHUNK, "small", 1),
+        ("tcp", "upload", "upload", "tcp_sink", LARGE_TCP_CHUNK, "large", 1),
+        ("tcp", "upload", "upload", "tcp_sink", LARGE_TCP_CHUNK, "large", MULTI_PARALLEL),
+        ("tcp", "download", "download", "tcp_source_small", SMALL_TCP_CHUNK, "small", 1),
+        ("tcp", "download", "download", "tcp_source_large", LARGE_TCP_CHUNK, "large", 1),
+        ("tcp", "download", "download", "tcp_source_large", LARGE_TCP_CHUNK, "large", MULTI_PARALLEL),
+        ("udp", "udp-upload", "upload", "udp_sink", SMALL_UDP_CHUNK, "small", 1),
+        ("udp", "udp-upload", "upload", "udp_sink", LARGE_UDP_CHUNK, "large", 1),
+        ("udp", "udp-upload", "upload", "udp_sink", LARGE_UDP_CHUNK, "large", MULTI_PARALLEL),
+        ("udp", "udp-download", "download", "udp_source_small", SMALL_UDP_CHUNK, "small", 1),
+        ("udp", "udp-download", "download", "udp_source_large", LARGE_UDP_CHUNK, "large", 1),
+        ("udp", "udp-download", "download", "udp_source_large", LARGE_UDP_CHUNK, "large", MULTI_PARALLEL),
+        ("http", "http-upload", "upload", "http_target", SMALL_HTTP_CHUNK, "small", 1),
+        ("http", "http-upload", "upload", "http_target", LARGE_HTTP_CHUNK, "large", 1),
+        ("http", "http-upload", "upload", "http_target", LARGE_HTTP_CHUNK, "large", MULTI_PARALLEL),
+        ("http", "http-download", "download", "http_target", SMALL_HTTP_CHUNK, "small", 1),
+        ("http", "http-download", "download", "http_target", LARGE_HTTP_CHUNK, "large", 1),
+        ("http", "http-download", "download", "http_target", LARGE_HTTP_CHUNK, "large", MULTI_PARALLEL),
+    ]
+    for protocol, mode, direction, target_key, chunk_size, size_label, parallel in clean_matrix:
+        scenarios.append(
             Scenario(
-                f"upload-long-connection-{profile_name}",
-                "upload",
-                profile=profile_name,
-                warmup_seconds=8.0 if profile_name == "high-latency-lossy" else None,
-            ),
-            Scenario(f"download-long-connection-{profile_name}", "download", profile=profile_name),
-        ]
-    )
+                name=f"{protocol}-{direction}-{size_label}-{'multi' if parallel > 1 else 'single'}",
+                mode=mode,
+                protocol=protocol,
+                target_key=target_key,
+                chunk_size=chunk_size,
+                parallel=parallel,
+                size_label=size_label,
+                http_path="/upload" if mode == "http-upload" else f"/download?chunk_size={chunk_size}",
+            )
+        )
+
+    weak_matrix = [
+        ("tcp", "upload", "upload", "tcp_sink", LARGE_TCP_CHUNK),
+        ("tcp", "download", "download", "tcp_source_large", LARGE_TCP_CHUNK),
+        ("udp", "udp-upload", "upload", "udp_sink", LARGE_UDP_CHUNK),
+        ("udp", "udp-download", "download", "udp_source_large", LARGE_UDP_CHUNK),
+        ("http", "http-upload", "upload", "http_target", LARGE_HTTP_CHUNK),
+        ("http", "http-download", "download", "http_target", LARGE_HTTP_CHUNK),
+    ]
+    for profile_name in NETEM_PROFILES:
+        for protocol, mode, direction, target_key, chunk_size in weak_matrix:
+            scenarios.append(
+                Scenario(
+                    name=f"{protocol}-{direction}-large-single-{profile_name}",
+                    mode=mode,
+                    protocol=protocol,
+                    target_key=target_key,
+                    chunk_size=chunk_size,
+                    profile=profile_name,
+                    warmup_seconds=8.0 if profile_name == "high-latency-lossy" and direction == "upload" else None,
+                    http_path="/upload" if mode == "http-upload" else f"/download?chunk_size={chunk_size}",
+                    size_label="large",
+                )
+            )
+    return scenarios
+
+
+SCENARIOS = build_default_scenarios()
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,12 +189,20 @@ def build_scenarios(args: argparse.Namespace) -> list[Scenario]:
     allowed = None
     if args.scenarios:
         allowed = {item.strip() for item in args.scenarios.split(",") if item.strip()}
-        unknown = allowed - {scenario.name for scenario in SCENARIOS}
+        known_names = {scenario.name for scenario in SCENARIOS}
+        normalized_allowed = set()
+        for name in allowed:
+            if name.startswith("idle-keepalive-"):
+                normalized_allowed.add("idle-keepalive-65s")
+            else:
+                normalized_allowed.add(name)
+        unknown = normalized_allowed - known_names
         if unknown:
             raise SystemExit(f"unknown scenarios: {', '.join(sorted(unknown))}")
 
     for base in SCENARIOS:
-        if allowed and base.name not in allowed:
+        scenario_name = base.name if base.mode != "idle" else f"idle-keepalive-{args.idle_seconds}s"
+        if allowed and base.name not in allowed and scenario_name not in allowed:
             continue
         attempts = base.attempts
         if base.mode != "idle" and args.attempts > 0:
@@ -127,14 +210,19 @@ def build_scenarios(args: argparse.Namespace) -> list[Scenario]:
         seconds = args.idle_seconds if base.mode == "idle" else args.long_seconds
         scenarios.append(
             Scenario(
-                name=base.name if base.mode != "idle" else f"idle-keepalive-{args.idle_seconds}s",
+                name=scenario_name,
                 mode=base.mode,
+                protocol=base.protocol,
+                target_key=base.target_key,
+                chunk_size=base.chunk_size,
                 profile=base.profile,
                 attempts=attempts,
                 parallel=base.parallel,
                 seconds=seconds,
                 warmup_seconds=base.warmup_seconds,
                 capture_curve=base.capture_curve,
+                http_path=base.http_path,
+                size_label=base.size_label,
             )
         )
     return scenarios
@@ -562,6 +650,12 @@ def stop_sing_clients(client_ssh: paramiko.SSHClient, *, client_root: str, clien
         stop_named(client_ssh, root=client_root, name=f"client-{index}")
 
 
+def scenario_target(scenario: Scenario) -> tuple[int, str | None]:
+    if scenario.target_key == "http_target":
+        return PORTS["http_target"], scenario.http_path
+    return PORTS[scenario.target_key], None
+
+
 def run_compare(
     client_ssh: paramiko.SSHClient,
     *,
@@ -573,7 +667,7 @@ def run_compare(
     proxies: list[str],
     local_run: pathlib.Path,
 ) -> tuple[dict, dict | None, pathlib.Path, pathlib.Path | None]:
-    target_port = PORTS["sink"] if scenario.mode in ("upload", "idle") else PORTS["source"]
+    target_port, http_path = scenario_target(scenario)
     slug = f"{scenario.name}-{impl_name}-attempt-{attempt}"
     remote_stdout = f"{client_root}/results/{run_id}-{slug}.json"
     remote_curve = None if not scenario.capture_curve else f"{client_root}/results/{run_id}-{slug}.curve.json"
@@ -591,8 +685,10 @@ def run_compare(
         "--parallel",
         str(scenario.parallel),
         "--chunk-size",
-        str(1024 if scenario.mode == "idle" else UPLOAD_CHUNK),
+        str(scenario.chunk_size),
     ]
+    if http_path:
+        cmd.extend(["--http-path", http_path])
     if scenario.warmup_seconds is not None:
         cmd.extend(["--measure-warmup-seconds", str(scenario.warmup_seconds)])
     if remote_curve:
@@ -778,6 +874,60 @@ httpd = ThreadingHTTPServer((host, int(port)), Handler)
 httpd.serve_forever()
 """
         put_text(server_sftp, f"{server_root}/bin/mock_panel.py", mock_panel, 0o755)
+
+        http_target = """#!/usr/bin/env python3
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--listen', required=True)
+args = parser.parse_args()
+host, port = args.listen.rsplit(':', 1)
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, fmt, *args):
+        return
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != '/download':
+            self.send_error(404)
+            return
+        qs = parse_qs(parsed.query)
+        chunk_size = max(256, min(int(qs.get('chunk_size', ['32768'])[0]), 65536))
+        payload = b'\\0' * chunk_size
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        try:
+            while True:
+                self.wfile.write(payload)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != '/upload':
+            self.send_error(404)
+            return
+        while True:
+            chunk = self.rfile.read(65536)
+            if not chunk:
+                break
+        raw = b'ok'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(raw)
+
+httpd = ThreadingHTTPServer((host, int(port)), Handler)
+httpd.serve_forever()
+"""
+        put_text(server_sftp, f"{server_root}/bin/http_target.py", http_target, 0o755)
         cert_path = f"{server_root}/config/tls.crt"
         key_path = f"{server_root}/config/tls.key"
         put_text(server_sftp, f"{server_root}/config/current.toml", current_node_config(panel_port=PORTS["panel_current"], cert_path=cert_path, key_path=key_path))
@@ -804,15 +954,20 @@ chmod 600 {shlex.quote(server_root)}/config/tls.key
 
     _, out, _ = run(
         server_ssh,
-        "ss -ltn | awk 'NR>1 {print $4}' | egrep '(:21080|:21081|:29080|:29081|:24443|:24444|:24445)$' || true",
+        "ss -ltnu | awk 'NR>1 {print $5}' | egrep '(:21080|:21081|:29080|:29081|:29082|:29090|:29091|:29092|:29100|:24443|:24444|:24445)$' || true",
         timeout=10,
         check=False,
     )
     if out.strip():
         raise RuntimeError(f"expected benchmark ports to be free on server, found listeners:\n{out}")
 
-    start_bg(server_ssh, root=server_root, name="source", cmd=f"{server_root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['source']}", ready_host="127.0.0.1", ready_port=PORTS["source"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="sink", cmd=f"{server_root}/bin/bench_anytls sink --listen 127.0.0.1:{PORTS['sink']}", ready_host="127.0.0.1", ready_port=PORTS["sink"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="tcp-source-small", cmd=f"{server_root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['tcp_source_small']} --chunk-size {SMALL_TCP_CHUNK}", ready_host="127.0.0.1", ready_port=PORTS["tcp_source_small"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="tcp-source-large", cmd=f"{server_root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['tcp_source_large']} --chunk-size {LARGE_TCP_CHUNK}", ready_host="127.0.0.1", ready_port=PORTS["tcp_source_large"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="tcp-sink", cmd=f"{server_root}/bin/bench_anytls sink --listen 127.0.0.1:{PORTS['tcp_sink']}", ready_host="127.0.0.1", ready_port=PORTS["tcp_sink"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="udp-source-small", cmd=f"{server_root}/bin/bench_anytls udp-source --listen 127.0.0.1:{PORTS['udp_source_small']} --payload-size {SMALL_UDP_CHUNK}", ready_label="server")
+    start_bg(server_ssh, root=server_root, name="udp-source-large", cmd=f"{server_root}/bin/bench_anytls udp-source --listen 127.0.0.1:{PORTS['udp_source_large']} --payload-size {LARGE_UDP_CHUNK}", ready_label="server")
+    start_bg(server_ssh, root=server_root, name="udp-sink", cmd=f"{server_root}/bin/bench_anytls udp-sink --listen 127.0.0.1:{PORTS['udp_sink']}", ready_label="server")
+    start_bg(server_ssh, root=server_root, name="http-target", cmd=f"python3 {server_root}/bin/http_target.py --listen 127.0.0.1:{PORTS['http_target']}", ready_host="127.0.0.1", ready_port=PORTS["http_target"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="panel-current", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_current']} --server-port {PORTS['current']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_current"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="panel-v031", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_v031']} --server-port {PORTS['v031']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_v031"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="noders-current", cmd=f"{server_root}/bin/noders-anytls-current {server_root}/config/current.toml", ready_host="127.0.0.1", ready_port=PORTS["current"], ready_label="server")
@@ -837,8 +992,11 @@ def build_markdown(summary: dict) -> str:
             [
                 f"## {row['name']}",
                 "",
+                f"- Protocol: `{row['protocol']}`",
                 f"- Mode: `{row['mode']}`",
                 f"- Profile: `{row['profile'] or 'clean'}`",
+                f"- Parallel: `{row['parallel']}`",
+                f"- Chunk size: `{row['chunk_size']}`",
                 "",
                 "| Impl | Mbps | Tail Mbps | Connect ms | First byte ms | Status |",
                 "|---|---:|---:|---:|---:|---|",
@@ -879,8 +1037,11 @@ def aggregate_scenarios(*, scenarios: list[Scenario], raw_results: list[dict]) -
         row = {
             "name": scenario.name,
             "mode": scenario.mode,
+            "protocol": scenario.protocol,
             "profile": scenario.profile,
             "attempts": scenario.attempts,
+            "parallel": scenario.parallel,
+            "chunk_size": scenario.chunk_size,
             "implementations": {},
         }
         for impl_name in ["current", "v0.0.31", "SingBox"]:

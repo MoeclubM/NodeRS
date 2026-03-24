@@ -21,6 +21,7 @@ pub const LEGACY_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
 const AF_IPV4: u8 = 0x00;
 const AF_IPV6: u8 = 0x01;
 const AF_FQDN: u8 = 0x02;
+const UDP_SOCKET_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UotVersion {
@@ -459,6 +460,8 @@ async fn bind_udp_socket() -> anyhow::Result<UdpSocket> {
         .context("create IPv6 UDP socket")?;
     socket.set_reuse_address(true).ok();
     socket.set_only_v6(false).ok();
+    socket.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
+    socket.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
     if socket
         .bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())
         .is_ok()
@@ -473,6 +476,8 @@ async fn bind_udp_socket() -> anyhow::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("create IPv4 UDP socket")?;
     socket.set_reuse_address(true).ok();
+    socket.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
+    socket.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
     socket
         .bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())
         .context("bind IPv4 UDP socket")?;
