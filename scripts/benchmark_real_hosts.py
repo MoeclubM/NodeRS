@@ -8,6 +8,7 @@ import shlex
 import socket
 import tarfile
 import time
+import typing
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,6 +33,21 @@ LARGE_UDP_CHUNK = 1200
 SMALL_HTTP_CHUNK = 1024
 LARGE_HTTP_CHUNK = 32768
 MULTI_PARALLEL = 4
+STANDARD_PADDING_SCHEME = [
+    "stop=8",
+    "0=30-30",
+    "1=100-400",
+    "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+    "3=9-9,500-1000",
+    "4=500-1000",
+    "5=500-1000",
+    "6=500-1000",
+    "7=500-1000",
+]
+PADDING_PROFILES = {
+    "product-default": [],
+    "standard-padding": STANDARD_PADDING_SCHEME,
+}
 
 PORTS = {
     "panel_current": 21080,
@@ -173,6 +189,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-seconds", type=int, default=65)
     parser.add_argument("--attempts", type=int, default=2, help="override throughput attempts when > 0")
     parser.add_argument("--sing-version", default="latest")
+    parser.add_argument(
+        "--padding-profile",
+        choices=sorted(PADDING_PROFILES),
+        default="product-default",
+    )
     args = parser.parse_args()
     if args.mode == "interconnect" and not args.brn_host:
         parser.error("--brn-host is required for interconnect mode")
@@ -189,6 +210,10 @@ def resolve_password(args: argparse.Namespace) -> str:
     if not value:
         raise SystemExit(f"environment variable {args.password_env!r} is empty or unset")
     return value
+
+
+def padding_scheme_for_profile(profile: str) -> list[str]:
+    return list(PADDING_PROFILES[profile])
 
 
 def build_scenarios(args: argparse.Namespace) -> list[Scenario]:
@@ -329,10 +354,50 @@ def ensure_local_assets(*, sing_version: str) -> dict:
 
 
 def ssh_connect(host: str, *, username: str, password: str) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, username=username, password=password, timeout=20, banner_timeout=20, auth_timeout=20)
-    return client
+    last_error: Exception | None = None
+    for attempt in range(3):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(
+                host,
+                username=username,
+                password=password,
+                timeout=20,
+                banner_timeout=20,
+                auth_timeout=20,
+            )
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+            last_error = error
+            with contextlib.suppress(Exception):
+                client.close()
+            if attempt == 2:
+                raise
+            time.sleep(2.0)
+            continue
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(15)
+        client._codex_host = host  # type: ignore[attr-defined]
+        client._codex_username = username  # type: ignore[attr-defined]
+        client._codex_password = password  # type: ignore[attr-defined]
+        return client
+    assert last_error is not None
+    raise last_error
+
+
+def reconnect_ssh(ssh: paramiko.SSHClient) -> paramiko.SSHClient:
+    host = getattr(ssh, "_codex_host", None)
+    username = getattr(ssh, "_codex_username", None)
+    password = getattr(ssh, "_codex_password", None)
+    if not host or not username or password is None:
+        raise RuntimeError("missing SSH reconnect metadata")
+    with contextlib.suppress(Exception):
+        ssh.close()
+    replacement = ssh_connect(host, username=username, password=password)
+    ssh.__dict__.clear()
+    ssh.__dict__.update(replacement.__dict__)
+    return ssh
 
 
 def ensure_ssh_active(
@@ -345,14 +410,48 @@ def ensure_ssh_active(
     transport = ssh.get_transport()
     if transport is not None and transport.is_active():
         return ssh
-    with contextlib.suppress(Exception):
-        ssh.close()
-    return ssh_connect(host, username=username, password=password)
+    ssh._codex_host = host  # type: ignore[attr-defined]
+    ssh._codex_username = username  # type: ignore[attr-defined]
+    ssh._codex_password = password  # type: ignore[attr-defined]
+    return reconnect_ssh(ssh)
+
+
+def exec_command_retry(
+    ssh: paramiko.SSHClient,
+    wrapped: str,
+    *,
+    timeout: int,
+) -> tuple[typing.Any, typing.Any, typing.Any]:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            return ssh.exec_command(wrapped, timeout=timeout)
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+            last_error = error
+            if attempt == 1:
+                raise
+            reconnect_ssh(ssh)
+    assert last_error is not None
+    raise last_error
+
+
+def open_sftp_retry(ssh: paramiko.SSHClient) -> paramiko.SFTPClient:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            return ssh.open_sftp()
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+            last_error = error
+            if attempt == 1:
+                raise
+            reconnect_ssh(ssh)
+    assert last_error is not None
+    raise last_error
 
 
 def run(ssh: paramiko.SSHClient, cmd: str, *, timeout: int = 120, check: bool = True) -> tuple[int, str, str]:
     wrapped = f"bash -lc {shlex.quote(cmd)}"
-    stdin, stdout, stderr = ssh.exec_command(wrapped, timeout=timeout)
+    stdin, stdout, stderr = exec_command_retry(ssh, wrapped, timeout=timeout)
     del stdin
     channel = stdout.channel
     deadline = time.time() + timeout
@@ -439,7 +538,12 @@ def wait_port(
         "PY"
     )
     while time.time() < deadline:
-        code, _, _ = run(ssh, wrap_exec(probe, exec_prefix=exec_prefix), timeout=10, check=False)
+        try:
+            code, _, _ = run(ssh, wrap_exec(probe, exec_prefix=exec_prefix), timeout=10, check=False)
+        except (TimeoutError, OSError, EOFError, ConnectionResetError, paramiko.SSHException):
+            reconnect_ssh(ssh)
+            time.sleep(0.5)
+            continue
         if code == 0:
             return
         time.sleep(0.5)
@@ -675,7 +779,14 @@ def format_delta(current: float | None, baseline: float | None, *, higher_is_bet
     return f"{sign}{raw:.2f}%"
 
 
-def write_sing_client_config(*, server: str, server_name: str, server_port: int, user: str, socks_port: int) -> str:
+def write_sing_client_config(
+    *,
+    server: str,
+    server_name: str,
+    server_port: int,
+    user: str,
+    socks_port: int,
+) -> str:
     return json.dumps(
         {
             "log": {"level": "warn"},
@@ -707,7 +818,7 @@ def start_sing_clients(
     client_count: int,
     exec_prefix: str | None = None,
 ) -> list[str]:
-    sftp = client_ssh.open_sftp()
+    sftp = open_sftp_retry(client_ssh)
     proxies: list[str] = []
     try:
         for index in range(client_count):
@@ -770,6 +881,17 @@ def run_compare(
     slug = f"{scenario.name}-{impl_name}-attempt-{attempt}"
     remote_stdout = f"{client_root}/results/{run_id}-{slug}.json"
     remote_curve = None if not scenario.capture_curve else f"{client_root}/results/{run_id}-{slug}.curve.json"
+    stdout_local = local_run / pathlib.Path(remote_stdout).name
+    stderr_local = local_run / f"{run_id}-{slug}.stderr.txt"
+    curve_local = None if not remote_curve else local_run / pathlib.Path(remote_curve).name
+    if stdout_local.exists():
+        with contextlib.suppress(json.JSONDecodeError):
+            metrics = json.loads(stdout_local.read_text(encoding="utf-8"))
+            curve_summary = None
+            if curve_local and curve_local.exists():
+                curve_data = json.loads(curve_local.read_text(encoding="utf-8"))
+                curve_summary = summarize_curve(curve_data.get("samples", []))
+            return metrics, curve_summary, stdout_local, curve_local if curve_local and curve_local.exists() else None
     cmd = [
         "python3",
         f"{client_root}/bin/benchmark_compare_socks.py",
@@ -792,9 +914,6 @@ def run_compare(
         cmd.extend(["--measure-warmup-seconds", str(scenario.warmup_seconds)])
     if remote_curve:
         cmd.extend(["--curve-file", remote_curve, "--sample-interval", str(SAMPLE_INTERVAL)])
-
-    stdout_local = local_run / pathlib.Path(remote_stdout).name
-    stderr_local = local_run / f"{run_id}-{slug}.stderr.txt"
     shell_cmd = "set -o pipefail; " + " ".join(shlex.quote(part) for part in cmd) + f" | tee {shlex.quote(remote_stdout)}"
     shell_cmd = wrap_exec(shell_cmd, exec_prefix=exec_prefix)
     code, stdout_text, stderr_text = run(client_ssh, shell_cmd, timeout=scenario.seconds + 120, check=False)
@@ -817,6 +936,9 @@ def run_compare(
             "mbps": 0.0,
             "pps": 0.0,
             "connect_ms": None,
+            "post_connect_first_byte_ms": None,
+            "request_sent_ms": None,
+            "request_to_first_byte_ms": None,
             "first_byte_ms": None,
             "status": "fail",
             "error": f"compare_socks exited with {code}: {detail[:1000]}",
@@ -825,7 +947,7 @@ def run_compare(
     curve_summary = None
     curve_local = None
     client_ssh = ensure_ssh_active(client_ssh, host=client_host, username=username, password=password)
-    sftp = client_ssh.open_sftp()
+    sftp = open_sftp_retry(client_ssh)
     try:
         if remote_curve and code == 0 and metrics.get("status") != "fail":
             curve_local = local_run / pathlib.Path(remote_curve).name
@@ -869,7 +991,13 @@ def current_node_config(*, panel_port: int, cert_path: str, key_path: str) -> st
     )
 
 
-def sing_server_config(*, server_name: str, cert_path: str, key_path: str) -> str:
+def sing_server_config(
+    *,
+    server_name: str,
+    cert_path: str,
+    key_path: str,
+    padding_scheme: list[str],
+) -> str:
     return json.dumps(
         {
             "log": {"level": "warn"},
@@ -880,7 +1008,7 @@ def sing_server_config(*, server_name: str, cert_path: str, key_path: str) -> st
                     "listen": "0.0.0.0",
                     "listen_port": PORTS["sing"],
                     "users": [{"name": user, "password": user} for user in USERS],
-                    "padding_scheme": [],
+                    "padding_scheme": padding_scheme,
                     "tls": {
                         "enabled": True,
                         "server_name": server_name,
@@ -904,12 +1032,13 @@ def install_remote_layout(
     client_root: str,
     assets: dict,
     server_name: str,
+    padding_profile: str,
 ) -> None:
     for ssh, root in ((server_ssh, server_root), (client_ssh, client_root)):
         run(ssh, f"mkdir -p {shlex.quote(root)}/{{bin,config,logs,results,run}}")
 
-    server_sftp = server_ssh.open_sftp()
-    client_sftp = client_ssh.open_sftp()
+    server_sftp = open_sftp_retry(server_ssh)
+    client_sftp = open_sftp_retry(client_ssh)
     try:
         put_file(server_sftp, pathlib.Path(assets["current_server"]), f"{server_root}/bin/noders-anytls-current")
         put_file(server_sftp, pathlib.Path(assets["v031_server"]), f"{server_root}/bin/noders-anytls-v0.0.31")
@@ -919,6 +1048,7 @@ def install_remote_layout(
         put_file(client_sftp, pathlib.Path(assets["sing"]), f"{client_root}/bin/sing-box")
         put_file(client_sftp, pathlib.Path(assets["compare_script"]), f"{client_root}/bin/benchmark_compare_socks.py")
 
+        padding_scheme = json.dumps(padding_scheme_for_profile(padding_profile))
         mock_panel = """#!/usr/bin/env python3
 import argparse
 import json
@@ -933,6 +1063,7 @@ parser.add_argument('--users', required=True)
 args = parser.parse_args()
 host, port = args.listen.rsplit(':', 1)
 users = [item for item in args.users.split(',') if item]
+padding_scheme = __PADDING_SCHEME__
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -953,7 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         if path.endswith('/config'):
-            self._json({'protocol': 'anytls', 'server_port': args.server_port, 'server_name': args.server_name, 'padding_scheme': [], 'routes': [], 'base_config': {'pull_interval': 600, 'push_interval': 600}})
+            self._json({'protocol': 'anytls', 'server_port': args.server_port, 'server_name': args.server_name, 'padding_scheme': padding_scheme, 'routes': [], 'base_config': {'pull_interval': 600, 'push_interval': 600}})
             return
         if path.endswith('/user'):
             self._json({'users': [{'id': idx + 1, 'uuid': user, 'speed_limit': 0, 'device_limit': 0} for idx, user in enumerate(users)]})
@@ -974,6 +1105,7 @@ class Handler(BaseHTTPRequestHandler):
 httpd = ThreadingHTTPServer((host, int(port)), Handler)
 httpd.serve_forever()
 """
+        mock_panel = mock_panel.replace("__PADDING_SCHEME__", padding_scheme)
         put_text(server_sftp, f"{server_root}/bin/mock_panel.py", mock_panel, 0o755)
 
         http_target = """#!/usr/bin/env python3
@@ -1033,7 +1165,16 @@ httpd.serve_forever()
         key_path = f"{server_root}/config/tls.key"
         put_text(server_sftp, f"{server_root}/config/current.toml", current_node_config(panel_port=PORTS["panel_current"], cert_path=cert_path, key_path=key_path))
         put_text(server_sftp, f"{server_root}/config/v0.0.31.toml", current_node_config(panel_port=PORTS["panel_v031"], cert_path=cert_path, key_path=key_path))
-        put_text(server_sftp, f"{server_root}/config/sing-box.json", sing_server_config(server_name=server_name, cert_path=cert_path, key_path=key_path))
+        put_text(
+            server_sftp,
+            f"{server_root}/config/sing-box.json",
+            sing_server_config(
+                server_name=server_name,
+                cert_path=cert_path,
+                key_path=key_path,
+                padding_scheme=padding_scheme_for_profile(padding_profile),
+            ),
+        )
     finally:
         server_sftp.close()
         client_sftp.close()
@@ -1085,6 +1226,7 @@ def build_markdown(summary: dict) -> str:
         f"- Client host: `{summary['client_host']}` ({summary['client_ip']})",
         f"- Current commit: `{summary['current_commit']}`",
         f"- SingBox: `{summary['sing_box_version']}`",
+        f"- Padding profile: `{summary['padding_profile']}`",
         f"- Ping avg: `{summary['ping'].get('avg_ms')} ms` packet loss `{summary['ping'].get('packet_loss')}`",
         "",
     ]
@@ -1099,15 +1241,17 @@ def build_markdown(summary: dict) -> str:
                 f"- Parallel: `{row['parallel']}`",
                 f"- Chunk size: `{row['chunk_size']}`",
                 "",
-                "| Impl | Mbps | Tail Mbps | Connect ms | First byte ms | Status |",
-                "|---|---:|---:|---:|---:|---|",
+                "| Impl | Mbps | Tail Mbps | Connect ms | Post-connect first byte ms | Request sent ms | Request to first byte ms | First byte ms | Status |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---|",
             ]
         )
         for impl in ["current", "v0.0.31", "SingBox"]:
             metrics = row["implementations"][impl]
             lines.append(
                 f"| {impl} | {format_metric(metrics.get('mbps'))} | {format_metric(metrics.get('curve_tail_mbps'))} | "
-                f"{format_metric(metrics.get('connect_ms'))} | {format_metric(metrics.get('first_byte_ms'))} | {metrics.get('status', 'n/a')} |"
+                f"{format_metric(metrics.get('connect_ms'))} | {format_metric(metrics.get('post_connect_first_byte_ms'))} | "
+                f"{format_metric(metrics.get('request_sent_ms'))} | {format_metric(metrics.get('request_to_first_byte_ms'))} | "
+                f"{format_metric(metrics.get('first_byte_ms'))} | {metrics.get('status', 'n/a')} |"
             )
         lines.append("")
     return "\n".join(lines)
@@ -1115,6 +1259,20 @@ def build_markdown(summary: dict) -> str:
 
 def current_commit() -> str:
     return os.popen(f'git -C "{ROOT}" rev-parse --short HEAD').read().strip()
+
+
+def existing_run_id(local_run: pathlib.Path) -> str | None:
+    summary_path = local_run / "summary.json"
+    if summary_path.exists():
+        with contextlib.suppress(json.JSONDecodeError, OSError):
+            return str(json.loads(summary_path.read_text(encoding="utf-8"))["run_id"])
+    for path in sorted(local_run.glob("*.json")):
+        if path.name == "summary.json":
+            continue
+        match = re.match(r"^(\d{8}T\d{6}Z)-", path.name)
+        if match:
+            return match.group(1)
+    return None
 
 
 def ping_summary(ssh: paramiko.SSHClient, host: str, *, local_run: pathlib.Path, exec_prefix: str | None = None) -> dict:
@@ -1149,6 +1307,9 @@ def aggregate_scenarios(*, scenarios: list[Scenario], raw_results: list[dict]) -
             impl_rows = [item for item in scenario_items if item["impl"] == impl_name]
             mbps_values = [item["metrics"].get("mbps") for item in impl_rows]
             connect_values = [item["metrics"].get("connect_ms") for item in impl_rows]
+            post_connect_values = [item["metrics"].get("post_connect_first_byte_ms") for item in impl_rows]
+            request_sent_values = [item["metrics"].get("request_sent_ms") for item in impl_rows]
+            request_to_first_byte_values = [item["metrics"].get("request_to_first_byte_ms") for item in impl_rows]
             first_byte_values = [item["metrics"].get("first_byte_ms") for item in impl_rows]
             tail_values = [
                 item["curve"].get("curve_tail_mbps")
@@ -1161,6 +1322,9 @@ def aggregate_scenarios(*, scenarios: list[Scenario], raw_results: list[dict]) -
                 "status": f"pass {sum(1 for status in statuses if status == 'pass')}/{len(statuses)}",
                 "mbps": round(median_value(mbps_values), 2) if median_value(mbps_values) is not None else None,
                 "connect_ms": round(median_value(connect_values), 2) if median_value(connect_values) is not None else None,
+                "post_connect_first_byte_ms": round(median_value(post_connect_values), 2) if median_value(post_connect_values) is not None else None,
+                "request_sent_ms": round(median_value(request_sent_values), 2) if median_value(request_sent_values) is not None else None,
+                "request_to_first_byte_ms": round(median_value(request_to_first_byte_values), 2) if median_value(request_to_first_byte_values) is not None else None,
                 "first_byte_ms": round(median_value(first_byte_values), 2) if median_value(first_byte_values) is not None else None,
                 "curve_tail_mbps": round(median_value(tail_values), 2) if median_value(tail_values) is not None else None,
                 "attempt_rows": impl_rows,
@@ -1176,7 +1340,7 @@ def collect_remote_artifacts(
     local_dir: pathlib.Path,
     run_id: str,
 ) -> None:
-    sftp = ssh.open_sftp()
+    sftp = open_sftp_retry(ssh)
     local_dir.mkdir(parents=True, exist_ok=True)
     try:
         try:
@@ -1194,9 +1358,14 @@ def main() -> None:
     args = parse_args()
     password = resolve_password(args)
     scenarios = build_scenarios(args)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    local_run = pathlib.Path(args.output_dir) if args.output_dir else RESULTS_ROOT / run_id
-    local_run.mkdir(parents=True, exist_ok=True)
+    if args.output_dir:
+        local_run = pathlib.Path(args.output_dir)
+        local_run.mkdir(parents=True, exist_ok=True)
+        run_id = existing_run_id(local_run) or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    else:
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        local_run = RESULTS_ROOT / run_id
+        local_run.mkdir(parents=True, exist_ok=True)
 
     server_root = f"{args.remote_root.rstrip('/')}/server"
     client_root = f"{args.remote_root.rstrip('/')}/client"
@@ -1220,6 +1389,8 @@ def main() -> None:
         "client_ip": client_ip,
         "current_commit": current_commit(),
         "sing_box_version": assets["sing_tag"],
+        "padding_profile": args.padding_profile,
+        "padding_scheme": padding_scheme_for_profile(args.padding_profile),
         "ports": PORTS,
         "selected_scenarios": [scenario.name for scenario in scenarios],
     }
@@ -1239,6 +1410,7 @@ def main() -> None:
             client_root=client_root,
             assets=assets,
             server_name=server_name,
+            padding_profile=args.padding_profile,
         )
         print("[phase] prepare remote servers", flush=True)
         prepare_servers(server_ssh, server_root=server_root, server_name=server_name)

@@ -23,9 +23,9 @@ use super::frame::{
     SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
     SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
 };
+use super::writer::{FrameWriter, write_frame, write_frame_immediate};
 #[cfg(target_env = "musl")]
-use super::writer::write_prefixed_frame;
-use super::writer::{FrameWriter, write_frame};
+use super::writer::{write_prefixed_frame, write_prefixed_frame_immediate};
 
 const TINY_UPLOAD_BATCH_IOVECS: usize = 4;
 #[cfg(target_env = "musl")]
@@ -233,6 +233,7 @@ pub(super) async fn pump_remote_to_client<R>(
     control: Arc<SessionControl>,
     traffic: Option<TrafficRecorder>,
     activity: Option<Arc<ActivityTracker>>,
+    prefetched_download: Option<Vec<u8>>,
 ) -> anyhow::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -240,45 +241,47 @@ where
     let mut buffer = vec![0u8; 7 + MAX_FRAME_PAYLOAD_LEN];
     let mut total = 0u64;
     let mut sent_first_payload = false;
+    let mut prefetched_download = prefetched_download;
     loop {
         if control.is_cancelled() {
             return Ok(total);
         }
-        let read = tokio::select! {
-            _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer[7..]) => read?,
+        let read = if let Some(prefetched) = prefetched_download.take() {
+            let read = prefetched.len();
+            buffer[7..7 + read].copy_from_slice(&prefetched);
+            read
+        } else {
+            tokio::select! {
+                _ = control.cancelled() => return Ok(total),
+                read = reader.read(&mut buffer[7..]) => read?,
+            }
         };
         if read == 0 {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
-        let allow_deferred_coalesce = sent_first_payload;
-        let (read, saw_eof) = match download_coalesce_target(read) {
-            Some(target) => {
-                coalesce_download_reads_inner(
-                    reader,
-                    &mut buffer[7..],
-                    read,
-                    target,
-                    allow_deferred_coalesce,
-                )
-                .await?
+        let first_payload_fast_path = !sent_first_payload;
+        let (read, saw_eof) = if first_payload_fast_path {
+            (read, false)
+        } else {
+            match download_coalesce_target(read) {
+                Some(target) => {
+                    coalesce_download_reads_inner(reader, &mut buffer[7..], read, target, true)
+                        .await?
+                }
+                None => (read, false),
             }
-            None => (read, false),
         };
-        let first_frame_len = first_download_frame_len(sent_first_payload, read);
-        if first_frame_len > 0 {
-            write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + first_frame_len]).await?;
-            let remaining = read - first_frame_len;
-            if remaining > 0 {
-                write_frame(
-                    &writer,
-                    CMD_PSH,
-                    stream_id,
-                    &buffer[7 + first_frame_len..7 + read],
-                )
-                .await?;
+        if first_payload_fast_path {
+            #[cfg(target_env = "musl")]
+            if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {
+                write_prefixed_frame_immediate(&writer, CMD_PSH, stream_id, &mut buffer, read)
+                    .await?;
+            } else {
+                write_frame_immediate(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
             }
+            #[cfg(not(target_env = "musl"))]
+            write_frame_immediate(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
         } else {
             #[cfg(target_env = "musl")]
             if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {
@@ -302,14 +305,6 @@ where
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
-    }
-}
-
-pub(super) fn first_download_frame_len(sent_first_payload: bool, read: usize) -> usize {
-    if sent_first_payload || read <= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
-        0
-    } else {
-        SMALL_DATA_FRAME_FLUSH_THRESHOLD
     }
 }
 

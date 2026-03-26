@@ -43,7 +43,7 @@ impl EffectiveNodeConfig {
             listen_ip: listen_ip.to_string(),
             server_port: remote.server_port,
             padding_scheme: if remote.padding_scheme.is_empty() {
-                PaddingScheme::default_lines()
+                PaddingScheme::fallback_lines()
             } else {
                 remote.padding_scheme.clone()
             },
@@ -68,7 +68,7 @@ mod tests {
     use crate::panel::NodeConfigResponse;
 
     #[test]
-    fn fills_default_padding_from_remote_config() {
+    fn fills_fallback_padding_from_remote_config() {
         let remote = NodeConfigResponse {
             protocol: "anytls".to_string(),
             server_port: 443,
@@ -78,7 +78,7 @@ mod tests {
         };
         let effective = EffectiveNodeConfig::from_remote("::", &remote);
         assert_eq!(effective.listen_ip, "::");
-        assert_eq!(effective.padding_scheme, PaddingScheme::default_lines());
+        assert_eq!(effective.padding_scheme, PaddingScheme::fallback_lines());
     }
 
     #[test]
@@ -107,7 +107,7 @@ impl ServerController {
             tls_materials: AsyncMutex::new(tls_materials),
             accounting,
             outbound: config.outbound.clone(),
-            padding_scheme: Arc::new(RwLock::new(PaddingScheme::default())),
+            padding_scheme: Arc::new(RwLock::new(PaddingScheme::fallback())),
             route_rules: Arc::new(RwLock::new(RouteRules::default())),
             inner: Mutex::new(None),
         })
@@ -115,7 +115,7 @@ impl ServerController {
 
     pub async fn apply_config(&self, config: EffectiveNodeConfig) -> anyhow::Result<()> {
         let padding = if config.padding_scheme.is_empty() {
-            PaddingScheme::default()
+            PaddingScheme::fallback()
         } else {
             PaddingScheme::from_lines(&config.padding_scheme)?
         };
