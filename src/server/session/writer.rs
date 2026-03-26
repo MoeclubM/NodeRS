@@ -56,6 +56,25 @@ impl FrameWriter {
     }
 
     pub(super) async fn send(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
+        self.send_with_mode(cmd, stream_id, payload, true).await
+    }
+
+    pub(super) async fn send_immediate(
+        &self,
+        cmd: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        self.send_with_mode(cmd, stream_id, payload, false).await
+    }
+
+    async fn send_with_mode(
+        &self,
+        cmd: u8,
+        stream_id: u32,
+        payload: &[u8],
+        allow_queue: bool,
+    ) -> anyhow::Result<()> {
         let payload_len = payload.len();
         if payload_len > MAX_FRAME_PAYLOAD_LEN {
             bail!("payload too large: {}", payload_len);
@@ -68,7 +87,9 @@ impl FrameWriter {
                     .await?;
                 return Ok(());
             }
-            if compact_contention_strategy(cmd, payload_len) == CompactContentionStrategy::Queue {
+            if allow_queue
+                && compact_contention_strategy(cmd, payload_len) == CompactContentionStrategy::Queue
+            {
                 return self.enqueue_compact_frame(&header, cmd, payload).await;
             }
 
@@ -89,6 +110,31 @@ impl FrameWriter {
         stream_id: u32,
         buffer: &mut [u8],
         payload_len: usize,
+    ) -> anyhow::Result<()> {
+        self.send_prefixed_with_mode(cmd, stream_id, buffer, payload_len, true)
+            .await
+    }
+
+    #[cfg(target_env = "musl")]
+    async fn send_prefixed_immediate(
+        &self,
+        cmd: u8,
+        stream_id: u32,
+        buffer: &mut [u8],
+        payload_len: usize,
+    ) -> anyhow::Result<()> {
+        self.send_prefixed_with_mode(cmd, stream_id, buffer, payload_len, false)
+            .await
+    }
+
+    #[cfg(target_env = "musl")]
+    async fn send_prefixed_with_mode(
+        &self,
+        cmd: u8,
+        stream_id: u32,
+        buffer: &mut [u8],
+        payload_len: usize,
+        allow_queue: bool,
     ) -> anyhow::Result<()> {
         if payload_len > MAX_FRAME_PAYLOAD_LEN {
             bail!("payload too large: {}", payload_len);
@@ -113,7 +159,7 @@ impl FrameWriter {
                 .context("write prefixed session frame")?;
             return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
-        if payload_len >= 32 * 1024 {
+        if allow_queue && payload_len >= 32 * 1024 {
             return self
                 .enqueue_pending_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice(), false)
                 .await;
@@ -215,6 +261,50 @@ pub(super) async fn write_frame(
     writer.send(cmd, stream_id, payload).await
 }
 
+pub(super) async fn write_frame_immediate(
+    writer: &FrameWriter,
+    cmd: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    writer.send_immediate(cmd, stream_id, payload).await
+}
+
+pub(super) async fn write_frame_pair_immediate(
+    writer: &FrameWriter,
+    first_cmd: u8,
+    first_stream_id: u32,
+    first_payload: &[u8],
+    second_cmd: u8,
+    second_stream_id: u32,
+    second_payload: &[u8],
+) -> anyhow::Result<()> {
+    if first_payload.len() > MAX_FRAME_PAYLOAD_LEN {
+        bail!("first payload too large: {}", first_payload.len());
+    }
+    if second_payload.len() > MAX_FRAME_PAYLOAD_LEN {
+        bail!("second payload too large: {}", second_payload.len());
+    }
+    let first_header = build_frame_header(first_cmd, first_stream_id, first_payload.len());
+    let second_header = build_frame_header(second_cmd, second_stream_id, second_payload.len());
+    let mut buffer = Vec::with_capacity(14 + first_payload.len() + second_payload.len());
+    buffer.extend_from_slice(&first_header);
+    buffer.extend_from_slice(first_payload);
+    buffer.extend_from_slice(&second_header);
+    buffer.extend_from_slice(second_payload);
+    let mut guard = writer.inner.lock().await;
+    guard
+        .write_all(&buffer)
+        .await
+        .context("write paired session frames")?;
+    if should_flush_frame(first_cmd, first_payload.len())
+        || should_flush_frame(second_cmd, second_payload.len())
+    {
+        guard.flush().await.context("flush paired session frames")?;
+    }
+    Ok(())
+}
+
 #[cfg(target_env = "musl")]
 pub(super) async fn write_prefixed_frame(
     writer: &FrameWriter,
@@ -225,6 +315,19 @@ pub(super) async fn write_prefixed_frame(
 ) -> anyhow::Result<()> {
     writer
         .send_prefixed(cmd, stream_id, buffer, payload_len)
+        .await
+}
+
+#[cfg(target_env = "musl")]
+pub(super) async fn write_prefixed_frame_immediate(
+    writer: &FrameWriter,
+    cmd: u8,
+    stream_id: u32,
+    buffer: &mut [u8],
+    payload_len: usize,
+) -> anyhow::Result<()> {
+    writer
+        .send_prefixed_immediate(cmd, stream_id, buffer, payload_len)
         .await
 }
 

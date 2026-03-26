@@ -20,6 +20,9 @@ class WorkerStats:
     packets: int = 0
     connect_ms: float | None = None
     first_byte_ms: float | None = None
+    post_connect_first_byte_ms: float | None = None
+    request_sent_ms: float | None = None
+    request_to_first_byte_ms: float | None = None
 
 
 class MeasurementWindow:
@@ -57,6 +60,22 @@ class MeasurementWindow:
             self.measure_start = now
             self.stop_time = now
             self._ready.set()
+
+
+def mark_request_sent(stats: WorkerStats, started: float) -> None:
+    if stats.request_sent_ms is None:
+        stats.request_sent_ms = (time.perf_counter() - started) * 1000.0
+
+
+def mark_first_byte(stats: WorkerStats, started: float) -> None:
+    if stats.first_byte_ms is not None:
+        return
+    first_byte_ms = (time.perf_counter() - started) * 1000.0
+    stats.first_byte_ms = first_byte_ms
+    if stats.connect_ms is not None:
+        stats.post_connect_first_byte_ms = max(first_byte_ms - stats.connect_ms, 0.0)
+    if stats.request_sent_ms is not None:
+        stats.request_to_first_byte_ms = max(first_byte_ms - stats.request_sent_ms, 0.0)
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -282,8 +301,7 @@ def worker_download(
                 continue
             if not chunk:
                 break
-            if stats.first_byte_ms is None:
-                stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+            mark_first_byte(stats, started)
             if time.perf_counter() >= measure_start:
                 stats.bytes += len(chunk)
                 stats.packets += 1
@@ -377,8 +395,7 @@ def worker_udp_download(
             if not packet:
                 continue
             payload = parse_udp_datagram(packet)
-            if stats.first_byte_ms is None:
-                stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+            mark_first_byte(stats, started)
             if time.perf_counter() >= measure_start:
                 stats.bytes += len(payload)
                 stats.packets += 1
@@ -467,13 +484,14 @@ def worker_http_download(
         "\r\n"
     ).encode("ascii")
     sock.sendall(request)
+    mark_request_sent(stats, started)
     measurement_window.mark_connected()
     measure_start, stop_time = measurement_window.wait()
     try:
         header_deadline = time.perf_counter() + max(10.0, measurement_window.warmup_seconds + 8.0)
         _, remainder = recv_until(sock, b"\r\n\r\n", deadline=header_deadline)
-        if remainder and stats.first_byte_ms is None:
-            stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+        if remainder:
+            mark_first_byte(stats, started)
         if remainder and time.perf_counter() >= measure_start:
             stats.bytes += len(remainder)
             stats.packets += 1
@@ -484,8 +502,7 @@ def worker_http_download(
                 continue
             if not chunk:
                 break
-            if stats.first_byte_ms is None:
-                stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
+            mark_first_byte(stats, started)
             if time.perf_counter() >= measure_start:
                 stats.bytes += len(chunk)
                 stats.packets += 1
@@ -650,6 +667,13 @@ def main() -> None:
                 "pps": round(total_packets / elapsed, 2),
                 "connect_ms": average([item.connect_ms for item in stats]),
                 "first_byte_ms": average([item.first_byte_ms for item in stats]),
+                "post_connect_first_byte_ms": average(
+                    [item.post_connect_first_byte_ms for item in stats]
+                ),
+                "request_sent_ms": average([item.request_sent_ms for item in stats]),
+                "request_to_first_byte_ms": average(
+                    [item.request_to_first_byte_ms for item in stats]
+                ),
                 "status": "pass",
             }
         )

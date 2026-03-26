@@ -25,6 +25,21 @@ from urllib.parse import parse_qs, urlparse
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 COMPARE_SOCKS = ROOT / "scripts" / "benchmark_compare_socks.py"
 USERS = [f"bench-user-uuid-{index:02d}" for index in range(1, 5)]
+STANDARD_PADDING_SCHEME = [
+    "stop=8",
+    "0=30-30",
+    "1=100-400",
+    "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+    "3=9-9,500-1000",
+    "4=500-1000",
+    "5=500-1000",
+    "6=500-1000",
+    "7=500-1000",
+]
+PADDING_PROFILES = {
+    "product-default": [],
+    "standard-padding": STANDARD_PADDING_SCHEME,
+}
 
 
 @dataclass(frozen=True)
@@ -145,7 +160,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--curve-sample-interval", type=float, default=1.0)
     parser.add_argument("--steady-state-warmup-seconds", type=float, default=2.0)
     parser.add_argument("--lossy-repeats", type=int, default=2)
+    parser.add_argument(
+        "--padding-profile",
+        choices=sorted(PADDING_PROFILES),
+        default="product-default",
+    )
     return parser.parse_args()
+
+
+def padding_scheme_for_profile(profile: str) -> list[str]:
+    return list(PADDING_PROFILES[profile])
 
 
 def run_checked(
@@ -325,9 +349,10 @@ def ensure_tls_materials(work_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.
 
 
 class MockPanel:
-    def __init__(self, port: int, server_port: int):
+    def __init__(self, port: int, server_port: int, padding_scheme: list[str]):
         self.port = port
         self.server_port = server_port
+        self.padding_scheme = padding_scheme
         self.httpd: ThreadingHTTPServer | None = None
 
     def start(self) -> None:
@@ -360,7 +385,7 @@ class MockPanel:
                             "protocol": "anytls",
                             "server_port": panel.server_port,
                             "server_name": "localhost",
-                            "padding_scheme": [],
+                            "padding_scheme": panel.padding_scheme,
                             "routes": [],
                             "base_config": {"pull_interval": 600, "push_interval": 600},
                         }
@@ -626,6 +651,9 @@ def aggregate_case_attempts(case: Case, attempts: list[dict[str, object]]) -> di
         "mbps",
         "pps",
         "connect_ms",
+        "post_connect_first_byte_ms",
+        "request_sent_ms",
+        "request_to_first_byte_ms",
         "first_byte_ms",
         "curve_head_mbps",
         "curve_avg_mbps",
@@ -647,7 +675,15 @@ def aggregate_case_attempts(case: Case, attempts: list[dict[str, object]]) -> di
         if values:
             aggregated[key] = int(round(float(median(values))))
 
-    for key in ["mbps", "connect_ms", "first_byte_ms", "curve_tail_mbps"]:
+    for key in [
+        "mbps",
+        "connect_ms",
+        "post_connect_first_byte_ms",
+        "request_sent_ms",
+        "request_to_first_byte_ms",
+        "first_byte_ms",
+        "curve_tail_mbps",
+    ]:
         attach_attempt_summary(aggregated, successful_attempts, key)
 
     if failed_attempts:
@@ -710,6 +746,7 @@ def write_sing_server_config(
     server_port: int,
     cert_path: pathlib.Path,
     key_path: pathlib.Path,
+    padding_scheme: list[str],
 ) -> None:
     path.write_text(
         json.dumps(
@@ -722,7 +759,7 @@ def write_sing_server_config(
                         "listen": "127.0.0.1",
                         "listen_port": server_port,
                         "users": [{"name": user, "password": user} for user in USERS],
-                        "padding_scheme": [],
+                        "padding_scheme": padding_scheme,
                         "tls": {
                             "enabled": True,
                             "server_name": "localhost",
@@ -740,7 +777,13 @@ def write_sing_server_config(
     )
 
 
-def write_sing_client_config(path: pathlib.Path, *, socks_port: int, server_port: int, user: str) -> None:
+def write_sing_client_config(
+    path: pathlib.Path,
+    *,
+    socks_port: int,
+    server_port: int,
+    user: str,
+) -> None:
     path.write_text(
         json.dumps(
             {
@@ -787,7 +830,12 @@ def start_sing_clients(
     socks_ports = [reserve_port() for _ in range(client_count)]
     for index, socks_port in enumerate(socks_ports):
         config_path = work_dir / f"{log_prefix}.client-{index}.json"
-        write_sing_client_config(config_path, socks_port=socks_port, server_port=server_port, user=USERS[index])
+        write_sing_client_config(
+            config_path,
+            socks_port=socks_port,
+            server_port=server_port,
+            user=USERS[index],
+        )
         stack.enter_context(
             started_process(
                 [str(sing_binary), "run", "-c", str(config_path)],
@@ -811,6 +859,7 @@ def benchmark_impl(
     steady_state_warmup_seconds: float = 3.0,
     enable_netem: bool = False,
     lossy_repeats: int = 3,
+    padding_profile: str = "product-default",
 ) -> list[dict[str, object]]:
     impl_dir = output_dir / implementation.label
     impl_dir.mkdir(parents=True, exist_ok=True)
@@ -818,6 +867,7 @@ def benchmark_impl(
         work_dir = pathlib.Path(temp_dir)
         cert_path, key_path = ensure_tls_materials(work_dir)
         server_port = reserve_port()
+        padding_scheme = padding_scheme_for_profile(padding_profile)
 
         with ExitStack() as stack:
             if implementation.kind == "singbox":
@@ -827,6 +877,7 @@ def benchmark_impl(
                     server_port=server_port,
                     cert_path=cert_path,
                     key_path=key_path,
+                    padding_scheme=padding_scheme,
                 )
                 stack.enter_context(
                     started_process(
@@ -845,7 +896,7 @@ def benchmark_impl(
                     cert_path=cert_path,
                     key_path=key_path,
                 )
-                stack.enter_context(MockPanel(panel_port, server_port))
+                stack.enter_context(MockPanel(panel_port, server_port, padding_scheme))
                 stack.enter_context(
                     started_process(
                         [str(implementation.binary), str(node_config)],
@@ -1143,6 +1194,7 @@ def write_outputs(
     previous_tags: list[str],
     sing_version: str,
     steady_state_warmup_seconds: float,
+    padding_profile: str,
     result_rows: list[dict[str, object]],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1156,6 +1208,8 @@ def write_outputs(
         "previous_tags": previous_tags,
         "sing_box_version": sing_version,
         "steady_state_warmup_seconds": steady_state_warmup_seconds,
+        "padding_profile": padding_profile,
+        "padding_scheme": padding_scheme_for_profile(padding_profile),
         "cases": [case.__dict__ for case in cases],
         "results": result_rows,
     }
@@ -1178,6 +1232,7 @@ def write_outputs(
         f"- Current: `{current_impl}`",
         f"- Previous tags: {', '.join(f'`{tag}`' for tag in previous_tags) if previous_tags else 'none'}",
         f"- Sing-box: `{sing_version}`",
+        f"- Padding profile: `{padding_profile}`",
         f"- Long connection seconds: `{max((case.seconds for case in curve_group), default=0)}`",
         f"- Idle seconds: `{max((case.seconds for case in stability_group), default=0)}`",
         f"- Default steady-state warmup seconds: `{max(steady_state_warmup_seconds, 0.0):.1f}`",
@@ -1260,8 +1315,8 @@ def write_outputs(
                 "",
                 "## Real Connection Latency",
                 "",
-                "| Scenario | Implementation | Avg Tunnel Connect ms | Avg First Byte ms |",
-                "| --- | --- | --- | --- |",
+                "| Scenario | Implementation | Avg Tunnel Connect ms | Avg Post-connect First Byte ms | Avg Request Sent ms | Avg Request to First Byte ms | Avg First Byte ms |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for case in latency_group:
@@ -1269,10 +1324,16 @@ def write_outputs(
             for impl in impl_order:
                 row = scenario_rows.get(impl)
                 connect_ms = row.get("connect_ms") if row else None
+                post_connect_first_byte_ms = row.get("post_connect_first_byte_ms") if row else None
+                request_sent_ms = row.get("request_sent_ms") if row else None
+                request_to_first_byte_ms = row.get("request_to_first_byte_ms") if row else None
                 first_byte_ms = row.get("first_byte_ms") if row else None
                 lines.append(
                     f"| `{case.name}` | `{impl}` | "
                     f"{f'{connect_ms:.2f}' if isinstance(connect_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{post_connect_first_byte_ms:.2f}' if isinstance(post_connect_first_byte_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{request_sent_ms:.2f}' if isinstance(request_sent_ms, (int, float)) else 'n/a'} | "
+                    f"{f'{request_to_first_byte_ms:.2f}' if isinstance(request_to_first_byte_ms, (int, float)) else 'n/a'} | "
                     f"{f'{first_byte_ms:.2f}' if isinstance(first_byte_ms, (int, float)) else 'n/a'} |"
                 )
                 latency_summary_rows.append(
@@ -1280,6 +1341,9 @@ def write_outputs(
                         "scenario": case.name,
                         "impl": impl,
                         "connect_ms": connect_ms,
+                        "post_connect_first_byte_ms": post_connect_first_byte_ms,
+                        "request_sent_ms": request_sent_ms,
+                        "request_to_first_byte_ms": request_to_first_byte_ms,
                         "first_byte_ms": first_byte_ms,
                     }
                 )
@@ -1691,6 +1755,7 @@ def main() -> int:
             steady_state_warmup_seconds=args.steady_state_warmup_seconds,
             enable_netem=args.enable_netem,
             lossy_repeats=args.lossy_repeats,
+            padding_profile=args.padding_profile,
         )
         result_rows.extend(rows)
 
@@ -1701,6 +1766,7 @@ def main() -> int:
         previous_tags=previous_tags,
         sing_version=sing_version,
         steady_state_warmup_seconds=args.steady_state_warmup_seconds,
+        padding_profile=args.padding_profile,
         result_rows=result_rows,
     )
     print(output_dir / "report.md")

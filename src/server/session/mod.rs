@@ -35,7 +35,7 @@ use frame::{
     padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
-use writer::{FrameWriter, write_frame};
+use writer::{FrameWriter, write_frame, write_frame_pair_immediate};
 
 const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
 const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
@@ -43,6 +43,7 @@ const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
 const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
 const DISCARD_SCRATCH_LEN: usize = 8 * 1024;
 const UOT_BRIDGE_BUFFER_SIZE: usize = 1024 * 1024;
+const PREFETCH_FIRST_DOWNLOAD_BYTES: usize = 4 * 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -716,6 +717,7 @@ async fn handle_stream(
                             pump_control,
                             None,
                             Some(pump_activity),
+                            None,
                         )
                         .await
                     });
@@ -776,8 +778,26 @@ async fn handle_stream(
     let result = async {
         match remote.as_mut() {
             Ok(stream) => {
+                let mut prefetched_download = prefetch_immediate_remote_download(stream)?;
+                let mut initial_download_bytes = 0u64;
                 if context.send_synack {
-                    write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
+                    if let Some(prefetched) = prefetched_download.take() {
+                        write_frame_pair_immediate(
+                            &context.writer,
+                            CMD_SYNACK,
+                            stream_id,
+                            &[],
+                            CMD_PSH,
+                            stream_id,
+                            &prefetched,
+                        )
+                        .await?;
+                        initial_download_bytes = prefetched.len() as u64;
+                        context.download_traffic.record(initial_download_bytes);
+                        context.activity.record();
+                    } else {
+                        write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
+                    }
                 }
                 let tcp_context = TcpStreamContext {
                     writer: context.writer.clone(),
@@ -787,7 +807,14 @@ async fn handle_stream(
                     upload_traffic: context.upload_traffic,
                     download_traffic: context.download_traffic,
                 };
-                handle_tcp_stream(app_side, stream, tcp_context).await
+                handle_tcp_stream(
+                    app_side,
+                    stream,
+                    prefetched_download,
+                    initial_download_bytes,
+                    tcp_context,
+                )
+                .await
             }
             Err(error) => {
                 if context.send_synack {
@@ -813,6 +840,8 @@ async fn handle_stream(
 async fn handle_tcp_stream(
     app_side: ChannelReader,
     stream: &mut TcpStream,
+    prefetched_download: Option<Vec<u8>>,
+    initial_download_bytes: u64,
     context: TcpStreamContext,
 ) -> anyhow::Result<(u64, u64)> {
     let (mut read_b, mut write_b) = stream.split();
@@ -832,8 +861,23 @@ async fn handle_tcp_stream(
         context.control,
         Some(context.download_traffic),
         Some(context.activity),
+        prefetched_download,
     );
-    tokio::try_join!(upload, download)
+    let (uploaded, downloaded) = tokio::try_join!(upload, download)?;
+    Ok((uploaded, downloaded + initial_download_bytes))
+}
+
+fn prefetch_immediate_remote_download(stream: &TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut buffer = vec![0u8; PREFETCH_FIRST_DOWNLOAD_BYTES];
+    match stream.try_read(&mut buffer) {
+        Ok(0) => Ok(None),
+        Ok(read) => {
+            buffer.truncate(read);
+            Ok(Some(buffer))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error).context("prefetch immediate remote download"),
+    }
 }
 
 #[cfg(test)]
@@ -850,8 +894,7 @@ mod tests {
     use super::io::pump_inbound_to_remote;
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
-        coalesce_download_reads_without_deferred_wait, first_download_frame_len, pump_copy,
-        write_chunk_batch_for_test,
+        coalesce_download_reads_without_deferred_wait, pump_copy, write_chunk_batch_for_test,
     };
     use super::{
         BACKPRESSURED_FORWARD_SEGMENT_LEN, SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN,
@@ -1228,13 +1271,6 @@ mod tests {
         assert_eq!(filled, 1024);
         assert!(!saw_eof);
         assert!(buffer[..1024].iter().all(|byte| *byte == 1));
-    }
-
-    #[test]
-    fn large_first_download_chunk_splits_off_flushable_prefix() {
-        assert_eq!(first_download_frame_len(false, 8 * 1024), 4 * 1024);
-        assert_eq!(first_download_frame_len(false, 4 * 1024), 0);
-        assert_eq!(first_download_frame_len(true, 8 * 1024), 0);
     }
 
     #[tokio::test]
