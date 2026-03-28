@@ -17,7 +17,6 @@ reqwest = { version = "0.13.2", default-features = false, features = ["json", "q
 regex = "1.12.3"
 rustc-hash = "2.1.1"
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = "1.14.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"

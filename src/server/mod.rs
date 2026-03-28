@@ -28,7 +28,6 @@ use self::rules::RouteRules;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
-const TCP_STREAM_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
@@ -43,7 +42,7 @@ impl EffectiveNodeConfig {
             listen_ip: listen_ip.to_string(),
             server_port: remote.server_port,
             padding_scheme: if remote.padding_scheme.is_empty() {
-                PaddingScheme::fallback_lines()
+                PaddingScheme::default_lines()
             } else {
                 remote.padding_scheme.clone()
             },
@@ -68,7 +67,7 @@ mod tests {
     use crate::panel::NodeConfigResponse;
 
     #[test]
-    fn fills_fallback_padding_from_remote_config() {
+    fn fills_default_padding_from_remote_config() {
         let remote = NodeConfigResponse {
             protocol: "anytls".to_string(),
             server_port: 443,
@@ -78,7 +77,7 @@ mod tests {
         };
         let effective = EffectiveNodeConfig::from_remote("::", &remote);
         assert_eq!(effective.listen_ip, "::");
-        assert_eq!(effective.padding_scheme, PaddingScheme::fallback_lines());
+        assert_eq!(effective.padding_scheme, PaddingScheme::default_lines());
     }
 
     #[test]
@@ -107,7 +106,7 @@ impl ServerController {
             tls_materials: AsyncMutex::new(tls_materials),
             accounting,
             outbound: config.outbound.clone(),
-            padding_scheme: Arc::new(RwLock::new(PaddingScheme::fallback())),
+            padding_scheme: Arc::new(RwLock::new(PaddingScheme::default())),
             route_rules: Arc::new(RwLock::new(RouteRules::default())),
             inner: Mutex::new(None),
         })
@@ -115,7 +114,7 @@ impl ServerController {
 
     pub async fn apply_config(&self, config: EffectiveNodeConfig) -> anyhow::Result<()> {
         let padding = if config.padding_scheme.is_empty() {
-            PaddingScheme::fallback()
+            PaddingScheme::default()
         } else {
             PaddingScheme::from_lines(&config.padding_scheme)?
         };
@@ -272,8 +271,6 @@ pub(super) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
     let socket = SockRef::from(stream);
-    let _ = socket.set_recv_buffer_size(TCP_STREAM_BUFFER_SIZE);
-    let _ = socket.set_send_buffer_size(TCP_STREAM_BUFFER_SIZE);
     let _ = socket.set_tcp_keepalive(&keepalive);
 }
 

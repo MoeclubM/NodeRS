@@ -8,7 +8,7 @@ use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest::Client;
 use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
-use rustls_pki_types::{CertificateDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

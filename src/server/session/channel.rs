@@ -85,7 +85,6 @@ impl PayloadBuffer {
         self.bytes.clear();
     }
 
-    #[cfg(test)]
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
@@ -224,6 +223,7 @@ impl InboundSender {
             .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
     }
 
+    #[cfg(test)]
     pub(super) fn available_send_budget(&self) -> usize {
         self.budget.available()
     }
@@ -361,6 +361,7 @@ impl ByteBudget {
         self.notify.notify_one();
     }
 
+    #[cfg(test)]
     fn available(&self) -> usize {
         self.limit.saturating_sub(self.used.load(Ordering::Acquire))
     }
@@ -450,6 +451,12 @@ impl ChannelReader {
 
     pub(super) fn enable_budget_release_on_read(&mut self) {
         self.release_budget_on_read = true;
+    }
+
+    pub(super) fn has_pending_data(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| self.offset < current.len())
     }
 
     pub(super) fn into_parts(
@@ -736,6 +743,25 @@ mod tests {
                 .is_err(),
             "only the unread tail of the current payload should remain reserved"
         );
+    }
+
+    #[tokio::test]
+    async fn channel_reader_reports_pending_tail_after_partial_read() {
+        let (sender, rx) = bounded_inbound_channel(8, 4);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
+            .expect("fill budget");
+
+        let mut reader = ChannelReader::new(rx);
+        assert!(!reader.has_pending_data());
+
+        let mut small = [0u8; 1];
+        reader
+            .read_exact(&mut small)
+            .await
+            .expect("read first byte");
+
+        assert!(reader.has_pending_data());
     }
 
     #[test]

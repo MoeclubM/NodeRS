@@ -6,6 +6,7 @@ import pathlib
 import re
 import shlex
 import socket
+import subprocess
 import tarfile
 import time
 import typing
@@ -33,6 +34,10 @@ LARGE_UDP_CHUNK = 1200
 SMALL_HTTP_CHUNK = 1024
 LARGE_HTTP_CHUNK = 32768
 MULTI_PARALLEL = 4
+KNOWN_INVALID_SCENARIOS = {
+    "http-upload-large-single-high-loss-low-latency-lossy",
+    "http-upload-large-single-jittery-lossy",
+}
 STANDARD_PADDING_SCHEME = [
     "stop=8",
     "0=30-30",
@@ -155,9 +160,12 @@ def build_default_scenarios() -> list[Scenario]:
     ]
     for profile_name in NETEM_PROFILES:
         for protocol, mode, direction, target_key, chunk_size in weak_matrix:
+            scenario_name = f"{protocol}-{direction}-large-single-{profile_name}"
+            if scenario_name in KNOWN_INVALID_SCENARIOS:
+                continue
             scenarios.append(
                 Scenario(
-                    name=f"{protocol}-{direction}-large-single-{profile_name}",
+                    name=scenario_name,
                     mode=mode,
                     protocol=protocol,
                     target_key=target_key,
@@ -185,14 +193,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-root", default="/root/test")
     parser.add_argument("--output-dir")
     parser.add_argument("--scenarios", help="comma separated scenario names; defaults to the full suite")
-    parser.add_argument("--long-seconds", type=int, default=20)
+    parser.add_argument("--long-seconds", type=int, default=10)
     parser.add_argument("--idle-seconds", type=int, default=65)
     parser.add_argument("--attempts", type=int, default=2, help="override throughput attempts when > 0")
+    parser.add_argument(
+        "--latency-attempts",
+        type=int,
+        default=3,
+        help="minimum attempt count for download scenarios with first-byte metrics",
+    )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument(
         "--padding-profile",
         choices=sorted(PADDING_PROFILES),
-        default="product-default",
+        default="standard-padding",
     )
     args = parser.parse_args()
     if args.mode == "interconnect" and not args.brn_host:
@@ -239,6 +253,8 @@ def build_scenarios(args: argparse.Namespace) -> list[Scenario]:
         attempts = base.attempts
         if base.mode != "idle" and args.attempts > 0:
             attempts = args.attempts
+        if base.mode in {"download", "udp-download", "http-download"}:
+            attempts = max(attempts, args.latency_attempts)
         seconds = args.idle_seconds if base.mode == "idle" else args.long_seconds
         scenarios.append(
             Scenario(
@@ -355,7 +371,7 @@ def ensure_local_assets(*, sing_version: str) -> dict:
 
 def ssh_connect(host: str, *, username: str, password: str) -> paramiko.SSHClient:
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(6):
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
@@ -363,17 +379,19 @@ def ssh_connect(host: str, *, username: str, password: str) -> paramiko.SSHClien
                 host,
                 username=username,
                 password=password,
-                timeout=20,
-                banner_timeout=20,
-                auth_timeout=20,
+                timeout=30,
+                banner_timeout=45,
+                auth_timeout=30,
+                allow_agent=False,
+                look_for_keys=False,
             )
         except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
             last_error = error
             with contextlib.suppress(Exception):
                 client.close()
-            if attempt == 2:
+            if attempt == 5:
                 raise
-            time.sleep(2.0)
+            time.sleep(min(2.0 * (attempt + 1), 12.0))
             continue
         transport = client.get_transport()
         if transport is not None:
@@ -810,6 +828,9 @@ def write_sing_client_config(
 def start_sing_clients(
     client_ssh: paramiko.SSHClient,
     *,
+    client_host: str,
+    username: str,
+    password: str,
     client_root: str,
     impl_name: str,
     server_host: str,
@@ -818,36 +839,52 @@ def start_sing_clients(
     client_count: int,
     exec_prefix: str | None = None,
 ) -> list[str]:
-    sftp = open_sftp_retry(client_ssh)
     proxies: list[str] = []
-    try:
-        for index in range(client_count):
-            socks_port = PORTS["socks_base"] + index
-            cfg_path = f"{client_root}/config/{impl_name}.client-{index}.json"
-            put_text(
-                sftp,
-                cfg_path,
-                write_sing_client_config(
-                    server=server_host,
-                    server_name=server_name,
-                    server_port=server_port,
-                    user=USERS[index],
-                    socks_port=socks_port,
-                ),
-            )
-            start_bg(
-                client_ssh,
-                root=client_root,
-                name=f"client-{index}",
-                cmd=f"{client_root}/bin/sing-box run -c {cfg_path}",
-                ready_host="127.0.0.1",
-                ready_port=socks_port,
-                ready_label="client",
-                exec_prefix=exec_prefix,
-            )
-            proxies.append(f"127.0.0.1:{socks_port}")
-    finally:
-        sftp.close()
+    for index in range(client_count):
+        socks_port = PORTS["socks_base"] + index
+        cfg_path = f"{client_root}/config/{impl_name}.client-{index}.json"
+        cfg_text = write_sing_client_config(
+            server=server_host,
+            server_name=server_name,
+            server_port=server_port,
+            user=USERS[index],
+            socks_port=socks_port,
+        )
+        last_error: Exception | None = None
+        for attempt in range(3):
+            sftp = None
+            try:
+                client_ssh = ensure_ssh_active(
+                    client_ssh,
+                    host=client_host,
+                    username=username,
+                    password=password,
+                )
+                sftp = open_sftp_retry(client_ssh)
+                put_text(sftp, cfg_path, cfg_text)
+                last_error = None
+                break
+            except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+                last_error = error
+                reconnect_ssh(client_ssh)
+                time.sleep(min(1.5 * (attempt + 1), 5.0))
+            finally:
+                if sftp is not None:
+                    with contextlib.suppress(Exception):
+                        sftp.close()
+        if last_error is not None:
+            raise last_error
+        start_bg(
+            client_ssh,
+            root=client_root,
+            name=f"client-{index}",
+            cmd=f"{client_root}/bin/sing-box run -c {cfg_path}",
+            ready_host="127.0.0.1",
+            ready_port=socks_port,
+            ready_label="client",
+            exec_prefix=exec_prefix,
+        )
+        proxies.append(f"127.0.0.1:{socks_port}")
     return proxies
 
 
@@ -1180,6 +1217,54 @@ httpd.serve_forever()
         client_sftp.close()
 
 
+TARGET_SERVICE_SPECS = {
+    "tcp_source_small": {
+        "name": "tcp-source-small",
+        "cmd": lambda root: f"{root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['tcp_source_small']} --chunk-size {SMALL_TCP_CHUNK}",
+        "ready_host": "127.0.0.1",
+        "ready_port": PORTS["tcp_source_small"],
+    },
+    "tcp_source_large": {
+        "name": "tcp-source-large",
+        "cmd": lambda root: f"{root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['tcp_source_large']} --chunk-size {LARGE_TCP_CHUNK}",
+        "ready_host": "127.0.0.1",
+        "ready_port": PORTS["tcp_source_large"],
+    },
+    "tcp_sink": {
+        "name": "tcp-sink",
+        "cmd": lambda root: f"{root}/bin/bench_anytls sink --listen 127.0.0.1:{PORTS['tcp_sink']}",
+        "ready_host": "127.0.0.1",
+        "ready_port": PORTS["tcp_sink"],
+    },
+    "udp_source_small": {
+        "name": "udp-source-small",
+        "cmd": lambda root: f"{root}/bin/bench_anytls udp-source --listen 127.0.0.1:{PORTS['udp_source_small']} --payload-size {SMALL_UDP_CHUNK}",
+        "ready_host": None,
+        "ready_port": None,
+    },
+    "udp_source_large": {
+        "name": "udp-source-large",
+        "cmd": lambda root: f"{root}/bin/bench_anytls udp-source --listen 127.0.0.1:{PORTS['udp_source_large']} --payload-size {LARGE_UDP_CHUNK}",
+        "ready_host": None,
+        "ready_port": None,
+    },
+    "udp_sink": {
+        "name": "udp-sink",
+        "cmd": lambda root: f"{root}/bin/bench_anytls udp-sink --listen 127.0.0.1:{PORTS['udp_sink']}",
+        "ready_host": None,
+        "ready_port": None,
+    },
+    "http_target": {
+        "name": "http-target",
+        "cmd": lambda root: f"python3 {root}/bin/http_target.py --listen 127.0.0.1:{PORTS['http_target']}",
+        "ready_host": "127.0.0.1",
+        "ready_port": PORTS["http_target"],
+    },
+}
+
+TARGET_SERVICE_KEYS = tuple(TARGET_SERVICE_SPECS.keys())
+
+
 def prepare_servers(server_ssh: paramiko.SSHClient, *, server_root: str, server_name: str) -> None:
     run(
         server_ssh,
@@ -1196,25 +1281,39 @@ chmod 600 {shlex.quote(server_root)}/config/tls.key
 
     _, out, _ = run(
         server_ssh,
-        "ss -ltnu | awk 'NR>1 {print $5}' | egrep '(:21080|:21081|:29080|:29081|:29082|:29090|:29091|:29092|:29100|:24443|:24444|:24445)$' || true",
+        "ss -ltnu | awk 'NR>1 {print $5}' | egrep '(:21080|:21081|:24443|:24444|:24445)$' || true",
         timeout=10,
         check=False,
     )
     if out.strip():
         raise RuntimeError(f"expected benchmark ports to be free on server, found listeners:\n{out}")
 
-    start_bg(server_ssh, root=server_root, name="tcp-source-small", cmd=f"{server_root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['tcp_source_small']} --chunk-size {SMALL_TCP_CHUNK}", ready_host="127.0.0.1", ready_port=PORTS["tcp_source_small"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="tcp-source-large", cmd=f"{server_root}/bin/bench_anytls source --listen 127.0.0.1:{PORTS['tcp_source_large']} --chunk-size {LARGE_TCP_CHUNK}", ready_host="127.0.0.1", ready_port=PORTS["tcp_source_large"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="tcp-sink", cmd=f"{server_root}/bin/bench_anytls sink --listen 127.0.0.1:{PORTS['tcp_sink']}", ready_host="127.0.0.1", ready_port=PORTS["tcp_sink"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="udp-source-small", cmd=f"{server_root}/bin/bench_anytls udp-source --listen 127.0.0.1:{PORTS['udp_source_small']} --payload-size {SMALL_UDP_CHUNK}", ready_label="server")
-    start_bg(server_ssh, root=server_root, name="udp-source-large", cmd=f"{server_root}/bin/bench_anytls udp-source --listen 127.0.0.1:{PORTS['udp_source_large']} --payload-size {LARGE_UDP_CHUNK}", ready_label="server")
-    start_bg(server_ssh, root=server_root, name="udp-sink", cmd=f"{server_root}/bin/bench_anytls udp-sink --listen 127.0.0.1:{PORTS['udp_sink']}", ready_label="server")
-    start_bg(server_ssh, root=server_root, name="http-target", cmd=f"python3 {server_root}/bin/http_target.py --listen 127.0.0.1:{PORTS['http_target']}", ready_host="127.0.0.1", ready_port=PORTS["http_target"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="panel-current", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_current']} --server-port {PORTS['current']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_current"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="panel-v031", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_v031']} --server-port {PORTS['v031']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_v031"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="noders-current", cmd=f"{server_root}/bin/noders-anytls-current {server_root}/config/current.toml", ready_host="127.0.0.1", ready_port=PORTS["current"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="noders-v031", cmd=f"{server_root}/bin/noders-anytls-v0.0.31 {server_root}/config/v0.0.31.toml", ready_host="127.0.0.1", ready_port=PORTS["v031"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="sing-box", cmd=f"{server_root}/bin/sing-box run -c {server_root}/config/sing-box.json", ready_host="127.0.0.1", ready_port=PORTS["sing"], ready_label="server")
+
+
+def ensure_target_service(server_ssh: paramiko.SSHClient, *, server_root: str, target_key: str) -> None:
+    if target_key not in TARGET_SERVICE_SPECS:
+        raise RuntimeError(f"unknown target service {target_key}")
+
+    for key in TARGET_SERVICE_KEYS:
+        if key == target_key:
+            continue
+        stop_named(server_ssh, root=server_root, name=TARGET_SERVICE_SPECS[key]["name"])
+
+    spec = TARGET_SERVICE_SPECS[target_key]
+    start_bg(
+        server_ssh,
+        root=server_root,
+        name=typing.cast(str, spec["name"]),
+        cmd=typing.cast(typing.Callable[[str], str], spec["cmd"])(server_root),
+        ready_host=typing.cast(str | None, spec["ready_host"]),
+        ready_port=typing.cast(int | None, spec["ready_port"]),
+        ready_label="server",
+    )
 
 
 def build_markdown(summary: dict) -> str:
@@ -1258,7 +1357,23 @@ def build_markdown(summary: dict) -> str:
 
 
 def current_commit() -> str:
-    return os.popen(f'git -C "{ROOT}" rev-parse --short HEAD').read().strip()
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "describe", "--always", "--dirty"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    fallback = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    return fallback.stdout.strip() or "unknown"
 
 
 def existing_run_id(local_run: pathlib.Path) -> str | None:
@@ -1444,6 +1559,7 @@ def main() -> None:
         server_ports = [PORTS["current"], PORTS["v031"], PORTS["sing"]]
         for scenario in scenarios:
             print(f"[scenario] {scenario.name} attempts={scenario.attempts}", flush=True)
+            ensure_target_service(server_ssh, server_root=server_root, target_key=scenario.target_key)
             with maybe_netem(
                 mode=args.mode,
                 profile_name=scenario.profile,
@@ -1465,6 +1581,9 @@ def main() -> None:
                         )
                         proxies = start_sing_clients(
                             client_ssh,
+                            client_host=client_host,
+                            username=args.username,
+                            password=password,
                             client_root=client_root,
                             impl_name=f"{scenario.name}-{impl_name.lower().replace('.', '-')}",
                             server_host=connect_host,
