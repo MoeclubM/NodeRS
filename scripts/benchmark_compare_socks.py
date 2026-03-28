@@ -458,8 +458,9 @@ def worker_http_upload(
     finally:
         with contextlib_suppress(OSError):
             sock.shutdown(socket.SHUT_WR)
-        with contextlib_suppress(OSError, EOFError, RuntimeError):
-            recv_until(sock, b"\r\n\r\n")
+        response_deadline = time.perf_counter() + 5.0
+        with contextlib_suppress(OSError, EOFError, RuntimeError, TimeoutError):
+            recv_until(sock, b"\r\n\r\n", deadline=response_deadline)
         sock.close()
 
 

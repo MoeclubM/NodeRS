@@ -1,6 +1,6 @@
 use anyhow::{Context, ensure};
 use rustls::ServerConfig;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

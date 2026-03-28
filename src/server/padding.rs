@@ -26,19 +26,8 @@ impl Default for PaddingScheme {
 }
 
 impl PaddingScheme {
-    pub fn fallback() -> Self {
-        Self::from_lines(&Self::fallback_lines()).expect("fallback padding scheme must be valid")
-    }
-
     pub fn default_lines() -> Vec<String> {
         DEFAULT_SCHEME.iter().map(|line| line.to_string()).collect()
-    }
-
-    // An empty panel scheme means "no explicit padding policy". Prefer the
-    // lightest runtime fallback so the first client stream does not pay for a
-    // downgrade frame that arrives only after SETTINGS.
-    pub fn fallback_lines() -> Vec<String> {
-        Self::minimal_lines()
     }
 
     pub fn minimal_lines() -> Vec<String> {
@@ -116,14 +105,6 @@ mod tests {
         assert_eq!(
             PaddingScheme::minimal_lines().as_slice(),
             &["stop=1".to_string(), "0=1-1".to_string()]
-        );
-    }
-
-    #[test]
-    fn fallback_matches_minimal_lines() {
-        assert_eq!(
-            PaddingScheme::fallback().raw_lines(),
-            PaddingScheme::minimal_lines()
         );
     }
 

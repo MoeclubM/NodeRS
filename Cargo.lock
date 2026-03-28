@@ -955,7 +955,6 @@ dependencies = [
  "reqwest",
  "rustc-hash",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",

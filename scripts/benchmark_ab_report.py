@@ -161,9 +161,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steady-state-warmup-seconds", type=float, default=2.0)
     parser.add_argument("--lossy-repeats", type=int, default=2)
     parser.add_argument(
+        "--latency-repeats",
+        type=int,
+        default=3,
+        help="minimum attempt count for download scenarios with first-byte metrics",
+    )
+    parser.add_argument(
         "--padding-profile",
         choices=sorted(PADDING_PROFILES),
-        default="product-default",
+        default="standard-padding",
     )
     return parser.parse_args()
 
@@ -191,6 +197,13 @@ def run_checked(
 
 def git_output(*args: str) -> str:
     return run_checked(["git", *args], capture_output=True).stdout.strip()
+
+
+def current_tree_label() -> str:
+    result = run_best_effort(["git", "describe", "--always", "--dirty"])
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return git_output("rev-parse", "HEAD")
 
 
 def run_best_effort(
@@ -859,7 +872,8 @@ def benchmark_impl(
     steady_state_warmup_seconds: float = 3.0,
     enable_netem: bool = False,
     lossy_repeats: int = 3,
-    padding_profile: str = "product-default",
+    latency_repeats: int = 3,
+    padding_profile: str = "standard-padding",
 ) -> list[dict[str, object]]:
     impl_dir = output_dir / implementation.label
     impl_dir.mkdir(parents=True, exist_ok=True)
@@ -909,6 +923,8 @@ def benchmark_impl(
             rows: list[dict[str, object]] = []
             for case in cases:
                 attempt_count = max(1, lossy_repeats if case.netem_profile else 1)
+                if case.mode == "download":
+                    attempt_count = max(attempt_count, latency_repeats)
                 case_attempts: list[dict[str, object]] = []
                 for attempt_index in range(attempt_count):
                     log_prefix = (
@@ -1705,7 +1721,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cases = build_cases(args.long_connection_seconds, args.idle_seconds)
 
-    current_commit = git_output("rev-parse", "HEAD")
+    current_commit = current_tree_label()
     previous_tags = select_previous_tags(args.compare_count)
     current_node, bench_binary = build_current_variant(
         output_dir,
@@ -1755,6 +1771,7 @@ def main() -> int:
             steady_state_warmup_seconds=args.steady_state_warmup_seconds,
             enable_netem=args.enable_netem,
             lossy_repeats=args.lossy_repeats,
+            latency_repeats=args.latency_repeats,
             padding_profile=args.padding_profile,
         )
         result_rows.extend(rows)
