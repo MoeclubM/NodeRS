@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       compare_count:
-        description: Total previous tags to compare; default is fixed v0.0.23 plus the latest previous tag
+        description: Total previous tags to compare; default keeps only the fixed release baseline v0.0.33
         required: false
-        default: "2"
+        default: "1"
       sing_box_version:
         description: sing-box release tag or latest
         required: false
@@ -71,7 +71,7 @@ jobs:
           curve_sample_interval="${{ github.event.inputs.curve_sample_interval }}"
           steady_state_warmup_seconds="${{ github.event.inputs.steady_state_warmup_seconds }}"
           lossy_repeats="${{ github.event.inputs.lossy_repeats }}"
-          compare_count="${compare_count:-2}"
+          compare_count="${compare_count:-1}"
           sing_box_version="${sing_box_version:-latest}"
           long_connection_seconds="${long_connection_seconds:-20}"
           idle_seconds="${idle_seconds:-65}"

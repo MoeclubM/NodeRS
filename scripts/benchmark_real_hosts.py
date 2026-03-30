@@ -53,6 +53,8 @@ PADDING_PROFILES = {
     "product-default": [],
     "standard-padding": STANDARD_PADDING_SCHEME,
 }
+RELEASE_BASELINE_TAG = "v0.0.33"
+RELEASE_BASELINE_LABEL = RELEASE_BASELINE_TAG
 
 PORTS = {
     "panel_current": 21080,
@@ -322,11 +324,15 @@ def ensure_local_assets(*, sing_version: str) -> dict:
     if not current_server.exists() or not current_bench.exists():
         raise RuntimeError("missing local musl build outputs under target/x86_64-unknown-linux-musl/release")
 
-    v031_archive = download_file(
-        "https://github.com/MoeclubM/NodeRS-AnyTLS/releases/download/v0.0.31/noders-anytls-v0.0.31-linux-amd64-musl.tar.gz",
-        ASSETS / "noders-anytls-v0.0.31-linux-amd64-musl.tar.gz",
+    baseline_archive = download_file(
+        f"https://github.com/MoeclubM/NodeRS-AnyTLS/releases/download/{RELEASE_BASELINE_TAG}/noders-anytls-{RELEASE_BASELINE_TAG}-linux-amd64-musl.tar.gz",
+        ASSETS / f"noders-anytls-{RELEASE_BASELINE_TAG}-linux-amd64-musl.tar.gz",
     )
-    v031_server = extract_single_binary(v031_archive, "noders-anytls", ASSETS / "noders-anytls-v0.0.31")
+    baseline_server = extract_single_binary(
+        baseline_archive,
+        "noders-anytls",
+        ASSETS / f"noders-anytls-{RELEASE_BASELINE_TAG}",
+    )
 
     requested = sing_version
     if requested == "latest":
@@ -362,7 +368,7 @@ def ensure_local_assets(*, sing_version: str) -> dict:
     return {
         "current_server": current_server,
         "bench": current_bench,
-        "v031_server": v031_server,
+        "baseline_server": baseline_server,
         "sing": sing_binary,
         "sing_tag": sing_tag,
         "compare_script": ROOT / "scripts" / "benchmark_compare_socks.py",
@@ -371,7 +377,7 @@ def ensure_local_assets(*, sing_version: str) -> dict:
 
 def ssh_connect(host: str, *, username: str, password: str) -> paramiko.SSHClient:
     last_error: Exception | None = None
-    for attempt in range(6):
+    for attempt in range(10):
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
@@ -389,9 +395,9 @@ def ssh_connect(host: str, *, username: str, password: str) -> paramiko.SSHClien
             last_error = error
             with contextlib.suppress(Exception):
                 client.close()
-            if attempt == 5:
+            if attempt == 9:
                 raise
-            time.sleep(min(2.0 * (attempt + 1), 12.0))
+            time.sleep(min(3.0 * (attempt + 1), 20.0))
             continue
         transport = client.get_transport()
         if transport is not None:
@@ -441,28 +447,30 @@ def exec_command_retry(
     timeout: int,
 ) -> tuple[typing.Any, typing.Any, typing.Any]:
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(6):
         try:
             return ssh.exec_command(wrapped, timeout=timeout)
         except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
             last_error = error
-            if attempt == 1:
+            if attempt == 5:
                 raise
             reconnect_ssh(ssh)
+            time.sleep(min(2.0 * (attempt + 1), 10.0))
     assert last_error is not None
     raise last_error
 
 
 def open_sftp_retry(ssh: paramiko.SSHClient) -> paramiko.SFTPClient:
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(6):
         try:
             return ssh.open_sftp()
         except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
             last_error = error
-            if attempt == 1:
+            if attempt == 5:
                 raise
             reconnect_ssh(ssh)
+            time.sleep(min(2.0 * (attempt + 1), 10.0))
     assert last_error is not None
     raise last_error
 
@@ -953,7 +961,26 @@ def run_compare(
         cmd.extend(["--curve-file", remote_curve, "--sample-interval", str(SAMPLE_INTERVAL)])
     shell_cmd = "set -o pipefail; " + " ".join(shlex.quote(part) for part in cmd) + f" | tee {shlex.quote(remote_stdout)}"
     shell_cmd = wrap_exec(shell_cmd, exec_prefix=exec_prefix)
-    code, stdout_text, stderr_text = run(client_ssh, shell_cmd, timeout=scenario.seconds + 120, check=False)
+    compare_timeout = max(30, int(scenario.seconds + (scenario.warmup_seconds or 0) + 25))
+    try:
+        code, stdout_text, stderr_text = run(client_ssh, shell_cmd, timeout=compare_timeout, check=False)
+    except TimeoutError as error:
+        with contextlib.suppress(Exception):
+            client_ssh = ensure_ssh_active(
+                client_ssh,
+                host=client_host,
+                username=username,
+                password=password,
+            )
+            run(
+                client_ssh,
+                f"pkill -f {shlex.quote(f'{client_root}/bin/benchmark_compare_socks.py')} 2>/dev/null || true",
+                timeout=10,
+                check=False,
+            )
+        code = -1
+        stdout_text = ""
+        stderr_text = str(error)
     stdout_local.write_text(stdout_text, encoding="utf-8")
     if stderr_text.strip():
         stderr_local.write_text(stderr_text, encoding="utf-8")
@@ -1078,7 +1105,7 @@ def install_remote_layout(
     client_sftp = open_sftp_retry(client_ssh)
     try:
         put_file(server_sftp, pathlib.Path(assets["current_server"]), f"{server_root}/bin/noders-anytls-current")
-        put_file(server_sftp, pathlib.Path(assets["v031_server"]), f"{server_root}/bin/noders-anytls-v0.0.31")
+        put_file(server_sftp, pathlib.Path(assets["baseline_server"]), f"{server_root}/bin/noders-anytls-baseline")
         put_file(server_sftp, pathlib.Path(assets["sing"]), f"{server_root}/bin/sing-box")
         put_file(server_sftp, pathlib.Path(assets["bench"]), f"{server_root}/bin/bench_anytls")
 
@@ -1201,7 +1228,7 @@ httpd.serve_forever()
         cert_path = f"{server_root}/config/tls.crt"
         key_path = f"{server_root}/config/tls.key"
         put_text(server_sftp, f"{server_root}/config/current.toml", current_node_config(panel_port=PORTS["panel_current"], cert_path=cert_path, key_path=key_path))
-        put_text(server_sftp, f"{server_root}/config/v0.0.31.toml", current_node_config(panel_port=PORTS["panel_v031"], cert_path=cert_path, key_path=key_path))
+        put_text(server_sftp, f"{server_root}/config/baseline.toml", current_node_config(panel_port=PORTS["panel_v031"], cert_path=cert_path, key_path=key_path))
         put_text(
             server_sftp,
             f"{server_root}/config/sing-box.json",
@@ -1289,9 +1316,9 @@ chmod 600 {shlex.quote(server_root)}/config/tls.key
         raise RuntimeError(f"expected benchmark ports to be free on server, found listeners:\n{out}")
 
     start_bg(server_ssh, root=server_root, name="panel-current", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_current']} --server-port {PORTS['current']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_current"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="panel-v031", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_v031']} --server-port {PORTS['v031']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_v031"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="panel-baseline", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_v031']} --server-port {PORTS['v031']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_v031"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="noders-current", cmd=f"{server_root}/bin/noders-anytls-current {server_root}/config/current.toml", ready_host="127.0.0.1", ready_port=PORTS["current"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="noders-v031", cmd=f"{server_root}/bin/noders-anytls-v0.0.31 {server_root}/config/v0.0.31.toml", ready_host="127.0.0.1", ready_port=PORTS["v031"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="noders-baseline", cmd=f"{server_root}/bin/noders-anytls-baseline {server_root}/config/baseline.toml", ready_host="127.0.0.1", ready_port=PORTS["v031"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="sing-box", cmd=f"{server_root}/bin/sing-box run -c {server_root}/config/sing-box.json", ready_host="127.0.0.1", ready_port=PORTS["sing"], ready_label="server")
 
 
@@ -1324,6 +1351,7 @@ def build_markdown(summary: dict) -> str:
         f"- Server host: `{summary['server_host']}` ({summary['server_ip']})",
         f"- Client host: `{summary['client_host']}` ({summary['client_ip']})",
         f"- Current commit: `{summary['current_commit']}`",
+        f"- Release baseline: `{summary['release_baseline']}`",
         f"- SingBox: `{summary['sing_box_version']}`",
         f"- Padding profile: `{summary['padding_profile']}`",
         f"- Ping avg: `{summary['ping'].get('avg_ms')} ms` packet loss `{summary['ping'].get('packet_loss')}`",
@@ -1344,7 +1372,7 @@ def build_markdown(summary: dict) -> str:
                 "|---|---:|---:|---:|---:|---:|---:|---:|---|",
             ]
         )
-        for impl in ["current", "v0.0.31", "SingBox"]:
+        for impl in ["current", RELEASE_BASELINE_LABEL, "SingBox"]:
             metrics = row["implementations"][impl]
             lines.append(
                 f"| {impl} | {format_metric(metrics.get('mbps'))} | {format_metric(metrics.get('curve_tail_mbps'))} | "
@@ -1418,7 +1446,7 @@ def aggregate_scenarios(*, scenarios: list[Scenario], raw_results: list[dict]) -
             "chunk_size": scenario.chunk_size,
             "implementations": {},
         }
-        for impl_name in ["current", "v0.0.31", "SingBox"]:
+        for impl_name in ["current", RELEASE_BASELINE_LABEL, "SingBox"]:
             impl_rows = [item for item in scenario_items if item["impl"] == impl_name]
             mbps_values = [item["metrics"].get("mbps") for item in impl_rows]
             connect_values = [item["metrics"].get("connect_ms") for item in impl_rows]
@@ -1503,6 +1531,7 @@ def main() -> None:
         "client_host": client_host,
         "client_ip": client_ip,
         "current_commit": current_commit(),
+        "release_baseline": RELEASE_BASELINE_TAG,
         "sing_box_version": assets["sing_tag"],
         "padding_profile": args.padding_profile,
         "padding_scheme": padding_scheme_for_profile(args.padding_profile),
@@ -1555,7 +1584,7 @@ def main() -> None:
         summary["ping"] = ping_summary(client_ssh, ping_host, local_run=local_run, exec_prefix=client_exec_prefix)
 
         raw_results: list[dict] = []
-        impls = [("current", PORTS["current"]), ("v0.0.31", PORTS["v031"]), ("SingBox", PORTS["sing"])]
+        impls = [("current", PORTS["current"]), (RELEASE_BASELINE_LABEL, PORTS["v031"]), ("SingBox", PORTS["sing"])]
         server_ports = [PORTS["current"], PORTS["v031"], PORTS["sing"]]
         for scenario in scenarios:
             print(f"[scenario] {scenario.name} attempts={scenario.attempts}", flush=True)

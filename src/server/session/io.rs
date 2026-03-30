@@ -13,15 +13,11 @@ use crate::accounting::SessionControl;
 use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
-#[cfg(target_env = "musl")]
-use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
-#[cfg(target_env = "musl")]
-use super::frame::LARGE_INBOUND_SEGMENT_LEN;
 use super::frame::{
-    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
-    MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
-    SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN, SMALL_UPLOAD_BATCH_IOVECS,
-    download_coalesce_target, upload_batch_policy,
+    CMD_FIN, CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, DEFAULT_UPLOAD_BATCH_IOVECS,
+    LARGE_UPLOAD_BATCH_IOVECS, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
+    SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame, write_frame_immediate};
 #[cfg(target_env = "musl")]
@@ -262,7 +258,14 @@ where
         }
         let first_payload_fast_path = !sent_first_payload;
         let (read, saw_eof) = if first_payload_fast_path {
-            (read, false)
+            match download_coalesce_target(read).filter(|_| read >= COMPACT_FRAME_PAYLOAD_THRESHOLD)
+            {
+                Some(target) => {
+                    coalesce_download_reads_inner(reader, &mut buffer[7..], read, target, false)
+                        .await?
+                }
+                None => (read, false),
+            }
         } else {
             match download_coalesce_target(read) {
                 Some(target) => {
@@ -477,7 +480,16 @@ fn upload_batch_policy_for_chunks(
     chunks: &VecDeque<BufferedChunk>,
 ) -> super::frame::UploadBatchPolicy {
     let front_len = chunks.front().map(BufferedChunk::len).unwrap_or_default();
-    upload_batch_policy(front_len)
+    let effective_front_len = if front_len <= SMALL_PAYLOAD_LEN {
+        chunks
+            .iter()
+            .map(BufferedChunk::len)
+            .find(|chunk_len| *chunk_len > SMALL_PAYLOAD_LEN)
+            .unwrap_or(front_len)
+    } else {
+        front_len
+    };
+    upload_batch_policy(effective_front_len)
 }
 
 #[cfg(test)]

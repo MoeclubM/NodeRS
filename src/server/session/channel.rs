@@ -85,6 +85,7 @@ impl PayloadBuffer {
         self.bytes.clear();
     }
 
+    #[cfg(test)]
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
@@ -223,7 +224,6 @@ impl InboundSender {
             .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
     }
 
-    #[cfg(test)]
     pub(super) fn available_send_budget(&self) -> usize {
         self.budget.available()
     }
@@ -361,7 +361,6 @@ impl ByteBudget {
         self.notify.notify_one();
     }
 
-    #[cfg(test)]
     fn available(&self) -> usize {
         self.limit.saturating_sub(self.used.load(Ordering::Acquire))
     }
