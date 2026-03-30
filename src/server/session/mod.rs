@@ -31,19 +31,15 @@ use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
-    LARGE_INBOUND_SEGMENT_LEN, MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES,
-    STREAM_INBOUND_QUEUE_CAPACITY, inbound_segment_len, is_eof, padding_md5, parse_settings,
+    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
+    padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame, write_frame_pair_immediate};
 
-#[cfg(test)]
 const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
-#[cfg(test)]
 const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
-#[cfg(test)]
 const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
-#[cfg(test)]
 const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
 const DISCARD_SCRATCH_LEN: usize = 8 * 1024;
 const UOT_BRIDGE_BUFFER_SIZE: usize = 1024 * 1024;
@@ -452,13 +448,7 @@ impl Session {
         inbound: channel::InboundSender,
         payload: PayloadBuffer,
     ) -> anyhow::Result<()> {
-        forward_inbound_payload_to_channel(
-            &inbound,
-            &self.lease.control(),
-            &self.payload_pool,
-            payload,
-        )
-        .await
+        forward_inbound_payload_to_channel(&inbound, &self.lease.control(), payload).await
     }
 }
 
@@ -469,36 +459,9 @@ fn can_send_heartbeat(state: &Arc<SessionState>) -> bool {
 async fn forward_inbound_payload_to_channel(
     inbound: &channel::InboundSender,
     control: &Arc<SessionControl>,
-    payload_pool: &Arc<PayloadPool>,
     payload: PayloadBuffer,
 ) -> anyhow::Result<()> {
-    if payload.len() <= LARGE_INBOUND_SEGMENT_LEN {
-        return forward_inbound_segment_to_channel(inbound, control, payload).await;
-    }
-
-    let segment_len = inbound_segment_len(payload.len());
-    for segment in payload.as_slice().chunks(segment_len) {
-        let mut segment_buffer = payload_pool.take(segment.len());
-        segment_buffer.extend_from_slice(segment);
-        forward_inbound_segment_to_channel(inbound, control, segment_buffer).await?;
-    }
-    Ok(())
-}
-
-async fn forward_inbound_segment_to_channel(
-    inbound: &channel::InboundSender,
-    control: &Arc<SessionControl>,
-    payload: PayloadBuffer,
-) -> anyhow::Result<()> {
-    match inbound.try_send_data(payload) {
-        Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
-        Err(channel::TrySendError::Full(payload)) => {
-            tokio::select! {
-                _ = control.cancelled() => Ok(()),
-                result = inbound.send_data(payload) => result,
-            }
-        }
-    }
+    forward_buffered_inbound_payload(inbound, control.clone(), payload, false).await
 }
 
 async fn read_header(reader: &mut ReadHalf<TlsStream>) -> anyhow::Result<FrameHeader> {
@@ -569,7 +532,6 @@ where
     Ok(())
 }
 
-#[cfg(test)]
 async fn forward_buffered_inbound_payload(
     inbound: &channel::InboundSender,
     control: Arc<SessionControl>,
@@ -650,7 +612,6 @@ async fn forward_buffered_inbound_payload(
     }
 }
 
-#[cfg(test)]
 fn should_eagerly_segment_padding_biased_payload(
     available_budget: usize,
     payload_len: usize,
@@ -658,17 +619,14 @@ fn should_eagerly_segment_padding_biased_payload(
     should_segment_backpressured_payload(available_budget, payload_len)
 }
 
-#[cfg(test)]
 fn should_segment_backpressured_payload(available_budget: usize, payload_len: usize) -> bool {
     available_budget.saturating_add(BACKPRESSURED_FORWARD_SEGMENT_LEN) < payload_len
 }
 
-#[cfg(test)]
 fn should_retry_whole_payload_after_backpressure(available_budget: usize) -> bool {
     available_budget >= WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET
 }
 
-#[cfg(test)]
 fn backpressured_payload_segment_len(available_budget: usize) -> usize {
     if available_budget < WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET {
         SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN
@@ -677,7 +635,6 @@ fn backpressured_payload_segment_len(available_budget: usize) -> usize {
     }
 }
 
-#[cfg(test)]
 async fn forward_backpressured_inbound_payload(
     inbound: &channel::InboundSender,
     control: Arc<SessionControl>,
@@ -953,21 +910,17 @@ mod tests {
         test_chunk,
     };
     use super::frame::{
-        CMD_PSH, CMD_SYNACK, LARGE_INBOUND_SEGMENT_LEN, MAX_FRAME_PAYLOAD_LEN, PayloadTier,
-        download_coalesce_target, parse_settings, payload_tier, should_flush_frame,
-        upload_batch_policy,
+        CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
+        parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
-    #[cfg(target_env = "musl")]
-    use super::io::pump_inbound_to_remote;
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
         coalesce_download_reads_without_deferred_wait, pump_copy, write_chunk_batch_for_test,
     };
     use super::{
-        BACKPRESSURED_FORWARD_SEGMENT_LEN, PAYLOAD_POOL_MAX_CACHED,
-        SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN, forward_buffered_inbound_payload,
-        forward_inbound_payload_to_channel, prefetch_remote_download_with_grace,
-        read_exact_payload,
+        BACKPRESSURED_FORWARD_SEGMENT_LEN, SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN,
+        forward_buffered_inbound_payload, forward_inbound_payload_to_channel,
+        prefetch_remote_download_with_grace, read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
@@ -1344,6 +1297,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_download_chunk_still_coalesces_immediately_available_reads() {
+        let mut reader = SegmentedReader::new([vec![1u8; 1024], vec![2u8; 1024]]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) =
+            coalesce_download_reads_without_deferred_wait(&mut reader, &mut buffer, first, 2048)
+                .await
+                .expect("coalesce immediate read without deferred wait");
+
+        assert_eq!(filled, 2048);
+        assert!(!saw_eof);
+        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
+    #[tokio::test]
     async fn prefetch_remote_download_with_grace_captures_prompt_data() {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1473,14 +1448,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_inbound_payload_segments_when_queue_has_budget() {
-        let payload_len = LARGE_INBOUND_SEGMENT_LEN + (16 * 1024);
+    async fn large_inbound_payload_keeps_whole_when_queue_has_budget() {
+        let payload_len = BACKPRESSURED_FORWARD_SEGMENT_LEN + (16 * 1024);
         let (inbound, mut rx) = bounded_inbound_channel(8, payload_len * 2);
         let control = SessionControl::new();
-        let payload_pool = Arc::new(PayloadPool::new(PAYLOAD_POOL_MAX_CACHED));
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
-        forward_inbound_payload_to_channel(&inbound, &control, &payload_pool, payload)
+        forward_inbound_payload_to_channel(&inbound, &control, payload)
             .await
             .expect("forward inbound payload");
 
@@ -1491,29 +1465,17 @@ mod tests {
         let InboundMessage::Data(first) = first else {
             panic!("expected data payload");
         };
-        assert_eq!(first.len(), LARGE_INBOUND_SEGMENT_LEN);
+        assert_eq!(first.len(), payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 7));
-        drop(first);
-
-        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .expect("tail segment should arrive")
-            .expect("second inbound message");
-        let InboundMessage::Data(second) = second else {
-            panic!("expected second data payload");
-        };
-        assert_eq!(second.len(), payload_len - LARGE_INBOUND_SEGMENT_LEN);
-        assert!(second.bytes().iter().all(|byte| *byte == 7));
     }
 
     #[tokio::test]
     async fn large_inbound_payload_falls_back_to_segments_under_backpressure() {
-        let payload_len = LARGE_INBOUND_SEGMENT_LEN + (16 * 1024);
+        let payload_len = BACKPRESSURED_FORWARD_SEGMENT_LEN + (16 * 1024);
         let first_payload_len = 64 * 1024;
         let budget_len = 64 * 1024;
         let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
         let control = SessionControl::new();
-        let payload_pool = Arc::new(PayloadPool::new(PAYLOAD_POOL_MAX_CACHED));
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
         inbound
@@ -1523,10 +1485,7 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            let payload_pool = payload_pool.clone();
-            async move {
-                forward_inbound_payload_to_channel(&inbound, &control, &payload_pool, payload).await
-            }
+            async move { forward_inbound_payload_to_channel(&inbound, &control, payload).await }
         });
         tokio::task::yield_now().await;
 
@@ -1547,7 +1506,7 @@ mod tests {
         let InboundMessage::Data(second) = second else {
             panic!("expected second data payload");
         };
-        assert_eq!(second.len(), LARGE_INBOUND_SEGMENT_LEN);
+        assert_eq!(second.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
         drop(second);
 
         let third = tokio::time::timeout(Duration::from_millis(100), rx.recv())
@@ -1557,8 +1516,21 @@ mod tests {
         let InboundMessage::Data(third) = third else {
             panic!("expected third data payload");
         };
-        assert_eq!(third.len(), payload_len - LARGE_INBOUND_SEGMENT_LEN);
-        assert!(third.bytes().iter().all(|byte| *byte == 7));
+        assert_eq!(third.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        drop(third);
+
+        let fourth = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("final fallback segment should arrive")
+            .expect("fourth inbound message");
+        let InboundMessage::Data(fourth) = fourth else {
+            panic!("expected fourth data payload");
+        };
+        assert_eq!(
+            fourth.len(),
+            payload_len - (SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN * 2)
+        );
+        assert!(fourth.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
             .await
@@ -1871,7 +1843,22 @@ mod tests {
 
         assert_eq!(policy.max_bytes, upload_batch_policy(32 * 1024).max_bytes);
         assert_eq!(policy.max_iovecs, upload_batch_policy(32 * 1024).max_iovecs);
+        assert!(total <= policy.max_bytes);
         assert_eq!(total, policy.max_bytes);
+    }
+
+    #[test]
+    fn tiny_front_chunk_does_not_downgrade_large_upload_batch_policy() {
+        let tiny = vec![1u8; 512];
+        let large = vec![7u8; 32 * 1024];
+        let chunks = std::collections::VecDeque::from([test_chunk(&tiny), test_chunk(&large)]);
+        let policy = chunk_batch_policy(&chunks, 0);
+
+        assert_eq!(policy.max_bytes, upload_batch_policy(large.len()).max_bytes);
+        assert_eq!(
+            policy.max_iovecs,
+            upload_batch_policy(large.len()).max_iovecs
+        );
     }
 
     #[cfg(not(target_env = "musl"))]

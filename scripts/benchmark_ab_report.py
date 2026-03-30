@@ -127,7 +127,7 @@ NETEM_PROFILES = {
     "jittery-lossy": ["delay", "40ms", "150ms", "distribution", "paretonormal", "loss", "6%"],
 }
 
-FIXED_COMPARE_TAGS = ["v0.0.23"]
+FIXED_COMPARE_TAGS = ["v0.0.33"]
 
 
 def throughput_cases(cases: list[Case]) -> list[Case]:
@@ -143,15 +143,15 @@ def curve_cases(cases: list[Case]) -> list[Case]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare current NodeRS, previous tags, and sing-box on Linux.")
+    parser = argparse.ArgumentParser(description="Compare current NodeRS, release baseline, and sing-box on Linux.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target", default="x86_64-unknown-linux-musl")
     parser.add_argument(
         "--compare-count",
         type=int,
-        default=2,
-        help="Total number of previous tags to benchmark. The default keeps the fixed baseline "
-        "v0.0.23, then adds the latest previous tag.",
+        default=1,
+        help="Total number of previous tags to benchmark. The default keeps only the fixed release baseline "
+        "v0.0.33.",
     )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")

@@ -33,10 +33,9 @@ pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 96;
 pub(super) const LARGE_UPLOAD_BATCH_IOVECS: usize = 42;
 pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
-pub(super) const LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
-pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 512 * 1024;
+pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PayloadTier {
@@ -108,13 +107,6 @@ pub(super) fn download_coalesce_target(initial_read: usize) -> Option<usize> {
         return Some(MAX_FRAME_PAYLOAD_LEN);
     }
     None
-}
-
-pub(super) fn inbound_segment_len(payload_len: usize) -> usize {
-    match payload_tier(payload_len) {
-        PayloadTier::Large => LARGE_INBOUND_SEGMENT_LEN,
-        PayloadTier::Small | PayloadTier::Medium => payload_len.max(1),
-    }
 }
 
 pub(super) fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
