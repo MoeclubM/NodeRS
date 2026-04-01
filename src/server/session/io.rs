@@ -14,7 +14,7 @@ use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 use super::frame::{
-    CMD_FIN, CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, DEFAULT_UPLOAD_BATCH_IOVECS,
+    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, DEFAULT_UPLOAD_BATCH_SIZE,
     LARGE_UPLOAD_BATCH_IOVECS, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
     SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
     SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
@@ -31,6 +31,7 @@ const INLINE_UPLOAD_BATCH_BYTES: usize = 2 * SMALL_PAYLOAD_LEN;
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
+    mut pending_front_offset: usize,
     mut rx: mpsc::Receiver<InboundMessage>,
     mut finished: bool,
     writer: &mut W,
@@ -45,15 +46,14 @@ where
     let mut queued_bytes = 0usize;
     let mut total = 0u64;
     loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
         if let Some(chunk) = pending.take() {
-            queued_bytes += chunk.len();
+            let chunk_offset = pending_front_offset.min(chunk.len());
+            queued_bytes += chunk.len().saturating_sub(chunk_offset);
             chunks.push_back(chunk);
-            front_offset = 0;
+            front_offset = chunk_offset;
+            pending_front_offset = 0;
         }
-        let policy = upload_batch_policy_for_chunks(&chunks);
+        let policy = upload_batch_policy_for_chunks(&chunks, front_offset);
         fill_ready_upload_batch(
             &mut rx,
             &mut chunks,
@@ -194,9 +194,6 @@ where
     let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
     let mut total = 0u64;
     loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
             read = reader.read(&mut buffer) => read.context("read proxied chunk")?,
@@ -239,9 +236,6 @@ where
     let mut sent_first_payload = false;
     let mut prefetched_download = prefetched_download;
     loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
         let read = if let Some(prefetched) = prefetched_download.take() {
             let read = prefetched.len();
             buffer[7..7 + read].copy_from_slice(&prefetched);
@@ -258,10 +252,12 @@ where
         }
         let first_payload_fast_path = !sent_first_payload;
         let (read, saw_eof) = if first_payload_fast_path {
-            match download_coalesce_target(read).filter(|_| read >= COMPACT_FRAME_PAYLOAD_THRESHOLD)
-            {
+            match download_coalesce_target(read) {
                 Some(target) => {
-                    coalesce_download_reads_inner(reader, &mut buffer[7..], read, target, false)
+                    // Let a tiny first read wait once for the immediately-following body bytes so
+                    // HTTP downloads do not split "headers now, first payload next frame" unless
+                    // the extra bytes truly are not ready yet.
+                    coalesce_download_reads_inner(reader, &mut buffer[7..], read, target, true)
                         .await?
                 }
                 None => (read, false),
@@ -336,6 +332,10 @@ where
             .context("write inbound chunk");
     }
     if writer.is_write_vectored() {
+        if chunks.len() == 1 {
+            // Large single-chunk uploads do not need the tier-sized IoSlice staging path.
+            return write_chunk_batch_vectored::<_, 1>(writer, chunks, front_offset, policy).await;
+        }
         if chunks.len() > 1 && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS {
             #[cfg(target_env = "musl")]
             let mut buffer = [0u8; INLINE_MUSL_UPLOAD_BATCH_BYTES];
@@ -478,18 +478,36 @@ where
 
 fn upload_batch_policy_for_chunks(
     chunks: &VecDeque<BufferedChunk>,
+    front_offset: usize,
 ) -> super::frame::UploadBatchPolicy {
-    let front_len = chunks.front().map(BufferedChunk::len).unwrap_or_default();
+    let front_len = chunks
+        .front()
+        .map(|front| front.len().saturating_sub(front_offset))
+        .unwrap_or_default();
     let effective_front_len = if front_len <= SMALL_PAYLOAD_LEN {
         chunks
             .iter()
-            .map(BufferedChunk::len)
+            .enumerate()
+            .map(|(index, chunk)| {
+                if index == 0 {
+                    chunk.len().saturating_sub(front_offset)
+                } else {
+                    chunk.len()
+                }
+            })
             .find(|chunk_len| *chunk_len > SMALL_PAYLOAD_LEN)
             .unwrap_or(front_len)
     } else {
         front_len
     };
-    upload_batch_policy(effective_front_len)
+    let policy = upload_batch_policy(effective_front_len);
+    if front_offset > 0 && policy.max_iovecs == LARGE_UPLOAD_BATCH_IOVECS {
+        return super::frame::UploadBatchPolicy {
+            max_bytes: DEFAULT_UPLOAD_BATCH_SIZE,
+            max_iovecs: DEFAULT_UPLOAD_BATCH_IOVECS,
+        };
+    }
+    policy
 }
 
 #[cfg(test)]
@@ -675,9 +693,9 @@ pub(super) fn chunk_batch_slices(
 #[cfg(test)]
 pub(super) fn chunk_batch_policy(
     chunks: &VecDeque<BufferedChunk>,
-    _front_offset: usize,
+    front_offset: usize,
 ) -> super::frame::UploadBatchPolicy {
-    upload_batch_policy_for_chunks(chunks)
+    upload_batch_policy_for_chunks(chunks, front_offset)
 }
 
 pub(super) fn advance_chunk_batch(

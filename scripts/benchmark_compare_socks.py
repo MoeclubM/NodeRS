@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
+import os
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -12,6 +16,7 @@ from typing import Callable
 
 UDP_HEADER_RSV = b"\x00\x00"
 UDP_HEADER_FRAG = b"\x00"
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 @dataclass
@@ -110,6 +115,118 @@ def recv_until(
             raise RuntimeError("marker not found before buffer limit")
     index = buffer.index(marker) + len(marker)
     return bytes(buffer[:index]), bytes(buffer[index:])
+
+
+def websocket_accept(key: str) -> str:
+    digest = hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def websocket_handshake(
+    sock: socket.socket,
+    target_host: str,
+    http_path: str,
+    *,
+    stats: WorkerStats | None = None,
+    started: float | None = None,
+) -> bytearray:
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    request = (
+        f"GET {http_path} HTTP/1.1\r\n"
+        f"Host: {target_host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    ).encode("ascii")
+    sock.sendall(request)
+    if stats is not None and started is not None:
+        mark_request_sent(stats, started)
+    header, remainder = recv_until(sock, b"\r\n\r\n", deadline=time.perf_counter() + 10.0)
+    if not header.startswith(b"HTTP/1.1 101"):
+        raise RuntimeError(f"websocket upgrade failed: {header[:120]!r}")
+    accept = websocket_accept(key).encode("ascii")
+    if b"Sec-WebSocket-Accept: " + accept not in header:
+        raise RuntimeError("websocket upgrade missing expected accept header")
+    return bytearray(remainder)
+
+
+def websocket_frame_header(payload_len: int, *, masked: bool) -> bytes:
+    header = bytearray([0x82])
+    mask_bit = 0x80 if masked else 0x00
+    if payload_len < 126:
+        header.append(mask_bit | payload_len)
+    elif payload_len <= 0xFFFF:
+        header.append(mask_bit | 126)
+        header.extend(struct.pack("!H", payload_len))
+    else:
+        header.append(mask_bit | 127)
+        header.extend(struct.pack("!Q", payload_len))
+    return bytes(header)
+
+
+def send_websocket_zero_frame(sock: socket.socket, payload_len: int, *, masked: bool) -> None:
+    header = websocket_frame_header(payload_len, masked=masked)
+    if masked:
+        mask = os.urandom(4)
+        payload = (mask * (payload_len // 4 + 1))[:payload_len]
+        sock.sendall(header + mask + payload)
+        return
+    sock.sendall(header + (b"\0" * payload_len))
+
+
+def recv_websocket_frame(sock: socket.socket, buffer: bytearray) -> tuple[int, bytes]:
+    while len(buffer) < 2:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise EOFError("unexpected EOF while reading websocket frame")
+        buffer.extend(chunk)
+
+    first = buffer[0]
+    second = buffer[1]
+    masked = (second & 0x80) != 0
+    payload_len = second & 0x7F
+    offset = 2
+    if payload_len == 126:
+        while len(buffer) < offset + 2:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise EOFError("unexpected EOF while reading websocket frame length")
+            buffer.extend(chunk)
+        payload_len = struct.unpack("!H", buffer[offset : offset + 2])[0]
+        offset += 2
+    elif payload_len == 127:
+        while len(buffer) < offset + 8:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise EOFError("unexpected EOF while reading websocket frame length")
+            buffer.extend(chunk)
+        payload_len = struct.unpack("!Q", buffer[offset : offset + 8])[0]
+        offset += 8
+
+    mask = b""
+    if masked:
+        while len(buffer) < offset + 4:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise EOFError("unexpected EOF while reading websocket frame mask")
+            buffer.extend(chunk)
+        mask = bytes(buffer[offset : offset + 4])
+        offset += 4
+
+    frame_end = offset + payload_len
+    while len(buffer) < frame_end:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise EOFError("unexpected EOF while reading websocket frame payload")
+        buffer.extend(chunk)
+
+    payload = bytes(buffer[offset:frame_end])
+    del buffer[:frame_end]
+    if masked:
+        payload = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
+    return first & 0x0F, payload
 
 
 def encode_socks5_address(host: str, port: int) -> bytes:
@@ -511,6 +628,67 @@ def worker_http_download(
         sock.close()
 
 
+def worker_ws_upload(
+    proxy: tuple[str, int],
+    target: tuple[str, int],
+    measurement_window: MeasurementWindow,
+    chunk_size: int,
+    stats: WorkerStats,
+    *,
+    http_path: str,
+) -> None:
+    sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
+    sock.settimeout(1.0)
+    stats.connect_ms = connect_ms
+    websocket_handshake(sock, target[0], http_path)
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
+    try:
+        while time.perf_counter() < stop_time:
+            try:
+                send_websocket_zero_frame(sock, chunk_size, masked=True)
+            except (socket.timeout, TimeoutError):
+                continue
+            record_bytes(stats, measure_start=measure_start, payload_len=chunk_size)
+    finally:
+        with contextlib_suppress(OSError):
+            sock.shutdown(socket.SHUT_WR)
+        sock.close()
+
+
+def worker_ws_download(
+    proxy: tuple[str, int],
+    target: tuple[str, int],
+    measurement_window: MeasurementWindow,
+    chunk_size: int,
+    stats: WorkerStats,
+    *,
+    http_path: str,
+) -> None:
+    _ = chunk_size
+    started = time.perf_counter()
+    sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
+    sock.settimeout(1.0)
+    stats.connect_ms = connect_ms
+    buffer = websocket_handshake(sock, target[0], http_path, stats=stats, started=started)
+    measurement_window.mark_connected()
+    measure_start, stop_time = measurement_window.wait()
+    try:
+        while time.perf_counter() < stop_time:
+            try:
+                opcode, payload = recv_websocket_frame(sock, buffer)
+            except (socket.timeout, TimeoutError):
+                continue
+            if opcode == 0x8:
+                break
+            if opcode != 0x2 or not payload:
+                continue
+            mark_first_byte(stats, started)
+            record_bytes(stats, measure_start=measure_start, payload_len=len(payload))
+    finally:
+        sock.close()
+
+
 def average(values: list[float | None]) -> float | None:
     usable = [value for value in values if value is not None]
     if not usable:
@@ -543,6 +721,8 @@ def main() -> None:
             "udp-download",
             "http-upload",
             "http-download",
+            "ws-upload",
+            "ws-download",
         ],
         required=True,
     )
@@ -613,6 +793,24 @@ def main() -> None:
                 )
             elif args.mode == "http-download":
                 worker_http_download(
+                    proxy,
+                    target,
+                    measurement_window,
+                    args.chunk_size,
+                    stats[index],
+                    http_path=args.http_path,
+                )
+            elif args.mode == "ws-upload":
+                worker_ws_upload(
+                    proxy,
+                    target,
+                    measurement_window,
+                    args.chunk_size,
+                    stats[index],
+                    http_path=args.http_path,
+                )
+            elif args.mode == "ws-download":
+                worker_ws_download(
                     proxy,
                     target,
                     measurement_window,

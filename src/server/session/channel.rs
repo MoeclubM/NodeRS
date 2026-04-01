@@ -85,7 +85,6 @@ impl PayloadBuffer {
         self.bytes.clear();
     }
 
-    #[cfg(test)]
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
@@ -149,16 +148,6 @@ impl BufferedChunk {
 
     pub(super) fn release_written(&mut self, len: usize) {
         self.permit.consume(len);
-    }
-
-    pub(super) fn split_off(mut self, at: usize) -> Self {
-        self.permit.consume(at);
-        let bytes = self.payload.into_vec();
-        let bytes = bytes[at..].to_vec();
-        Self {
-            payload: PayloadBuffer::new(bytes),
-            permit: self.permit,
-        }
     }
 }
 
@@ -460,19 +449,26 @@ impl ChannelReader {
 
     pub(super) fn into_parts(
         self,
-    ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {
+    ) -> (
+        Option<BufferedChunk>,
+        usize,
+        mpsc::Receiver<InboundMessage>,
+        bool,
+    ) {
         debug_assert!(
             !self.release_budget_on_read,
             "streaming readers should not be converted back into queued parts"
         );
-        let pending = self.current.and_then(|current| {
-            if self.offset < current.len() {
-                Some(current.split_off(self.offset))
+        let pending_offset = self.offset;
+        let pending = self.current.and_then(|mut current| {
+            if pending_offset < current.len() {
+                current.release_written(pending_offset);
+                Some(current)
             } else {
                 None
             }
         });
-        (pending, self.rx, self.finished)
+        (pending, pending_offset, self.rx, self.finished)
     }
 }
 
@@ -642,31 +638,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_off_releases_consumed_prefix_budget() {
-        let (sender, mut rx) = bounded_inbound_channel(8, 4);
-        sender
-            .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
-            .expect("send chunk");
-
-        let chunk = match rx.recv().await.expect("receive chunk") {
-            InboundMessage::Data(chunk) => chunk,
-            InboundMessage::Fin => panic!("unexpected fin"),
-        };
-        let _remaining = chunk.split_off(1);
-
-        assert!(
-            sender.try_send_data(PayloadBuffer::new(vec![5])).is_ok(),
-            "split-off prefix bytes should release matching budget"
-        );
-        assert!(
-            sender
-                .try_send_data(PayloadBuffer::new(vec![6, 7]))
-                .is_err(),
-            "only the unread tail budget should remain reserved"
-        );
-    }
-
-    #[tokio::test]
     async fn channel_reader_releases_budget_as_bytes_are_read() {
         let (sender, rx) = bounded_inbound_channel(8, 4);
         sender
@@ -690,10 +661,11 @@ mod tests {
             "the parser must not free queue budget before the unread tail is handed off"
         );
 
-        let (pending, _rx, finished) = reader.into_parts();
+        let (pending, pending_offset, _rx, finished) = reader.into_parts();
         assert!(!finished, "reading a prefix must not finish the stream");
         let pending = pending.expect("the unread tail should remain pending");
-        assert_eq!(pending.bytes(), &[2, 3, 4]);
+        assert_eq!(pending_offset, 1);
+        assert_eq!(&pending.bytes()[pending_offset..], &[2, 3, 4]);
         assert_eq!(
             sender.budget.used.load(Ordering::Acquire),
             3,

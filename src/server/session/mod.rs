@@ -43,8 +43,8 @@ const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
 const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
 const DISCARD_SCRATCH_LEN: usize = 8 * 1024;
 const UOT_BRIDGE_BUFFER_SIZE: usize = 1024 * 1024;
-const PREFETCH_FIRST_DOWNLOAD_BYTES: usize = 4 * 1024;
-const FIRST_DOWNLOAD_PREFETCH_GRACE: std::time::Duration = std::time::Duration::from_micros(500);
+const PREFETCH_FIRST_DOWNLOAD_BYTES: usize = 32 * 1024;
+const FIRST_DOWNLOAD_PREFETCH_GRACE: std::time::Duration = std::time::Duration::from_millis(2);
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -129,6 +129,7 @@ struct SessionState {
     received_settings: AtomicBool,
     peer_version: AtomicU8,
     sent_light_padding_update: AtomicBool,
+    saw_recent_padding: AtomicBool,
     streams: RwLock<FxHashMap<u32, StreamState>>,
 }
 
@@ -138,6 +139,7 @@ impl Default for SessionState {
             received_settings: AtomicBool::new(false),
             peer_version: AtomicU8::new(0),
             sent_light_padding_update: AtomicBool::new(false),
+            saw_recent_padding: AtomicBool::new(false),
             streams: RwLock::new(FxHashMap::default()),
         }
     }
@@ -187,7 +189,9 @@ impl Session {
                     if idle_for >= SESSION_IDLE_TIMEOUT {
                         break Err(anyhow!("session idle timeout"));
                     }
-                    if idle_for >= HEARTBEAT_INTERVAL && can_send_heartbeat(&state) {
+                    if idle_for >= HEARTBEAT_INTERVAL
+                        && state.received_settings.load(Ordering::Relaxed)
+                    {
                         write_frame(&writer, CMD_HEART_REQUEST, 0, &[]).await?;
                     }
                     continue;
@@ -203,7 +207,11 @@ impl Session {
                 CMD_PSH => self.handle_psh(header).await?,
                 CMD_SYN => self.handle_syn(header.stream_id).await?,
                 CMD_FIN => self.handle_fin(header.stream_id).await,
-                CMD_WASTE => self.discard(header.length as usize).await?,
+                CMD_WASTE => {
+                    self.maybe_send_light_padding_update().await?;
+                    self.state.saw_recent_padding.store(true, Ordering::Relaxed);
+                    self.discard(header.length as usize).await?
+                }
                 CMD_SETTINGS => self.handle_settings(header.length as usize).await?,
                 CMD_ALERT => self.handle_alert(header.length as usize).await?,
                 CMD_HEART_REQUEST => {
@@ -390,12 +398,7 @@ impl Session {
             )
             .await?;
         }
-        if settings
-            .get("v")
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or_default()
-            >= 2
-        {
+        if peer_version >= 2 {
             self.write_frame(CMD_SERVER_SETTINGS, 0, b"v=2").await?;
         }
         Ok(())
@@ -448,20 +451,25 @@ impl Session {
         inbound: channel::InboundSender,
         payload: PayloadBuffer,
     ) -> anyhow::Result<()> {
-        forward_inbound_payload_to_channel(&inbound, &self.lease.control(), payload).await
+        forward_buffered_inbound_payload(
+            &inbound,
+            self.lease.control(),
+            payload,
+            self.state.saw_recent_padding.swap(false, Ordering::Relaxed),
+            Some(&self.payload_pool),
+        )
+        .await
     }
 }
 
-fn can_send_heartbeat(state: &Arc<SessionState>) -> bool {
-    state.received_settings.load(Ordering::Relaxed)
-}
-
+#[cfg(test)]
 async fn forward_inbound_payload_to_channel(
     inbound: &channel::InboundSender,
     control: &Arc<SessionControl>,
     payload: PayloadBuffer,
+    payload_pool: Option<&Arc<PayloadPool>>,
 ) -> anyhow::Result<()> {
-    forward_buffered_inbound_payload(inbound, control.clone(), payload, false).await
+    forward_buffered_inbound_payload(inbound, control.clone(), payload, false, payload_pool).await
 }
 
 async fn read_header(reader: &mut ReadHalf<TlsStream>) -> anyhow::Result<FrameHeader> {
@@ -537,10 +545,11 @@ async fn forward_buffered_inbound_payload(
     control: Arc<SessionControl>,
     payload: PayloadBuffer,
     prefer_segmented_large_payload: bool,
+    payload_pool: Option<&Arc<PayloadPool>>,
 ) -> anyhow::Result<()> {
     if prefer_segmented_large_payload && payload.len() > BACKPRESSURED_FORWARD_SEGMENT_LEN {
         let available_budget = inbound.available_send_budget();
-        if should_eagerly_segment_padding_biased_payload(available_budget, payload.len()) {
+        if should_segment_backpressured_payload(available_budget, payload.len()) {
             // Padding-heavy uploads interleave CMD_WASTE bursts with real payloads. Segment the
             // next large payload only when the queue is still tight enough that a whole-frame
             // enqueue would immediately bounce on budget again.
@@ -549,6 +558,7 @@ async fn forward_buffered_inbound_payload(
                 control,
                 payload,
                 backpressured_payload_segment_len(available_budget),
+                payload_pool,
             )
             .await;
         }
@@ -606,17 +616,11 @@ async fn forward_buffered_inbound_payload(
                 control,
                 payload,
                 backpressured_payload_segment_len(available_budget),
+                payload_pool,
             )
             .await
         }
     }
-}
-
-fn should_eagerly_segment_padding_biased_payload(
-    available_budget: usize,
-    payload_len: usize,
-) -> bool {
-    should_segment_backpressured_payload(available_budget, payload_len)
 }
 
 fn should_segment_backpressured_payload(available_budget: usize, payload_len: usize) -> bool {
@@ -640,8 +644,25 @@ async fn forward_backpressured_inbound_payload(
     control: Arc<SessionControl>,
     payload: PayloadBuffer,
     segment_len: usize,
+    payload_pool: Option<&Arc<PayloadPool>>,
 ) -> anyhow::Result<()> {
     let segment_len = segment_len.max(1);
+    if let Some(payload_pool) = payload_pool {
+        for segment in payload.as_slice().chunks(segment_len) {
+            let mut buffered_segment = payload_pool.take(segment.len());
+            buffered_segment.extend_from_slice(segment);
+            match inbound.try_send_data(buffered_segment) {
+                Ok(()) | Err(channel::TrySendError::Closed) => {}
+                Err(channel::TrySendError::Full(segment)) => {
+                    tokio::select! {
+                        _ = control.cancelled() => return Ok(()),
+                        result = inbound.send_data(segment) => result?,
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     let bytes = payload.into_vec();
     for segment in bytes.chunks(segment_len) {
         let segment = PayloadBuffer::new(segment.to_vec());
@@ -851,9 +872,10 @@ async fn handle_tcp_stream(
     context: TcpStreamContext,
 ) -> anyhow::Result<(u64, u64)> {
     let (mut read_b, mut write_b) = stream.split();
-    let (pending, inbound_rx, inbound_finished) = app_side.into_parts();
+    let (pending, pending_front_offset, inbound_rx, inbound_finished) = app_side.into_parts();
     let upload = pump_inbound_to_remote(
         pending,
+        pending_front_offset,
         inbound_rx,
         inbound_finished,
         &mut write_b,
@@ -1137,8 +1159,6 @@ mod tests {
         assert!(large.max_bytes > medium.max_bytes);
         assert!(download_coalesce_target(1024).is_some());
         assert!(download_coalesce_target(8 * 1024).is_none());
-        #[cfg(target_env = "musl")]
-        assert_eq!(download_coalesce_target(32 * 1024), Some(56 * 1024));
         #[cfg(not(target_env = "musl"))]
         assert_eq!(
             download_coalesce_target(32 * 1024),
@@ -1377,15 +1397,9 @@ mod tests {
             .await
             .expect("coalesce immediate large read");
 
-        #[cfg(target_env = "musl")]
-        assert_eq!(filled, 56 * 1024);
-        #[cfg(not(target_env = "musl"))]
         assert_eq!(filled, 56 * 1024);
         assert!(!saw_eof);
         assert!(buffer[..32 * 1024].iter().all(|byte| *byte == 1));
-        #[cfg(target_env = "musl")]
-        assert!(buffer[32 * 1024..56 * 1024].iter().all(|byte| *byte == 2));
-        #[cfg(not(target_env = "musl"))]
         assert!(buffer[32 * 1024..56 * 1024].iter().all(|byte| *byte == 2));
     }
 
@@ -1432,7 +1446,7 @@ mod tests {
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
-        forward_buffered_inbound_payload(&inbound, control, payload, false)
+        forward_buffered_inbound_payload(&inbound, control, payload, false, None)
             .await
             .expect("forward buffered payload");
 
@@ -1454,7 +1468,7 @@ mod tests {
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
-        forward_inbound_payload_to_channel(&inbound, &control, payload)
+        forward_inbound_payload_to_channel(&inbound, &control, payload, None)
             .await
             .expect("forward inbound payload");
 
@@ -1485,7 +1499,7 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            async move { forward_inbound_payload_to_channel(&inbound, &control, payload).await }
+            async move { forward_inbound_payload_to_channel(&inbound, &control, payload, None).await }
         });
         tokio::task::yield_now().await;
 
@@ -1545,7 +1559,7 @@ mod tests {
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
-        forward_buffered_inbound_payload(&inbound, control, payload, true)
+        forward_buffered_inbound_payload(&inbound, control, payload, true, None)
             .await
             .expect("forward buffered payload");
 
@@ -1576,7 +1590,7 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            async move { forward_buffered_inbound_payload(&inbound, control, payload, true).await }
+            async move { forward_buffered_inbound_payload(&inbound, control, payload, true, None).await }
         });
         tokio::task::yield_now().await;
 
@@ -1634,7 +1648,9 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            async move { forward_buffered_inbound_payload(&inbound, control, payload, false).await }
+            async move {
+                forward_buffered_inbound_payload(&inbound, control, payload, false, None).await
+            }
         });
         tokio::task::yield_now().await;
 
@@ -1707,7 +1723,9 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            async move { forward_buffered_inbound_payload(&inbound, control, payload, false).await }
+            async move {
+                forward_buffered_inbound_payload(&inbound, control, payload, false, None).await
+            }
         });
         tokio::task::yield_now().await;
 
@@ -1826,9 +1844,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_front_write_keeps_large_upload_batch_policy() {
+    fn partial_front_write_narrows_large_upload_batch_policy() {
         let large = vec![7u8; 32 * 1024];
         let chunks = std::collections::VecDeque::from([
+            test_chunk(&large),
+            test_chunk(&large),
             test_chunk(&large),
             test_chunk(&large),
             test_chunk(&large),
@@ -1841,9 +1861,8 @@ mod tests {
         let slices = chunk_batch_slices(&chunks, 31 * 1024, policy);
         let total: usize = slices.iter().map(|slice| slice.len()).sum();
 
-        assert_eq!(policy.max_bytes, upload_batch_policy(32 * 1024).max_bytes);
-        assert_eq!(policy.max_iovecs, upload_batch_policy(32 * 1024).max_iovecs);
-        assert!(total <= policy.max_bytes);
+        assert_eq!(policy.max_bytes, upload_batch_policy(8 * 1024).max_bytes);
+        assert_eq!(policy.max_iovecs, upload_batch_policy(8 * 1024).max_iovecs);
         assert_eq!(total, policy.max_bytes);
     }
 
@@ -1876,36 +1895,6 @@ mod tests {
         assert_eq!(writer.vectored_writes, 0);
     }
 
-    #[cfg(target_env = "musl")]
-    #[tokio::test]
-    async fn single_chunk_upload_batch_keeps_vectored_write_path_on_musl() {
-        let chunks = std::collections::VecDeque::from([test_chunk(b"hello")]);
-        let mut writer = WriteModeRecorder::default();
-
-        let written = write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(5))
-            .await
-            .expect("write single chunk batch");
-
-        assert_eq!(written, 5);
-        assert_eq!(writer.scalar_writes, 0);
-        assert_eq!(writer.vectored_writes, 1);
-    }
-
-    #[cfg(target_env = "musl")]
-    #[tokio::test]
-    async fn tiny_multi_chunk_upload_batch_uses_inline_scalar_write_on_musl() {
-        let chunks = std::collections::VecDeque::from([test_chunk(b"he"), test_chunk(b"llo")]);
-        let mut writer = WriteModeRecorder::default();
-
-        let written = write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(5))
-            .await
-            .expect("write tiny multi chunk batch");
-
-        assert_eq!(written, 5);
-        assert_eq!(writer.scalar_writes, 1);
-        assert_eq!(writer.vectored_writes, 0);
-    }
-
     #[cfg(not(target_env = "musl"))]
     #[tokio::test]
     async fn tiny_multi_chunk_upload_batch_uses_inline_scalar_write() {
@@ -1919,72 +1908,6 @@ mod tests {
         assert_eq!(written, 5);
         assert_eq!(writer.scalar_writes, 1);
         assert_eq!(writer.vectored_writes, 0);
-    }
-
-    #[cfg(target_env = "musl")]
-    #[tokio::test]
-    async fn musl_small_upload_batch_retries_after_one_scheduler_yield() {
-        let (tx, rx) = mpsc::channel(8);
-        let control = SessionControl::new();
-        let mut writer = WriteModeRecorder::default();
-
-        let sender = tokio::spawn(async move {
-            tx.send(InboundMessage::Data(test_chunk(b"world")))
-                .await
-                .expect("send second chunk");
-            tx.send(InboundMessage::Fin).await.expect("send fin");
-        });
-
-        let transferred = pump_inbound_to_remote(
-            Some(test_chunk(b"hello")),
-            rx,
-            false,
-            &mut writer,
-            control,
-            None,
-        )
-        .await
-        .expect("pump inbound");
-
-        sender.await.expect("join sender");
-        assert_eq!(transferred, 10);
-        assert_eq!(writer.scalar_writes, 1);
-        assert_eq!(writer.vectored_writes, 0);
-    }
-
-    #[cfg(target_env = "musl")]
-    #[tokio::test]
-    async fn musl_large_upload_batch_retries_after_one_scheduler_yield() {
-        let (tx, rx) = mpsc::channel(8);
-        let control = SessionControl::new();
-        let mut writer = WriteModeRecorder::default();
-        let payload = vec![7u8; 32 * 1024];
-
-        let sender = tokio::spawn({
-            let payload = payload.clone();
-            async move {
-                tx.send(InboundMessage::Data(test_chunk(&payload)))
-                    .await
-                    .expect("send second chunk");
-                tx.send(InboundMessage::Fin).await.expect("send fin");
-            }
-        });
-
-        let transferred = pump_inbound_to_remote(
-            Some(test_chunk(&payload)),
-            rx,
-            false,
-            &mut writer,
-            control,
-            None,
-        )
-        .await
-        .expect("pump inbound");
-
-        sender.await.expect("join sender");
-        assert_eq!(transferred, (payload.len() * 2) as u64);
-        assert_eq!(writer.scalar_writes, 0);
-        assert_eq!(writer.vectored_writes, 1);
     }
 
     #[tokio::test]

@@ -189,10 +189,11 @@ async fn relay_client_to_udp(
 ) -> anyhow::Result<()> {
     let mut destination_cache = HashMap::new();
     loop {
-        if context.control.is_cancelled() {
-            return Ok(());
-        }
-        let Some(packet) = read_client_packet(&mut reader, &context.mode).await? else {
+        let packet = tokio::select! {
+            _ = context.control.cancelled() => return Ok(()),
+            packet = read_client_packet(&mut reader, &context.mode) => packet?,
+        };
+        let Some(packet) = packet else {
             return Ok(());
         };
         if route_rules.is_blocked(&packet.destination, "udp") {
@@ -235,9 +236,6 @@ async fn relay_udp_to_client(
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; u16::MAX as usize];
     loop {
-        if context.control.is_cancelled() {
-            return Ok(());
-        }
         let (payload_len, source) = match &context.mode {
             RelayMode::Connect { .. } => {
                 let read = tokio::select! {

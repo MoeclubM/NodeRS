@@ -137,8 +137,20 @@ def build_default_scenarios() -> list[Scenario]:
         ("http", "http-download", "download", "http_target", SMALL_HTTP_CHUNK, "small", 1),
         ("http", "http-download", "download", "http_target", LARGE_HTTP_CHUNK, "large", 1),
         ("http", "http-download", "download", "http_target", LARGE_HTTP_CHUNK, "large", MULTI_PARALLEL),
+        ("ws", "ws-upload", "upload", "http_target", LARGE_HTTP_CHUNK, "large", 1),
+        ("ws", "ws-upload", "upload", "http_target", LARGE_HTTP_CHUNK, "large", MULTI_PARALLEL),
+        ("ws", "ws-download", "download", "http_target", LARGE_HTTP_CHUNK, "large", 1),
+        ("ws", "ws-download", "download", "http_target", LARGE_HTTP_CHUNK, "large", MULTI_PARALLEL),
     ]
     for protocol, mode, direction, target_key, chunk_size, size_label, parallel in clean_matrix:
+        if mode == "http-upload":
+            http_path = "/upload"
+        elif mode == "http-download":
+            http_path = f"/download?chunk_size={chunk_size}"
+        elif mode == "ws-upload":
+            http_path = "/ws-upload"
+        else:
+            http_path = f"/ws-download?chunk_size={chunk_size}"
         scenarios.append(
             Scenario(
                 name=f"{protocol}-{direction}-{size_label}-{'multi' if parallel > 1 else 'single'}",
@@ -148,7 +160,7 @@ def build_default_scenarios() -> list[Scenario]:
                 chunk_size=chunk_size,
                 parallel=parallel,
                 size_label=size_label,
-                http_path="/upload" if mode == "http-upload" else f"/download?chunk_size={chunk_size}",
+                http_path=http_path,
             )
         )
 
@@ -159,12 +171,22 @@ def build_default_scenarios() -> list[Scenario]:
         ("udp", "udp-download", "download", "udp_source_large", LARGE_UDP_CHUNK),
         ("http", "http-upload", "upload", "http_target", LARGE_HTTP_CHUNK),
         ("http", "http-download", "download", "http_target", LARGE_HTTP_CHUNK),
+        ("ws", "ws-upload", "upload", "http_target", LARGE_HTTP_CHUNK),
+        ("ws", "ws-download", "download", "http_target", LARGE_HTTP_CHUNK),
     ]
     for profile_name in NETEM_PROFILES:
         for protocol, mode, direction, target_key, chunk_size in weak_matrix:
             scenario_name = f"{protocol}-{direction}-large-single-{profile_name}"
             if scenario_name in KNOWN_INVALID_SCENARIOS:
                 continue
+            if mode == "http-upload":
+                http_path = "/upload"
+            elif mode == "http-download":
+                http_path = f"/download?chunk_size={chunk_size}"
+            elif mode == "ws-upload":
+                http_path = "/ws-upload"
+            else:
+                http_path = f"/ws-download?chunk_size={chunk_size}"
             scenarios.append(
                 Scenario(
                     name=scenario_name,
@@ -174,7 +196,7 @@ def build_default_scenarios() -> list[Scenario]:
                     chunk_size=chunk_size,
                     profile=profile_name,
                     warmup_seconds=8.0 if profile_name == "high-latency-lossy" and direction == "upload" else None,
-                    http_path="/upload" if mode == "http-upload" else f"/download?chunk_size={chunk_size}",
+                    http_path=http_path,
                     size_label="large",
                 )
             )
@@ -182,6 +204,42 @@ def build_default_scenarios() -> list[Scenario]:
 
 
 SCENARIOS = build_default_scenarios()
+DEFAULT_SCENARIO_SUITE = "focused"
+SCENARIO_SUITES = {
+    "full": tuple(scenario.name for scenario in SCENARIOS),
+    "focused": (
+        "idle-keepalive-65s",
+        "http-upload-large-multi",
+        "http-download-large-multi",
+        "ws-upload-large-multi",
+        "ws-download-large-multi",
+        "http-upload-large-single-high-latency-lossy",
+        "http-download-large-single-high-latency-lossy",
+        "ws-upload-large-single-high-latency-lossy",
+        "ws-download-large-single-high-latency-lossy",
+    ),
+    "http": (
+        "idle-keepalive-65s",
+        "http-upload-large-multi",
+        "http-download-large-multi",
+        "http-upload-large-single-high-latency-lossy",
+        "http-download-large-single-high-latency-lossy",
+    ),
+    "ws": (
+        "idle-keepalive-65s",
+        "ws-upload-large-multi",
+        "ws-download-large-multi",
+        "ws-upload-large-single-high-latency-lossy",
+        "ws-download-large-single-high-latency-lossy",
+    ),
+    "stability": (
+        "idle-keepalive-65s",
+        "http-upload-large-single-high-latency-lossy",
+        "http-download-large-single-high-latency-lossy",
+        "ws-upload-large-single-high-latency-lossy",
+        "ws-download-large-single-high-latency-lossy",
+    ),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,15 +252,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password-env")
     parser.add_argument("--remote-root", default="/root/test")
     parser.add_argument("--output-dir")
-    parser.add_argument("--scenarios", help="comma separated scenario names; defaults to the full suite")
+    parser.add_argument(
+        "--scenarios",
+        help="comma separated scenario names; overrides --suite when provided",
+    )
+    parser.add_argument(
+        "--suite",
+        choices=sorted(SCENARIO_SUITES),
+        default=DEFAULT_SCENARIO_SUITE,
+        help=(
+            "scenario preset to run when --scenarios is omitted; default trims near-duplicate cases "
+            "and focuses on HTTP throughput plus stability coverage"
+        ),
+    )
     parser.add_argument("--long-seconds", type=int, default=10)
     parser.add_argument("--idle-seconds", type=int, default=65)
-    parser.add_argument("--attempts", type=int, default=2, help="override throughput attempts when > 0")
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=0,
+        help="override throughput attempts when > 0; otherwise use suite defaults",
+    )
     parser.add_argument(
         "--latency-attempts",
         type=int,
-        default=3,
-        help="minimum attempt count for download scenarios with first-byte metrics",
+        default=0,
+        help="minimum attempt count for download scenarios with first-byte metrics; otherwise use suite defaults",
     )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument(
@@ -232,8 +307,30 @@ def padding_scheme_for_profile(profile: str) -> list[str]:
     return list(PADDING_PROFILES[profile])
 
 
+def scenario_suite_note(suite: str) -> str | None:
+    if suite == "full":
+        return None
+    return (
+        f"the `{suite}` suite merges near-duplicate cases and keeps the run budget inside roughly 10 minutes "
+        "by focusing on representative HTTP / WebSocket throughput plus weak-link stability."
+    )
+
+
+def effective_suite(args: argparse.Namespace) -> str:
+    return "custom" if args.scenarios else args.suite
+
+
+def default_attempts_for_suite(suite: str) -> int:
+    return 2 if suite in {"full", "custom"} else 1
+
+
+def default_latency_attempts_for_suite(suite: str) -> int:
+    return 3 if suite in {"full", "custom"} else 1
+
+
 def build_scenarios(args: argparse.Namespace) -> list[Scenario]:
     scenarios: list[Scenario] = []
+    suite = effective_suite(args)
     allowed = None
     if args.scenarios:
         allowed = {item.strip() for item in args.scenarios.split(",") if item.strip()}
@@ -247,16 +344,25 @@ def build_scenarios(args: argparse.Namespace) -> list[Scenario]:
         unknown = normalized_allowed - known_names
         if unknown:
             raise SystemExit(f"unknown scenarios: {', '.join(sorted(unknown))}")
+    else:
+        allowed = set(SCENARIO_SUITES[args.suite])
+
+    throughput_attempts = args.attempts if args.attempts > 0 else default_attempts_for_suite(suite)
+    latency_attempts = (
+        args.latency_attempts
+        if args.latency_attempts > 0
+        else default_latency_attempts_for_suite(suite)
+    )
 
     for base in SCENARIOS:
         scenario_name = base.name if base.mode != "idle" else f"idle-keepalive-{args.idle_seconds}s"
         if allowed and base.name not in allowed and scenario_name not in allowed:
             continue
         attempts = base.attempts
-        if base.mode != "idle" and args.attempts > 0:
-            attempts = args.attempts
-        if base.mode in {"download", "udp-download", "http-download"}:
-            attempts = max(attempts, args.latency_attempts)
+        if base.mode != "idle":
+            attempts = throughput_attempts
+        if base.mode in {"download", "udp-download", "http-download", "ws-download"}:
+            attempts = max(attempts, latency_attempts)
         seconds = args.idle_seconds if base.mode == "idle" else args.long_seconds
         scenarios.append(
             Scenario(
@@ -317,21 +423,41 @@ def extract_single_binary(archive_path: pathlib.Path, binary_name: str, out_path
     return out_path
 
 
-def ensure_local_assets(*, sing_version: str) -> dict:
-    current_dir = ROOT / "target" / "x86_64-unknown-linux-musl" / "release"
-    current_server = current_dir / "noders-anytls"
-    current_bench = current_dir / "bench_anytls"
-    if not current_server.exists() or not current_bench.exists():
-        raise RuntimeError("missing local musl build outputs under target/x86_64-unknown-linux-musl/release")
+def create_current_source_archive(out_path: pathlib.Path) -> pathlib.Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(out_path, "w:gz") as archive:
+        archive.add(ROOT / "Cargo.toml", arcname="Cargo.toml")
+        archive.add(ROOT / "Cargo.lock", arcname="Cargo.lock")
+        archive.add(ROOT / "src", arcname="src")
+    return out_path
 
-    baseline_archive = download_file(
-        f"https://github.com/MoeclubM/NodeRS-AnyTLS/releases/download/{RELEASE_BASELINE_TAG}/noders-anytls-{RELEASE_BASELINE_TAG}-linux-amd64-musl.tar.gz",
-        ASSETS / f"noders-anytls-{RELEASE_BASELINE_TAG}-linux-amd64-musl.tar.gz",
+
+def create_tag_source_archive(tag: str, out_path: pathlib.Path) -> pathlib.Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "archive",
+            "--format=tar.gz",
+            "-o",
+            str(out_path),
+            tag,
+            "Cargo.toml",
+            "Cargo.lock",
+            "src",
+        ],
+        check=True,
     )
-    baseline_server = extract_single_binary(
-        baseline_archive,
-        "noders-anytls",
-        ASSETS / f"noders-anytls-{RELEASE_BASELINE_TAG}",
+    return out_path
+
+
+def ensure_local_assets(*, sing_version: str) -> dict:
+    current_source_archive = create_current_source_archive(ASSETS / "noders-anytls-current-source.tar.gz")
+    baseline_source_archive = create_tag_source_archive(
+        RELEASE_BASELINE_TAG,
+        ASSETS / f"noders-anytls-{RELEASE_BASELINE_TAG}-source.tar.gz",
     )
 
     requested = sing_version
@@ -357,18 +483,28 @@ def ensure_local_assets(*, sing_version: str) -> dict:
             sing_binary = extract_single_binary(archive, "sing-box", ASSETS / f"sing-box-{sing_tag}")
     else:
         tag = requested if requested.startswith("v") else f"v{requested}"
-        archive_name = f"sing-box-{tag}-linux-amd64.tar.gz"
-        archive = download_file(
-            f"https://github.com/SagerNet/sing-box/releases/download/{tag}/{archive_name}",
-            ASSETS / archive_name,
-        )
         sing_tag = tag
-        sing_binary = extract_single_binary(archive, "sing-box", ASSETS / f"sing-box-{sing_tag}")
+        sing_binary = ASSETS / f"sing-box-{sing_tag}"
+        if not sing_binary.exists():
+            release = github_json(
+                f"https://api.github.com/repos/SagerNet/sing-box/releases/tags/{tag}"
+            )
+            asset = next(
+                (
+                    item
+                    for item in release.get("assets", [])
+                    if item["name"].endswith("linux-amd64.tar.gz") and "with-pgo" not in item["name"]
+                ),
+                None,
+            )
+            if asset is None:
+                raise RuntimeError(f"linux-amd64 sing-box asset not found in {tag}")
+            archive = download_file(asset["browser_download_url"], ASSETS / asset["name"])
+            sing_binary = extract_single_binary(archive, "sing-box", sing_binary)
 
     return {
-        "current_server": current_server,
-        "bench": current_bench,
-        "baseline_server": baseline_server,
+        "current_source_archive": current_source_archive,
+        "baseline_source_archive": baseline_source_archive,
         "sing": sing_binary,
         "sing_tag": sing_tag,
         "compare_script": ROOT / "scripts" / "benchmark_compare_socks.py",
@@ -538,6 +674,33 @@ def put_file(sftp: paramiko.SFTPClient, local_path: pathlib.Path, remote_path: s
             with contextlib.suppress(IOError):
                 sftp.remove(remote_path)
             time.sleep(0.5)
+    assert last_error is not None
+    raise last_error
+
+
+def get_file_retry(
+    ssh: paramiko.SSHClient,
+    *,
+    remote_path: str,
+    local_path: pathlib.Path,
+) -> None:
+    last_error: Exception | None = None
+    for attempt in range(4):
+        sftp = None
+        try:
+            sftp = open_sftp_retry(ssh)
+            sftp.get(remote_path, str(local_path))
+            return
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+            last_error = error
+            if attempt == 3:
+                raise RuntimeError(f"failed to download remote file {remote_path} -> {local_path}") from error
+            reconnect_ssh(ssh)
+            time.sleep(min(1.5 * (attempt + 1), 5.0))
+        finally:
+            if sftp is not None:
+                with contextlib.suppress(Exception):
+                    sftp.close()
     assert last_error is not None
     raise last_error
 
@@ -961,7 +1124,10 @@ def run_compare(
         cmd.extend(["--curve-file", remote_curve, "--sample-interval", str(SAMPLE_INTERVAL)])
     shell_cmd = "set -o pipefail; " + " ".join(shlex.quote(part) for part in cmd) + f" | tee {shlex.quote(remote_stdout)}"
     shell_cmd = wrap_exec(shell_cmd, exec_prefix=exec_prefix)
-    compare_timeout = max(30, int(scenario.seconds + (scenario.warmup_seconds or 0) + 25))
+    # benchmark_compare_socks keeps worker threads around for up to `seconds + 30` while they drain
+    # lingering reads. Leave extra headroom here so weak-link download runs do not get killed after
+    # finishing measurement but before they print the final JSON summary.
+    compare_timeout = max(45, int(scenario.seconds + (scenario.warmup_seconds or 0) + 40))
     try:
         code, stdout_text, stderr_text = run(client_ssh, shell_cmd, timeout=compare_timeout, check=False)
     except TimeoutError as error:
@@ -1011,15 +1177,11 @@ def run_compare(
     curve_summary = None
     curve_local = None
     client_ssh = ensure_ssh_active(client_ssh, host=client_host, username=username, password=password)
-    sftp = open_sftp_retry(client_ssh)
-    try:
-        if remote_curve and code == 0 and metrics.get("status") != "fail":
-            curve_local = local_run / pathlib.Path(remote_curve).name
-            sftp.get(remote_curve, str(curve_local))
-            curve_data = json.loads(curve_local.read_text(encoding="utf-8"))
-            curve_summary = summarize_curve(curve_data.get("samples", []))
-    finally:
-        sftp.close()
+    if remote_curve and code == 0 and metrics.get("status") != "fail":
+        curve_local = local_run / pathlib.Path(remote_curve).name
+        get_file_retry(client_ssh, remote_path=remote_curve, local_path=curve_local)
+        curve_data = json.loads(curve_local.read_text(encoding="utf-8"))
+        curve_summary = summarize_curve(curve_data.get("samples", []))
     return metrics, curve_summary, stdout_local, curve_local
 
 
@@ -1104,10 +1266,19 @@ def install_remote_layout(
     server_sftp = open_sftp_retry(server_ssh)
     client_sftp = open_sftp_retry(client_ssh)
     try:
-        put_file(server_sftp, pathlib.Path(assets["current_server"]), f"{server_root}/bin/noders-anytls-current")
-        put_file(server_sftp, pathlib.Path(assets["baseline_server"]), f"{server_root}/bin/noders-anytls-baseline")
+        put_file(
+            server_sftp,
+            pathlib.Path(assets["current_source_archive"]),
+            f"{server_root}/run/current-source.tar.gz",
+            0o644,
+        )
+        put_file(
+            server_sftp,
+            pathlib.Path(assets["baseline_source_archive"]),
+            f"{server_root}/run/baseline-source.tar.gz",
+            0o644,
+        )
         put_file(server_sftp, pathlib.Path(assets["sing"]), f"{server_root}/bin/sing-box")
-        put_file(server_sftp, pathlib.Path(assets["bench"]), f"{server_root}/bin/bench_anytls")
 
         put_file(client_sftp, pathlib.Path(assets["sing"]), f"{client_root}/bin/sing-box")
         put_file(client_sftp, pathlib.Path(assets["compare_script"]), f"{client_root}/bin/benchmark_compare_socks.py")
@@ -1174,36 +1345,137 @@ httpd.serve_forever()
 
         http_target = """#!/usr/bin/env python3
 import argparse
+import base64
+import hashlib
+import socket
+import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--listen', required=True)
 args = parser.parse_args()
 host, port = args.listen.rsplit(':', 1)
 
+def websocket_accept(key):
+    digest = hashlib.sha1((key + WS_GUID).encode('ascii')).digest()
+    return base64.b64encode(digest).decode('ascii')
+
+def websocket_frame(payload):
+    header = bytearray([0x82])
+    length = len(payload)
+    if length < 126:
+        header.append(length)
+    elif length <= 0xFFFF:
+        header.append(126)
+        header.extend(struct.pack('!H', length))
+    else:
+        header.append(127)
+        header.extend(struct.pack('!Q', length))
+    return bytes(header) + payload
+
+def recv_exact(sock, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise EOFError('unexpected EOF')
+        data.extend(chunk)
+    return bytes(data)
+
+def recv_websocket_frame(sock):
+    head = recv_exact(sock, 2)
+    opcode = head[0] & 0x0F
+    masked = (head[1] & 0x80) != 0
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack('!H', recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack('!Q', recv_exact(sock, 8))[0]
+    if masked:
+        recv_exact(sock, 4)
+    if length:
+        recv_exact(sock, length)
+    return opcode
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
     def log_message(self, fmt, *args):
         return
+
+    def _ws_chunk_size(self, parsed):
+        qs = parse_qs(parsed.query)
+        return max(256, min(int(qs.get('chunk_size', ['32768'])[0]), 65536))
+
+    def _upgrade_websocket(self):
+        if self.headers.get('Upgrade', '').lower() != 'websocket':
+            self.send_error(400)
+            return None
+        key = self.headers.get('Sec-WebSocket-Key')
+        if not key:
+            self.send_error(400)
+            return None
+        self.send_response_only(101, 'Switching Protocols')
+        self.send_header('Upgrade', 'websocket')
+        self.send_header('Connection', 'Upgrade')
+        self.send_header('Sec-WebSocket-Accept', websocket_accept(key))
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        self.connection.settimeout(10.0)
+        return self.connection
+
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path != '/download':
-            self.send_error(404)
+        if parsed.path == '/download':
+            chunk_size = self._ws_chunk_size(parsed)
+            payload = b'\\0' * chunk_size
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
             return
-        qs = parse_qs(parsed.query)
-        chunk_size = max(256, min(int(qs.get('chunk_size', ['32768'])[0]), 65536))
-        payload = b'\\0' * chunk_size
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/octet-stream')
-        self.send_header('Connection', 'close')
-        self.end_headers()
-        try:
-            while True:
-                self.wfile.write(payload)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        if parsed.path == '/ws-download':
+            conn = self._upgrade_websocket()
+            if conn is None:
+                return
+            frame = websocket_frame(b'\\0' * self._ws_chunk_size(parsed))
+            try:
+                while True:
+                    conn.sendall(frame)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                return
             return
+        if parsed.path == '/ws-upload':
+            conn = self._upgrade_websocket()
+            if conn is None:
+                return
+            try:
+                while True:
+                    opcode = recv_websocket_frame(conn)
+                    if opcode == 0x8:
+                        conn.sendall(b'\\x88\\x00')
+                        return
+                    if opcode == 0x9:
+                        conn.sendall(b'\\x8a\\x00')
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, EOFError, OSError):
+                return
+            return
+        self.send_error(404)
+
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path != '/upload':
@@ -1242,6 +1514,31 @@ httpd.serve_forever()
     finally:
         server_sftp.close()
         client_sftp.close()
+
+
+def build_remote_binaries(server_ssh: paramiko.SSHClient, *, server_root: str) -> None:
+    cmd = f"""
+set -e
+rm -rf {shlex.quote(server_root)}/build/current {shlex.quote(server_root)}/build/baseline
+mkdir -p {shlex.quote(server_root)}/build/current {shlex.quote(server_root)}/build/baseline {shlex.quote(server_root)}/bin
+tar -xzf {shlex.quote(server_root)}/run/current-source.tar.gz -C {shlex.quote(server_root)}/build/current
+tar -xzf {shlex.quote(server_root)}/run/baseline-source.tar.gz -C {shlex.quote(server_root)}/build/baseline
+
+cd {shlex.quote(server_root)}/build/current
+cargo build --release --locked --bin noders-anytls --bin bench_anytls
+cp target/release/noders-anytls {shlex.quote(server_root)}/bin/noders-anytls-current
+cp target/release/bench_anytls {shlex.quote(server_root)}/bin/bench_anytls
+
+cd {shlex.quote(server_root)}/build/baseline
+cargo build --release --locked --bin noders-anytls --bin bench_anytls
+cp target/release/noders-anytls {shlex.quote(server_root)}/bin/noders-anytls-baseline
+
+chmod +x \
+  {shlex.quote(server_root)}/bin/noders-anytls-current \
+  {shlex.quote(server_root)}/bin/noders-anytls-baseline \
+  {shlex.quote(server_root)}/bin/bench_anytls
+"""
+    run(server_ssh, cmd, timeout=3600)
 
 
 TARGET_SERVICE_SPECS = {
@@ -1353,10 +1650,13 @@ def build_markdown(summary: dict) -> str:
         f"- Current commit: `{summary['current_commit']}`",
         f"- Release baseline: `{summary['release_baseline']}`",
         f"- SingBox: `{summary['sing_box_version']}`",
+        f"- Scenario suite: `{summary['scenario_suite']}`",
         f"- Padding profile: `{summary['padding_profile']}`",
         f"- Ping avg: `{summary['ping'].get('avg_ms')} ms` packet loss `{summary['ping'].get('packet_loss')}`",
         "",
     ]
+    if summary.get("scenario_suite_note"):
+        lines.extend([f"- Scope note: {summary['scenario_suite_note']}", ""])
     for row in summary["scenario_rows"]:
         lines.extend(
             [
@@ -1483,18 +1783,31 @@ def collect_remote_artifacts(
     local_dir: pathlib.Path,
     run_id: str,
 ) -> None:
-    sftp = open_sftp_retry(ssh)
     local_dir.mkdir(parents=True, exist_ok=True)
-    try:
+    for attempt in range(4):
+        sftp = None
         try:
+            sftp = open_sftp_retry(ssh)
             for entry in sftp.listdir_attr(f"{root}/results"):
                 if run_id not in entry.filename:
                     continue
-                sftp.get(f"{root}/results/{entry.filename}", str(local_dir / entry.filename))
+                get_file_retry(
+                    ssh,
+                    remote_path=f"{root}/results/{entry.filename}",
+                    local_path=local_dir / entry.filename,
+                )
+            return
         except IOError:
-            pass
-    finally:
-        sftp.close()
+            return
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException):
+            if attempt == 3:
+                raise
+            reconnect_ssh(ssh)
+            time.sleep(min(1.5 * (attempt + 1), 5.0))
+        finally:
+            if sftp is not None:
+                with contextlib.suppress(Exception):
+                    sftp.close()
 
 
 def main() -> None:
@@ -1522,6 +1835,7 @@ def main() -> None:
     assert client_host is not None
     client_ip = socket.gethostbyname(client_host)
 
+    scenario_suite = effective_suite(args)
     summary = {
         "run_id": run_id,
         "mode": args.mode,
@@ -1533,6 +1847,8 @@ def main() -> None:
         "current_commit": current_commit(),
         "release_baseline": RELEASE_BASELINE_TAG,
         "sing_box_version": assets["sing_tag"],
+        "scenario_suite": scenario_suite,
+        "scenario_suite_note": None if scenario_suite == "custom" else scenario_suite_note(scenario_suite),
         "padding_profile": args.padding_profile,
         "padding_scheme": padding_scheme_for_profile(args.padding_profile),
         "ports": PORTS,
@@ -1556,6 +1872,8 @@ def main() -> None:
             server_name=server_name,
             padding_profile=args.padding_profile,
         )
+        print("[phase] build current and baseline on server", flush=True)
+        build_remote_binaries(server_ssh, server_root=server_root)
         print("[phase] prepare remote servers", flush=True)
         prepare_servers(server_ssh, server_root=server_root, server_name=server_name)
 

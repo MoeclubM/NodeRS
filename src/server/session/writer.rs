@@ -83,7 +83,7 @@ impl FrameWriter {
         if payload_len <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
             if let Ok(mut writer) = self.inner.try_lock() {
                 write_compact_frame(&mut *writer, &header, payload).await?;
-                self.flush_after_write(&mut *writer, cmd, payload_len)
+                self.flush_after_write(&mut *writer, cmd, payload_len, !allow_queue)
                     .await?;
                 return Ok(());
             }
@@ -95,12 +95,15 @@ impl FrameWriter {
 
             let mut writer = self.inner.lock().await;
             write_compact_frame(&mut *writer, &header, payload).await?;
-            return self.flush_after_write(&mut *writer, cmd, payload_len).await;
+            return self
+                .flush_after_write(&mut *writer, cmd, payload_len, !allow_queue)
+                .await;
         }
 
         let mut writer = self.inner.lock().await;
         write_frame_parts(&mut *writer, &header, payload).await?;
-        self.flush_after_write(&mut *writer, cmd, payload_len).await
+        self.flush_after_write(&mut *writer, cmd, payload_len, !allow_queue)
+            .await
     }
 
     #[cfg(target_env = "musl")]
@@ -157,7 +160,9 @@ impl FrameWriter {
                 .write_all(&buffer[..7 + payload_len])
                 .await
                 .context("write prefixed session frame")?;
-            return self.flush_after_write(&mut *writer, cmd, payload_len).await;
+            return self
+                .flush_after_write(&mut *writer, cmd, payload_len, !allow_queue)
+                .await;
         }
         if allow_queue && payload_len >= 32 * 1024 {
             return self
@@ -169,7 +174,8 @@ impl FrameWriter {
             .write_all(&buffer[..7 + payload_len])
             .await
             .context("write prefixed session frame")?;
-        self.flush_after_write(&mut *writer, cmd, payload_len).await
+        self.flush_after_write(&mut *writer, cmd, payload_len, !allow_queue)
+            .await
     }
 
     async fn enqueue_compact_frame(
@@ -231,6 +237,7 @@ impl FrameWriter {
         writer: &mut W,
         cmd: u8,
         payload_len: usize,
+        force_flush: bool,
     ) -> anyhow::Result<()>
     where
         W: AsyncWrite + Unpin,
@@ -245,7 +252,7 @@ impl FrameWriter {
             PendingDrain::None => false,
             PendingDrain::Drained { needs_flush } => needs_flush,
         };
-        if should_flush_frame(cmd, payload_len) || pending_needs_flush {
+        if should_flush_after_write(cmd, payload_len, force_flush, pending_needs_flush) {
             writer.flush().await.context("flush session frame")?;
         }
         Ok(())
@@ -348,6 +355,15 @@ fn compact_contention_strategy(cmd: u8, payload_len: usize) -> CompactContention
     } else {
         CompactContentionStrategy::Inline
     }
+}
+
+fn should_flush_after_write(
+    cmd: u8,
+    payload_len: usize,
+    force_flush: bool,
+    pending_needs_flush: bool,
+) -> bool {
+    force_flush || should_flush_frame(cmd, payload_len) || pending_needs_flush
 }
 
 fn enqueue_pending_compact_frame(
@@ -853,5 +869,12 @@ mod tests {
             compact_contention_strategy(super::super::frame::CMD_FIN, 0),
             CompactContentionStrategy::Inline
         );
+    }
+
+    #[test]
+    fn immediate_large_psh_forces_flush() {
+        assert!(should_flush_after_write(CMD_PSH, 32 * 1024, true, false));
+        assert!(!should_flush_after_write(CMD_PSH, 32 * 1024, false, false));
+        assert!(should_flush_after_write(CMD_PSH, 32 * 1024, false, true));
     }
 }
