@@ -325,6 +325,9 @@ impl Session {
 
             if let Err(error) = outcome {
                 warn!(%error, stream_id, "AnyTLS stream handler failed");
+                if !control.is_cancelled() {
+                    let _ = write_frame(&writer, CMD_FIN, stream_id, &[]).await;
+                }
             }
         });
 
@@ -567,7 +570,10 @@ async fn forward_buffered_inbound_payload(
     // re-slicing the payload under pressure. Our frame size is already capped to u16::MAX,
     // so forwarding the pooled buffer as a single unit avoids extra copies and fragmentation.
     match inbound.try_send_data(payload) {
-        Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+        Ok(()) => Ok(()),
+        Err(channel::TrySendError::Closed) => Err(anyhow!(
+            "inbound channel closed before data could be delivered"
+        )),
         Err(channel::TrySendError::Full(payload)) => {
             if payload.len() <= BACKPRESSURED_FORWARD_SEGMENT_LEN {
                 return tokio::select! {
@@ -594,7 +600,12 @@ async fn forward_buffered_inbound_payload(
                         return Ok(());
                     }
                     match inbound.try_send_data(payload) {
-                        Ok(()) | Err(channel::TrySendError::Closed) => return Ok(()),
+                        Ok(()) => return Ok(()),
+                        Err(channel::TrySendError::Closed) => {
+                            return Err(anyhow!(
+                                "inbound channel closed before data could be delivered"
+                            ));
+                        }
                         Err(channel::TrySendError::Full(next_payload)) => {
                             payload = next_payload;
                             if tokio::time::Instant::now() >= deadline {
@@ -652,7 +663,12 @@ async fn forward_backpressured_inbound_payload(
             let mut buffered_segment = payload_pool.take(segment.len());
             buffered_segment.extend_from_slice(segment);
             match inbound.try_send_data(buffered_segment) {
-                Ok(()) | Err(channel::TrySendError::Closed) => {}
+                Ok(()) => {}
+                Err(channel::TrySendError::Closed) => {
+                    return Err(anyhow!(
+                        "inbound channel closed before data could be delivered"
+                    ));
+                }
                 Err(channel::TrySendError::Full(segment)) => {
                     tokio::select! {
                         _ = control.cancelled() => return Ok(()),
@@ -667,7 +683,12 @@ async fn forward_backpressured_inbound_payload(
     for segment in bytes.chunks(segment_len) {
         let segment = PayloadBuffer::new(segment.to_vec());
         match inbound.try_send_data(segment) {
-            Ok(()) | Err(channel::TrySendError::Closed) => {}
+            Ok(()) => {}
+            Err(channel::TrySendError::Closed) => {
+                return Err(anyhow!(
+                    "inbound channel closed before data could be delivered"
+                ));
+            }
             Err(channel::TrySendError::Full(segment)) => {
                 tokio::select! {
                     _ = control.cancelled() => return Ok(()),
@@ -941,8 +962,9 @@ mod tests {
     };
     use super::{
         BACKPRESSURED_FORWARD_SEGMENT_LEN, SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN,
-        forward_buffered_inbound_payload, forward_inbound_payload_to_channel,
-        prefetch_remote_download_with_grace, read_exact_payload,
+        forward_backpressured_inbound_payload, forward_buffered_inbound_payload,
+        forward_inbound_payload_to_channel, prefetch_remote_download_with_grace,
+        read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
@@ -1462,6 +1484,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_inbound_channel_surfaces_error_for_whole_payload_forwarding() {
+        let payload_len = 48 * 1024;
+        let (inbound, rx) = bounded_inbound_channel(8, payload_len * 2);
+        let control = SessionControl::new();
+        let payload = PayloadBuffer::new(vec![7u8; payload_len]);
+        drop(rx);
+
+        let error = forward_buffered_inbound_payload(&inbound, control, payload, false, None)
+            .await
+            .expect_err("closed inbound channel should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("inbound channel closed before data could be delivered")
+        );
+    }
+
+    #[tokio::test]
     async fn large_inbound_payload_keeps_whole_when_queue_has_budget() {
         let payload_len = BACKPRESSURED_FORWARD_SEGMENT_LEN + (16 * 1024);
         let (inbound, mut rx) = bounded_inbound_channel(8, payload_len * 2);
@@ -1550,6 +1590,51 @@ mod tests {
             .await
             .expect("join forward task")
             .expect("forward inbound payload");
+    }
+
+    #[tokio::test]
+    async fn closed_inbound_channel_surfaces_error_mid_segmented_forwarding() {
+        let payload_len = SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN * 2;
+        let (inbound, mut rx) =
+            bounded_inbound_channel(8, SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        let control = SessionControl::new();
+        let payload = PayloadBuffer::new(vec![7u8; payload_len]);
+
+        let forward_task = tokio::spawn({
+            let inbound = inbound.clone();
+            let control = control.clone();
+            async move {
+                forward_backpressured_inbound_payload(
+                    &inbound,
+                    control,
+                    payload,
+                    SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN,
+                    None,
+                )
+                .await
+            }
+        });
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("first segment should arrive")
+            .expect("first inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected first data payload");
+        };
+        assert_eq!(first.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        drop(first);
+        drop(rx);
+
+        let error = forward_task
+            .await
+            .expect("join forward task")
+            .expect_err("closed inbound channel should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("inbound channel closed before data could be delivered")
+        );
     }
 
     #[tokio::test]
