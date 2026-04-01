@@ -145,7 +145,7 @@ def curve_cases(cases: list[Case]) -> list[Case]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current NodeRS, release baseline, and sing-box on Linux.")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--target", default="x86_64-unknown-linux-musl")
+    parser.add_argument("--target", default="x86_64-unknown-linux-gnu")
     parser.add_argument(
         "--compare-count",
         type=int,

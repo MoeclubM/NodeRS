@@ -24,7 +24,7 @@ pub(super) const SMALL_DOWNLOAD_COALESCE_WAIT: std::time::Duration =
 #[cfg(target_env = "musl")]
 pub(super) const MUSL_LARGE_DOWNLOAD_COALESCE_SPAN: usize = 24 * 1024;
 pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
-pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 192 * 1024;
+pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 256 * 1024;
 pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
 #[cfg(target_env = "musl")]
 pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 80;
@@ -35,7 +35,10 @@ pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
-pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 1024 * 1024;
+// This queue doubles as the effective upload window between the AnyTLS session and the
+// outbound socket. Weak-link uploads stall early when this window is too tight because
+// whole-frame forwarding falls into backpressure retries far more often than the socket itself.
+pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PayloadTier {
