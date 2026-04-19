@@ -118,13 +118,6 @@ impl EffectiveTlsConfig {
                     .cert_config
                     .as_ref()
                     .context("Xboard cert_config is required for ACME certificate mode")?;
-                let cert_path = cert_config.cert_path.trim();
-                let key_path = cert_config.key_path.trim();
-                if cert_path.is_empty() || key_path.is_empty() {
-                    anyhow::bail!(
-                        "Xboard cert_config acme mode must include cert_path and key_path"
-                    );
-                }
                 let domain = if !cert_config.domain().is_empty() {
                     cert_config.domain().to_string()
                 } else if !remote.server_name.trim().is_empty() {
@@ -136,15 +129,43 @@ impl EffectiveTlsConfig {
                         "Xboard cert_config acme mode must include domain or server_name"
                     );
                 };
+                let cert_path = if cert_config.cert_path.trim().is_empty() {
+                    let storage_name: String = domain
+                        .chars()
+                        .map(|ch| {
+                            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                                ch
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect();
+                    let storage_name = if storage_name.is_empty() {
+                        "default"
+                    } else {
+                        storage_name.as_str()
+                    };
+                    PathBuf::from(format!("acme/{storage_name}/fullchain.pem"))
+                } else {
+                    cert_config.cert_path.trim().into()
+                };
+                let key_path = if cert_config.key_path.trim().is_empty() {
+                    cert_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("acme"))
+                        .join("privkey.pem")
+                } else {
+                    cert_config.key_path.trim().into()
+                };
                 let account_key_path = if !cert_config.account_key_path().is_empty() {
                     cert_config.account_key_path().into()
                 } else {
-                    PathBuf::from(cert_path).with_extension("account.pem")
+                    cert_path.with_extension("account.pem")
                 };
                 Ok(Self {
                     source: tls::TlsMaterialSource::Acme {
-                        cert_path: cert_path.into(),
-                        key_path: key_path.into(),
+                        cert_path,
+                        key_path,
                         directory_url: cert_config.directory_url().to_string(),
                         email: cert_config.email().to_string(),
                         domain,
@@ -516,8 +537,6 @@ mod tests {
             custom_routes: Vec::new(),
             cert_config: Some(crate::panel::CertConfig {
                 cert_mode: "http".to_string(),
-                cert_path: "/var/lib/noders/anytls/node.example.com/fullchain.pem".to_string(),
-                key_path: "/var/lib/noders/anytls/node.example.com/privkey.pem".to_string(),
                 email: "ops@example.com".to_string(),
                 ..Default::default()
             }),
@@ -525,10 +544,25 @@ mod tests {
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("http cert mode");
-        assert!(matches!(
-            effective.tls.source,
-            tls::TlsMaterialSource::Acme { .. }
-        ));
+        match effective.tls.source {
+            tls::TlsMaterialSource::Acme {
+                cert_path,
+                key_path,
+                account_key_path,
+                ..
+            } => {
+                assert_eq!(
+                    cert_path,
+                    PathBuf::from("acme/node.example.com/fullchain.pem")
+                );
+                assert_eq!(key_path, PathBuf::from("acme/node.example.com/privkey.pem"));
+                assert_eq!(
+                    account_key_path,
+                    PathBuf::from("acme/node.example.com/fullchain.account.pem")
+                );
+            }
+            _ => unreachable!("expected ACME TLS source"),
+        }
     }
 
     #[test]

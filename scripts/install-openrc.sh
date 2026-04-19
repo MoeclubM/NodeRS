@@ -58,8 +58,8 @@ Options:
   --state-dir <path>          Working directory, default: /var/lib/noders/anytls
   --api <url>                 Xboard API address
   --key <token>               Xboard machine key
-  --machine-id <id>           Xboard machine id
-  --machine <url> <key> <id>  Add one Xboard machine triplet; may be repeated
+  --machine-id <id>           Xboard machine id; with --uninstall it removes all local instances for that machine id
+  --machine <url> <key> <id>  Add one Xboard machine triplet; may be repeated; with --uninstall it removes the exact instance
   --uninstall                 Remove installed service(s), binary, and related files
   --all                       Used with --uninstall to remove all nodes and all data
   --no-service                Skip OpenRC service installation
@@ -67,7 +67,7 @@ Options:
 
 Examples:
   bash install-openrc.sh --api https://api.example.com --key token --machine-id 1
-  bash install-openrc.sh --machine https://api.example.com tokenA 1 --machine https://api.example.com tokenB 2
+  bash install-openrc.sh --machine https://secapi.example.com tokenA 10 --machine https://api.example.com tokenB 10
   bash install-openrc.sh --api https://api.example.com --key token --machine-id 171 --uninstall
   bash install-openrc.sh --uninstall --all
 EOF
@@ -288,7 +288,7 @@ render_service_file() {
 }
 
 install_service() {
-  local service_user service_group spec machine_id config_path service_path service_unit
+  local service_user service_group spec panel_api machine_id instance_id config_path service_path service_unit
 
   [[ "$NO_SERVICE" -eq 0 ]] || return 0
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -304,14 +304,16 @@ install_service() {
   chown -R "$service_user":"$service_group" "$STATE_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"
 
   for spec in "${XBOARD_SPECS[@]}"; do
-    IFS='|' read -r _ _ machine_id <<<"$spec"
-    config_path="$(node_config_path "$machine_id")"
-    service_path="$(node_service_path "$machine_id")"
-    service_unit="${SERVICE_NAME}-${machine_id}"
+    IFS='|' read -r panel_api _ machine_id <<<"$spec"
+    instance_id="$(machine_instance_id "$panel_api" "$machine_id")"
+    config_path="$(node_config_path "$instance_id")"
+    service_path="$(node_service_path "$instance_id")"
+    service_unit="${SERVICE_NAME}-${instance_id}"
+    stop_disable_unit "${SERVICE_NAME}-${machine_id}"
     if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
       stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
     fi
-    render_service_file "$service_path" "$machine_id" "$config_path" "$service_user" "$service_group"
+    render_service_file "$service_path" "$instance_id" "$config_path" "$service_user" "$service_group"
     INSTALLED_SERVICES+=("$service_unit")
   done
 
@@ -351,18 +353,58 @@ remove_service_account() {
 }
 
 remove_single_node() {
-  local machine_id config_path unit_name log_path pid_path
-  machine_id="$1"
-  config_path="$(node_config_path "$machine_id")"
-  unit_name="${SERVICE_NAME}-${machine_id}"
-  log_path="$(node_service_log_path "$machine_id")"
-  pid_path="$(node_service_pid_path "$machine_id")"
+  local instance_id machine_id config_path unit_name log_path pid_path
+  instance_id="$1"
+  machine_id="${2:-}"
+  config_path="$(node_config_path "$instance_id")"
+  unit_name="${SERVICE_NAME}-${instance_id}"
+  log_path="$(node_service_log_path "$instance_id")"
+  pid_path="$(node_service_pid_path "$instance_id")"
 
   stop_disable_unit "$unit_name"
-  if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
-    stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+  if [[ -n "$machine_id" ]]; then
+    stop_disable_unit "${SERVICE_NAME}-${machine_id}"
+    if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
+      stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+    fi
+    rm -f "$(legacy_node_config_path "$machine_id")"
   fi
   rm -f "$config_path" "$log_path" "$pid_path"
+}
+
+remove_machine_instances() {
+  local machine_id unit_path unit_name config_path log_path pid_path
+  machine_id="$1"
+
+  shopt -s nullglob
+  for unit_path in \
+    "${OPENRC_DIR%/}/${SERVICE_NAME}-${machine_id}" \
+    "${OPENRC_DIR%/}/${SERVICE_NAME}-${machine_id}-"* \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-${machine_id}" \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-${machine_id}-"*; do
+    [[ -e "$unit_path" ]] || continue
+    unit_name="$(basename "$unit_path")"
+    stop_disable_unit "$unit_name"
+  done
+  shopt -u nullglob
+
+  rm -f "$(legacy_node_config_path "$machine_id")"
+  shopt -s nullglob
+  for config_path in "${CONFIG_DIR%/}/machines/${machine_id}-"*.toml; do
+    rm -f "$config_path"
+  done
+  for log_path in "${LOG_DIR%/}/${SERVICE_NAME}-${machine_id}-"*.log; do
+    rm -f "$log_path"
+  done
+  for pid_path in "${RUN_DIR%/}/${SERVICE_NAME}-${machine_id}-"*.pid; do
+    rm -f "$pid_path"
+  done
+  shopt -u nullglob
+  rm -f \
+    "${LOG_DIR%/}/${SERVICE_NAME}-${machine_id}.log" \
+    "${RUN_DIR%/}/${SERVICE_NAME}-${machine_id}.pid" \
+    "${LOG_DIR%/}/${LEGACY_SERVICE_NAME}-${machine_id}.log" \
+    "${RUN_DIR%/}/${LEGACY_SERVICE_NAME}-${machine_id}.pid"
 }
 
 remove_all_nodes() {
@@ -381,17 +423,36 @@ remove_all_nodes() {
 }
 
 uninstall() {
+  local spec panel_api machine_id instance_id skip_machine_id spec_machine_id
   require_linux
 
-  if [[ "$REMOVE_ALL" -eq 1 || ${#TARGET_MACHINE_IDS[@]} -eq 0 ]]; then
+  if [[ "$REMOVE_ALL" -eq 1 || (${#TARGET_MACHINE_IDS[@]} -eq 0 && ${#XBOARD_SPECS[@]} -eq 0) ]]; then
     remove_all_nodes
     echo "Removed all NodeRS machine instances, configs, OpenRC services, logs, and binary."
     return
   fi
 
+  for spec in "${XBOARD_SPECS[@]}"; do
+    IFS='|' read -r panel_api _ machine_id <<<"$spec"
+    instance_id="$(machine_instance_id "$panel_api" "$machine_id")"
+    remove_single_node "$instance_id" "$machine_id"
+    echo "Removed machine ${machine_id} instance ${instance_id}."
+  done
+
   for machine_id in "${TARGET_MACHINE_IDS[@]}"; do
-    remove_single_node "$machine_id"
-    echo "Removed machine ${machine_id}."
+    skip_machine_id=0
+    for spec in "${XBOARD_SPECS[@]}"; do
+      IFS='|' read -r _ _ spec_machine_id <<<"$spec"
+      if [[ "$spec_machine_id" == "$machine_id" ]]; then
+        skip_machine_id=1
+        break
+      fi
+    done
+    if [[ "$skip_machine_id" -eq 1 ]]; then
+      continue
+    fi
+    remove_machine_instances "$machine_id"
+    echo "Removed all machine ${machine_id} instances."
   done
 }
 

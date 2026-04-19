@@ -143,7 +143,6 @@ parse_args() {
         ;;
       --machine)
         XBOARD_SPECS+=("$2|$3|$4")
-        TARGET_MACHINE_IDS+=("$4")
         shift 4
         ;;
       --uninstall)
@@ -194,6 +193,18 @@ sed_escape() {
   printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
 }
 
+normalized_panel_api() {
+  printf '%s\n' "${1%/}"
+}
+
+machine_instance_id() {
+  local panel_api machine_id panel_hash
+  panel_api="$(normalized_panel_api "$1")"
+  machine_id="$2"
+  panel_hash="$(printf '%s' "$panel_api" | cksum | awk '{print $1}')"
+  printf '%s-%s\n' "$machine_id" "$panel_hash"
+}
+
 render_config_file() {
   local template_path target_path panel_api panel_key machine_id escaped_api escaped_key escaped_machine_id
   template_path="$1"
@@ -217,6 +228,10 @@ node_config_path() {
   printf '%s\n' "${CONFIG_DIR%/}/machines/${1}.toml"
 }
 
+legacy_node_config_path() {
+  printf '%s\n' "${CONFIG_DIR%/}/machines/${1}.toml"
+}
+
 openrc_node_service_path() {
   printf '%s\n' "${OPENRC_DIR%/}/${SERVICE_NAME}-${1}"
 }
@@ -230,20 +245,20 @@ openrc_node_service_log_path() {
 }
 
 render_openrc_service_file() {
-  local target machine_id config_path service_user service_group pid_path log_path
+  local target instance_id config_path service_user service_group pid_path log_path
   target="$1"
-  machine_id="$2"
+  instance_id="$2"
   config_path="$3"
   service_user="$4"
   service_group="$5"
-  pid_path="$(openrc_node_service_pid_path "$machine_id")"
-  log_path="$(openrc_node_service_log_path "$machine_id")"
+  pid_path="$(openrc_node_service_pid_path "$instance_id")"
+  log_path="$(openrc_node_service_log_path "$instance_id")"
 
   cat > "$target" <<EOF
 #!/sbin/openrc-run
 
-name="${SERVICE_NAME}-${machine_id}"
-description="NodeRS service for machine ${machine_id}"
+name="${SERVICE_NAME}-${instance_id}"
+description="NodeRS service for instance ${instance_id}"
 command="${PREFIX}/bin/noders-anytls"
 command_args="${config_path}"
 command_user="${service_user}:${service_group}"
@@ -269,13 +284,15 @@ EOF
 }
 
 write_xboard_configs() {
-  local staging_dir template_path spec panel_api panel_key machine_id config_path
+  local staging_dir template_path spec panel_api panel_key machine_id instance_id config_path
   staging_dir="$1"
   template_path="$staging_dir/config.example.toml"
 
   for spec in "${XBOARD_SPECS[@]}"; do
     IFS='|' read -r panel_api panel_key machine_id <<<"$spec"
-    config_path="$(node_config_path "$machine_id")"
+    instance_id="$(machine_instance_id "$panel_api" "$machine_id")"
+    rm -f "$(legacy_node_config_path "$machine_id")"
+    config_path="$(node_config_path "$instance_id")"
     render_config_file \
       "$template_path" \
       "$config_path" \
