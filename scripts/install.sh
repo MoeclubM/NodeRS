@@ -56,8 +56,8 @@ Options:
   --state-dir <path>          Working directory, default: /var/lib/noders/anytls
   --api <url>                 Xboard API address
   --key <token>               Xboard machine key
-  --machine-id <id>           Xboard machine id
-  --machine <url> <key> <id>  Add one Xboard machine triplet; may be repeated
+  --machine-id <id>           Xboard machine id; with --uninstall it removes all local instances for that machine id
+  --machine <url> <key> <id>  Add one Xboard machine triplet; may be repeated; with --uninstall it removes the exact instance
   --uninstall                 Remove installed service(s), binary, and related files
   --all                       Used with --uninstall to remove all nodes and all data
   --no-service                Skip service installation
@@ -65,7 +65,7 @@ Options:
 
 Examples:
   bash install.sh --api https://api.example.com --key token --machine-id 1
-  bash install.sh --machine https://api.example.com tokenA 1 --machine https://api.example.com tokenB 2
+  bash install.sh --machine https://secapi.example.com tokenA 10 --machine https://api.example.com tokenB 10
   bash install.sh --api https://api.example.com --key token --machine-id 171 --uninstall
   bash install.sh --uninstall --all
 EOF
@@ -292,7 +292,7 @@ render_service_file() {
 }
 
 install_service() {
-  local staging_dir spec machine_id config_path unit_path service_unit
+  local staging_dir spec panel_api machine_id instance_id config_path unit_path service_unit
   staging_dir="$1"
   [[ "$NO_SERVICE" -eq 0 ]] || return 0
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -310,9 +310,11 @@ install_service() {
   chown -R "$SERVICE_USER":"$SERVICE_USER" "$STATE_DIR" "$CONFIG_DIR"
 
   for spec in "${XBOARD_SPECS[@]}"; do
-    IFS='|' read -r _ _ machine_id <<<"$spec"
-    config_path="$(node_config_path "$machine_id")"
-    service_unit="${SERVICE_NAME}-${machine_id}"
+    IFS='|' read -r panel_api _ machine_id <<<"$spec"
+    instance_id="$(machine_instance_id "$panel_api" "$machine_id")"
+    config_path="$(node_config_path "$instance_id")"
+    service_unit="${SERVICE_NAME}-${instance_id}"
+    stop_disable_unit "${SERVICE_NAME}-${machine_id}"
     if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
       stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
     fi
@@ -338,16 +340,46 @@ stop_disable_unit() {
 }
 
 remove_single_node() {
-  local machine_id config_path unit_name
-  machine_id="$1"
-  config_path="$(node_config_path "$machine_id")"
-  unit_name="${SERVICE_NAME}-${machine_id}"
+  local instance_id machine_id config_path
+  instance_id="$1"
+  machine_id="${2:-}"
+  config_path="$(node_config_path "$instance_id")"
 
-  stop_disable_unit "$unit_name"
-  if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
-    stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+  stop_disable_unit "${SERVICE_NAME}-${instance_id}"
+  if [[ -n "$machine_id" ]]; then
+    stop_disable_unit "${SERVICE_NAME}-${machine_id}"
+    if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
+      stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+    fi
+    rm -f "$(legacy_node_config_path "$machine_id")"
   fi
   rm -f "$config_path"
+}
+
+remove_machine_instances() {
+  local machine_id unit_path unit_name config_path
+  machine_id="$1"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    shopt -s nullglob
+    for unit_path in \
+      /etc/systemd/system/${SERVICE_NAME}-${machine_id}.service \
+      /etc/systemd/system/${SERVICE_NAME}-${machine_id}-*.service \
+      /etc/systemd/system/${LEGACY_SERVICE_NAME}-${machine_id}.service \
+      /etc/systemd/system/${LEGACY_SERVICE_NAME}-${machine_id}-*.service; do
+      [[ -e "$unit_path" ]] || continue
+      unit_name="$(basename "$unit_path" .service)"
+      stop_disable_unit "$unit_name"
+    done
+    shopt -u nullglob
+  fi
+
+  rm -f "$(legacy_node_config_path "$machine_id")"
+  shopt -s nullglob
+  for config_path in "${CONFIG_DIR%/}/machines/${machine_id}-"*.toml; do
+    rm -f "$config_path"
+  done
+  shopt -u nullglob
 }
 
 remove_all_nodes() {
@@ -374,17 +406,36 @@ remove_all_nodes() {
 }
 
 uninstall() {
+  local spec panel_api machine_id instance_id skip_machine_id spec_machine_id
   require_linux
 
-  if [[ "$REMOVE_ALL" -eq 1 || ${#TARGET_MACHINE_IDS[@]} -eq 0 ]]; then
+  if [[ "$REMOVE_ALL" -eq 1 || (${#TARGET_MACHINE_IDS[@]} -eq 0 && ${#XBOARD_SPECS[@]} -eq 0) ]]; then
     remove_all_nodes
     echo "Removed all NodeRS machine instances, configs, services, and binary."
     return
   fi
 
+  for spec in "${XBOARD_SPECS[@]}"; do
+    IFS='|' read -r panel_api _ machine_id <<<"$spec"
+    instance_id="$(machine_instance_id "$panel_api" "$machine_id")"
+    remove_single_node "$instance_id" "$machine_id"
+    echo "Removed machine ${machine_id} instance ${instance_id}."
+  done
+
   for machine_id in "${TARGET_MACHINE_IDS[@]}"; do
-    remove_single_node "$machine_id"
-    echo "Removed machine ${machine_id}."
+    skip_machine_id=0
+    for spec in "${XBOARD_SPECS[@]}"; do
+      IFS='|' read -r _ _ spec_machine_id <<<"$spec"
+      if [[ "$spec_machine_id" == "$machine_id" ]]; then
+        skip_machine_id=1
+        break
+      fi
+    done
+    if [[ "$skip_machine_id" -eq 1 ]]; then
+      continue
+    fi
+    remove_machine_instances "$machine_id"
+    echo "Removed all machine ${machine_id} instances."
   done
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true

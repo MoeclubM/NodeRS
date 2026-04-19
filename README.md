@@ -32,7 +32,8 @@ TLS is no longer read from the local config file.
 - Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, and `http`
 - File or path mode requires `cert_path` and `key_path`
 - Inline or PEM mode requires certificate PEM content and private key PEM content
-- ACME mode requires `cert_path` and `key_path`, and uses `cert_config.domain` or the panel `server_name` as the certificate domain
+- ACME mode uses `cert_config.domain` or the panel `server_name` as the certificate domain
+- If ACME mode does not deliver `cert_path` or `key_path`, NodeRS stores them under `acme/<domain>/fullchain.pem` and `acme/<domain>/privkey.pem` relative to the working directory; in the installed service this resolves under `/var/lib/noders/anytls`
 - Optional ACME fields are `email`, `directory_url` or `directory`, `challenge_listen` or `http01_listen`, `renew_before_days`, and `account_key_path`
 - Any other `cert_mode` fails explicitly during config sync
 
@@ -70,40 +71,42 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/instal
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
-  --machine https://api.example.com machine_key_a 1 \
-  --machine https://api.example.com machine_key_b 2
+  --machine https://secapi.example.com machine_key_a 10 \
+  --machine https://api.example.com machine_key_b 10
 ```
+
+Multiple APIs may reuse the same `machine_id` on one host. NodeRS derives a stable local instance suffix from `api + machine_id`, so config files and service names do not conflict.
 
 ## Runtime Paths
 
 - Project name in documentation: `NodeRS`
 - Binary: `/usr/local/bin/noders-anytls`
 - Config root: `/etc/noders/anytls`
-- Machine config: `/etc/noders/anytls/machines/<machine_id>.toml`
+- Machine config: `/etc/noders/anytls/machines/<machine_id>-<api_hash>.toml`
 - State: `/var/lib/noders/anytls`
-- systemd service: `noders-<machine_id>`
-- OpenRC service: `noders-<machine_id>`
+- systemd service: `noders-<machine_id>-<api_hash>`
+- OpenRC service: `noders-<machine_id>-<api_hash>`
 
 ## Common Operations
 
 ### systemd
 
 ```bash
-systemctl status noders-1 --no-pager -l
-journalctl -u noders-1 -n 100 --no-pager
-journalctl -u noders-1 -f
-systemctl restart noders-1
-systemctl stop noders-1
-systemctl enable noders-1
+systemctl status noders-1-123456789 --no-pager -l
+journalctl -u noders-1-123456789 -n 100 --no-pager
+journalctl -u noders-1-123456789 -f
+systemctl restart noders-1-123456789
+systemctl stop noders-1-123456789
+systemctl enable noders-1-123456789
 ```
 
 ### OpenRC
 
 ```bash
-rc-service noders-1 status
-rc-service noders-1 restart
-tail -n 100 /var/log/noders-anytls/noders-1.log
-tail -f /var/log/noders-anytls/noders-1.log
+rc-service noders-1-123456789 status
+rc-service noders-1-123456789 restart
+tail -n 100 /var/log/noders-anytls/noders-1-123456789.log
+tail -f /var/log/noders-anytls/noders-1-123456789.log
 ```
 
 ## Upgrade
@@ -112,7 +115,7 @@ tail -f /var/log/noders-anytls/noders-1.log
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-If an existing host still uses old `noders-anytls-<machine_id>` units, uninstall and reinstall to switch to the new `noders-<machine_id>` service names.
+If an existing host still uses old `noders-anytls-<machine_id>` or `noders-<machine_id>` units, uninstall and reinstall to switch to the new `noders-<machine_id>-<api_hash>` instance names.
 
 ## Uninstall
 
@@ -123,6 +126,8 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/instal
   --uninstall \
   --machine-id 1
 ```
+
+This removes every local instance whose `machine_id` is `1`. To remove one exact instance when multiple APIs share the same `machine_id`, pass the original `--machine <url> <key> <id>` triplet together with `--uninstall`.
 
 ### Remove everything
 
