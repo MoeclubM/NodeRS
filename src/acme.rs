@@ -18,8 +18,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use crate::config::AcmeConfig;
-
 const ACME_CONTENT_TYPE: &str = "application/jose+json";
 const ACME_JWS_ALGORITHM: &str = "ES256";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -27,17 +25,24 @@ const MAX_POLL_ATTEMPTS: usize = 90;
 const HTTP_BUFFER_SIZE: usize = 8192;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeConfig {
+    pub directory_url: String,
+    pub email: String,
+    pub domain: String,
+    pub challenge_listen: String,
+    pub renew_before_days: u64,
+    pub account_key_path: PathBuf,
+}
+
 pub async fn ensure_certificate(
     config: &AcmeConfig,
     cert_path: &Path,
     key_path: &Path,
 ) -> anyhow::Result<bool> {
-    if !config.enabled {
-        return Ok(false);
-    }
     ensure!(
         !config.domain.trim().is_empty(),
-        "ACME domain must not be empty when ACME is enabled"
+        "ACME domain must not be empty when ACME mode is used"
     );
     if !needs_renewal(cert_path, key_path, config.renew_before_days).await? {
         return Ok(false);

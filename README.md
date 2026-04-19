@@ -1,197 +1,163 @@
-# NodeRS-AnyTLS
+# NodeRS
 
-Pure Rust AnyTLS node for Xboard `UniProxy`.
+NodeRS is a pure Rust Xboard machine-node runtime. This repository currently ships the AnyTLS implementation, so the installed binary, service, and state names remain `noders-anytls`.
+
+## Overview
 
 - Linux only
-- Native Rust AnyTLS + UOT implementation
-- Xboard `config / user / push / alive / alivelist / status` compatible
-- Built-in ACME HTTP-01, TLS hot reload, dual-stack listen
-- Multi-user hot reload and device-limit control
+- Compatible with Xboard `/api/v2/server/*` and `/api/v2/server/machine/*`
+- One local process manages every AnyTLS node assigned to the same Xboard machine
+- Node membership, users, routes, listen address, port, and TLS are supplied by the panel
+- Device-limit control is supported
+- `speed_limit` is intentionally not implemented
 
-## Quick Start
+## Runtime Model
 
-### Before you install
+NodeRS currently runs in Xboard machine mode only.
 
-- `--panel-token` must be the Xboard global `server_token` used by `/api/v1/server/UniProxy/*`
-- `install.sh` is the default entry point on Linux
-- If the host does not provide `systemd` but does provide `OpenRC`, `install.sh` automatically switches to the OpenRC installer
-- `install-openrc.sh` is still available if you want to call the OpenRC installer directly
-- On `glibc` hosts the installer prefers the GNU build; on Alpine, other `musl` hosts, or `glibc < 2.17`, it falls back to the `musl` bundle automatically
+- Local config contains only `panel.api`, `panel.key`, and `panel.machine_id`
+- `panel.key` must be the machine key for the target Xboard machine
+- Node membership comes from `/api/v2/server/machine/nodes`
+- Per-node config and users come from `/api/v2/server/config` and `/api/v2/server/user`
+- Traffic, alive state, and node status are reported through `/api/v2/server/report`
+- Host status is reported through `/api/v2/server/machine/status`
+- WebSocket sync uses the machine connection returned by `/api/v2/server/handshake`
 
-### Install one node
+## TLS Delivery
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1
-```
+TLS is no longer read from the local config file.
 
-What this does:
+- AnyTLS nodes must receive `cert_config` from Xboard
+- `listen_ip`, `server_port`, `server_name`, `tls_settings`, `padding_scheme`, and `routes` are all taken from the panel response
+- Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, and `letsencrypt`
+- File or path mode requires `cert_path` and `key_path`
+- Inline or PEM mode requires certificate PEM content and private key PEM content
+- ACME mode requires `cert_path` and `key_path`, and uses `cert_config.domain` or the panel `server_name` as the certificate domain
+- Optional ACME fields are `email`, `directory_url` or `directory`, `challenge_listen` or `http01_listen`, `renew_before_days`, and `account_key_path`
+- Any other `cert_mode` fails explicitly during config sync
 
-- downloads the matching release package
-- writes config under `/etc/noders/anytls`
-- installs `/usr/local/bin/noders-anytls`
-- creates and starts `noders-anytls-<node_id>`
+## Support Matrix
 
-### Install multiple nodes
+- Supported panel fields: `listen_ip`, `server_port`, `server_name`, `padding_scheme`, `routes`, and `cert_config`
+- Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, or `letsencrypt`
+- Supported `custom_outbounds` types: `direct`, `dns`, and `block`
+- Supported `custom_routes` actions: `outbound`, `reject`, and `block`
+- Supported `custom_routes` match fields: `network`, `protocol`, `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`, `ip_cidr`, `ip_is_private`, `port`, and `port_range`
+- Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`
+- Unsupported `custom_outbounds` types, unsupported `custom_routes` fields or actions, and malformed ECH settings fail explicitly during config sync; they are not ignored silently
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --xboard https://api.example.com server_token 1 \
-  --xboard https://api.example.com server_token 2
-```
+## Migrate Legacy Config
 
-### Install on Alpine / OpenRC / non-systemd hosts
+The installer and release bundle no longer migrate legacy `UniProxy` or node-based configs automatically.
 
-`install.sh` now auto-detects `OpenRC`, so this direct installer is optional.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install-openrc.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1
-```
-
-## TLS Options
-
-### Default: automatic ACME
-
-By default the installer fetches the node `server_name` from Xboard and uses it as the ACME domain.
-
-### Override the certificate domain
-
-If you want to force the certificate domain instead of using the one from Xboard, pass `--server-name`.
+Use `scripts/migrate_config.py` before switching an old deployment to the machine-based version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1 \
-  --server-name node.example.com
+python3 scripts/migrate_config.py /etc/noders/anytls/nodes/1.toml
 ```
 
-### Generate a self-signed certificate
+The script prompts for the new `machine_id`, writes a backup next to the source file, and by default writes the migrated config to `/etc/noders/anytls/machines/<machine_id>.toml`.
 
-If you do not want ACME, pass `--self-signed`. This mode requires `openssl` on the target Linux host.
+You can also run it non-interactively:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1 \
-  --server-name node.example.com \
-  --self-signed
+python3 scripts/migrate_config.py /etc/noders/anytls/nodes/1.toml --machine-id 9
 ```
 
-### Use existing certificate files
+## Install
 
-If you already have a certificate and key, pass both paths. In this mode ACME is disabled.
+### systemd
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1 \
-  --cert-file /etc/ssl/private/fullchain.pem \
-  --key-file /etc/ssl/private/privkey.pem
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
+  --api https://api.example.com \
+  --key machine_key \
+  --machine-id 1
 ```
 
-### Set outbound DNS and IP preference
+### OpenRC
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1 \
-  --dns-resolver 1.1.1.1 \
-  --ip-strategy prefer_ipv6
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install-openrc.sh | bash -s -- \
+  --api https://api.example.com \
+  --key machine_key \
+  --machine-id 1
 ```
 
-## Paths
+### Multiple machine configs on one host
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
+  --machine https://api.example.com machine_key_a 1 \
+  --machine https://api.example.com machine_key_b 2
+```
+
+## Runtime Paths
+
+- Project name in documentation: `NodeRS`
 - Binary: `/usr/local/bin/noders-anytls`
 - Config root: `/etc/noders/anytls`
-- Node config: `/etc/noders/anytls/nodes/<node_id>.toml`
+- Machine config: `/etc/noders/anytls/machines/<machine_id>.toml`
 - State: `/var/lib/noders/anytls`
-- Service: `noders-anytls-<node_id>`
+- systemd service: `noders-anytls-<machine_id>`
+- OpenRC service: `noders-anytls-<machine_id>`
 
 ## Common Operations
 
-### Check systemd service status
+### systemd
 
 ```bash
 systemctl status noders-anytls-1 --no-pager -l
-```
-
-### View systemd logs
-
-```bash
 journalctl -u noders-anytls-1 -n 100 --no-pager
 journalctl -u noders-anytls-1 -f
-```
-
-### Restart or stop a systemd service
-
-```bash
 systemctl restart noders-anytls-1
-systemctl start noders-anytls-1
 systemctl stop noders-anytls-1
-```
-
-### Enable or disable systemd auto start
-
-```bash
 systemctl enable noders-anytls-1
-systemctl disable noders-anytls-1
 ```
 
-### Check generated config
-
-```bash
-cat /etc/noders/anytls/nodes/1.toml
-```
-
-### Check OpenRC status and logs
+### OpenRC
 
 ```bash
 rc-service noders-anytls-1 status
+rc-service noders-anytls-1 restart
 tail -n 100 /var/log/noders-anytls/noders-anytls-1.log
 tail -f /var/log/noders-anytls/noders-anytls-1.log
 ```
 
 ## Upgrade
 
-### Upgrade to latest release
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s --
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-### Upgrade to a specific release
+If you are upgrading from a legacy node-based deployment, migrate the config first with `scripts/migrate_config.py`, then reinstall with the new machine-based installer.
+
+Example migration path:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.27
-```
-
-### Upgrade without restart
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.27 --no-restart
+python3 scripts/migrate_config.py /etc/noders/anytls/nodes/1.toml --machine-id 9
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
+  --api https://api.example.com \
+  --key machine_key \
+  --machine-id 9
 ```
 
 ## Uninstall
 
-### Remove one node
+### Remove one machine instance
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --uninstall --node-id 1
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
+  --uninstall \
+  --machine-id 1
 ```
 
 ### Remove everything
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --uninstall --all
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
+  --uninstall \
+  --all
 ```
 
 ## Local Run
@@ -201,16 +167,8 @@ cp config.example.toml config.toml
 cargo run --offline -- config.toml
 ```
 
-Minimum required fields:
+Required fields:
 
-- `panel.url`
-- `panel.token`
-- `panel.node_id`
-- `tls.cert_path`
-- `tls.key_path`
-
-Common optional fields:
-
-- `[outbound].dns_resolver`
-- `[outbound].ip_strategy`
-- `[tls.acme]`
+- `panel.api`
+- `panel.key`
+- `panel.machine_id`

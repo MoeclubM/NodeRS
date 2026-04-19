@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPOSITORY="MoeclubM/NodeRS-AnyTLS"
+REPOSITORY="MoeclubM/NodeRS"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
@@ -40,8 +40,8 @@ usage() {
   cat <<'EOF'
 Usage: upgrade.sh [options]
 
-Upgrade the installed NodeRS-AnyTLS binary in place.
-Existing node configs, certificates, ACME account files, and state are preserved.
+Upgrade the installed NodeRS binary in place.
+Existing machine configs, certificates, ACME account files, and state are preserved.
 
 Options:
   --version <tag>       Release tag to install, default: latest
@@ -407,7 +407,7 @@ restart_active_units() {
 
   if [[ ${#DISCOVERED_UNITS[@]} -eq 0 ]]; then
     RESTART_STATE="no-services"
-    echo "Binary upgraded; no NodeRS-AnyTLS ${SERVICE_MANAGER} units were found."
+    echo "Binary upgraded; no NodeRS ${SERVICE_MANAGER} units were found."
     return 0
   fi
 
@@ -418,9 +418,9 @@ restart_active_units() {
   if [[ ${#RESTART_TARGET_UNITS[@]} -eq 0 ]]; then
     RESTART_STATE="no-active-services"
     if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
-      echo "Binary upgraded; no enabled or running NodeRS-AnyTLS services needed a restart."
+      echo "Binary upgraded; no enabled or running NodeRS services needed a restart."
     else
-      echo "Binary upgraded; no active NodeRS-AnyTLS services needed a restart."
+      echo "Binary upgraded; no active NodeRS services needed a restart."
     fi
     return 0
   fi
@@ -456,7 +456,7 @@ restart_active_units() {
 print_summary() {
   local unit_name
   cat <<EOF
-Upgraded NodeRS-AnyTLS
+Upgraded NodeRS
   Binary: $PREFIX/bin/noders-anytls
   Config: $CONFIG_DIR
 EOF

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPOSITORY="MoeclubM/NodeRS-AnyTLS"
+REPOSITORY="MoeclubM/NodeRS"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
@@ -10,26 +10,17 @@ STATE_DIR="/var/lib/noders/anytls"
 SERVICE_NAME="noders-anytls"
 SERVICE_USER="noders-anytls"
 VERSION="latest"
-ACME_EMAIL=""
-ACME_CHALLENGE_LISTEN="[::]:80"
-TLS_SERVER_NAME=""
-DNS_RESOLVER="system"
-IP_STRATEGY="system"
-SELF_SIGNED=0
-SELF_SIGNED_DAYS=3650
 NO_SERVICE=0
 UNINSTALL=0
 REMOVE_ALL=0
-CERT_PATH=""
-KEY_PATH=""
-PANEL_URL=""
-PANEL_TOKEN=""
-PANEL_NODE_ID=""
+PANEL_API=""
+PANEL_KEY=""
+PANEL_MACHINE_ID=""
 TMP_ROOT=""
 declare -a XBOARD_SPECS=()
 declare -a GENERATED_CONFIGS=()
 declare -a INSTALLED_SERVICES=()
-declare -a TARGET_NODE_IDS=()
+declare -a TARGET_MACHINE_IDS=()
 
 if [[ -f "$COMMON_LIB_PATH" ]]; then
   # shellcheck source=/dev/null
@@ -55,39 +46,26 @@ Install mode:
   to the OpenRC installer.
 
 Uninstall mode:
-  Pass `--uninstall` to remove one node or the whole installation.
+  Pass `--uninstall` to remove one machine instance or the whole installation.
 
 Options:
   --version <tag>             Release tag to install, default: latest
   --prefix <path>             Binary installation prefix, default: /usr/local
   --config-dir <path>         Config directory, default: /etc/noders/anytls
   --state-dir <path>          Working directory, default: /var/lib/noders/anytls
-  --panel-url <url>           Single-node Xboard API address
-  --panel-token <token>       Single-node Xboard server_token
-  --node-id <id>              Single-node Xboard node id
-  --xboard <url> <token> <id> Add one Xboard node triplet; may be repeated
-  --server-name <fqdn>        Override the certificate domain used for ACME or self-signed TLS
-  --self-signed               Generate a self-signed certificate per node and disable ACME
-  --self-signed-days <days>   Validity for generated self-signed certs, default: 3650
-  --cert-file <path>          Use an existing certificate file and disable ACME
-  --key-file <path>           Use an existing private key file and disable ACME
-  --acme-email <mailbox>      Contact email for ACME account registration
-  --dns-resolver <value>      Outbound DNS: system or a custom nameserver like 1.1.1.1
-  --ip-strategy <value>       Outbound IP order: system, prefer_ipv4, prefer_ipv6
-  --acme-challenge-listen <addr>
-                              HTTP-01 listener address, default: [::]:80
+  --api <url>                 Xboard API address
+  --key <token>               Xboard machine key
+  --machine-id <id>           Xboard machine id
+  --machine <url> <key> <id>  Add one Xboard machine triplet; may be repeated
   --uninstall                 Remove installed service(s), binary, and related files
   --all                       Used with --uninstall to remove all nodes and all data
   --no-service                Skip service installation
   -h, --help                  Show this help message
 
 Examples:
-  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1
-  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --server-name node.example.com
-  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --self-signed --server-name node.example.com
-  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --cert-file /path/fullchain.pem --key-file /path/privkey.pem
-  bash install.sh --xboard https://api.example.com tokenA 1 --xboard https://api.example.com tokenB 2
-  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 171 --uninstall
+  bash install.sh --api https://api.example.com --key token --machine-id 1
+  bash install.sh --machine https://api.example.com tokenA 1 --machine https://api.example.com tokenB 2
+  bash install.sh --api https://api.example.com --key token --machine-id 171 --uninstall
   bash install.sh --uninstall --all
 EOF
 }
@@ -286,7 +264,7 @@ load_common_or_bootstrap() {
 }
 
 ensure_directories() {
-  install -d "$PREFIX/bin" "$CONFIG_DIR" "$STATE_DIR" "$CONFIG_DIR/nodes"
+  install -d "$PREFIX/bin" "$CONFIG_DIR" "$STATE_DIR" "$CONFIG_DIR/machines"
 }
 
 render_service_file() {
@@ -313,7 +291,7 @@ render_service_file() {
 }
 
 install_service() {
-  local staging_dir spec node_id config_path unit_path service_unit
+  local staging_dir spec machine_id config_path unit_path service_unit
   staging_dir="$1"
   [[ "$NO_SERVICE" -eq 0 ]] || return 0
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -331,9 +309,9 @@ install_service() {
   chown -R "$SERVICE_USER":"$SERVICE_USER" "$STATE_DIR" "$CONFIG_DIR"
 
   for spec in "${XBOARD_SPECS[@]}"; do
-    IFS='|' read -r _ _ node_id <<<"$spec"
-    config_path="$(node_config_path "$node_id")"
-    service_unit="${SERVICE_NAME}-${node_id}"
+    IFS='|' read -r _ _ machine_id <<<"$spec"
+    config_path="$(node_config_path "$machine_id")"
+    service_unit="${SERVICE_NAME}-${machine_id}"
     unit_path="/etc/systemd/system/${service_unit}.service"
     render_service_file "$staging_dir" "$unit_path" "$config_path"
     INSTALLED_SERVICES+=("$service_unit")
@@ -356,18 +334,13 @@ stop_disable_unit() {
 }
 
 remove_single_node() {
-  local node_id config_path cert_path key_path account_key_path self_signed_cert_path self_signed_key_path unit_name
-  node_id="$1"
-  config_path="$(node_config_path "$node_id")"
-  cert_path="$(node_cert_path "$node_id")"
-  key_path="$(node_key_path "$node_id")"
-  account_key_path="$(node_account_key_path "$node_id")"
-  self_signed_cert_path="$(node_self_signed_cert_path "$node_id")"
-  self_signed_key_path="$(node_self_signed_key_path "$node_id")"
-  unit_name="${SERVICE_NAME}-${node_id}"
+  local machine_id config_path unit_name
+  machine_id="$1"
+  config_path="$(node_config_path "$machine_id")"
+  unit_name="${SERVICE_NAME}-${machine_id}"
 
   stop_disable_unit "$unit_name"
-  rm -f "$config_path" "$cert_path" "$key_path" "$account_key_path" "$self_signed_cert_path" "$self_signed_key_path"
+  rm -f "$config_path"
 }
 
 remove_all_nodes() {
@@ -392,15 +365,15 @@ remove_all_nodes() {
 uninstall() {
   require_linux
 
-  if [[ "$REMOVE_ALL" -eq 1 || ${#TARGET_NODE_IDS[@]} -eq 0 ]]; then
+  if [[ "$REMOVE_ALL" -eq 1 || ${#TARGET_MACHINE_IDS[@]} -eq 0 ]]; then
     remove_all_nodes
-    echo "Removed all NodeRS-AnyTLS nodes, configs, services, and binary."
+    echo "Removed all NodeRS machine instances, configs, services, and binary."
     return
   fi
 
-  for node_id in "${TARGET_NODE_IDS[@]}"; do
-    remove_single_node "$node_id"
-    echo "Removed node ${node_id}."
+  for machine_id in "${TARGET_MACHINE_IDS[@]}"; do
+    remove_single_node "$machine_id"
+    echo "Removed machine ${machine_id}."
   done
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -408,19 +381,11 @@ uninstall() {
 }
 
 print_summary() {
-  local service_unit tls_summary
-  if [[ "$SELF_SIGNED" -eq 1 ]]; then
-    tls_summary="Self-signed certificates generated locally from --server-name or Xboard server_name"
-  elif [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]]; then
-    tls_summary="Using existing certificate files from --cert-file/--key-file"
-  else
-    tls_summary="Auto ACME from --server-name or Xboard server_name"
-  fi
+  local service_unit
   cat <<EOF
-Installed NodeRS-AnyTLS
+Installed NodeRS
   Binary: $PREFIX/bin/noders-anytls
   State:  $STATE_DIR
-  TLS:    $tls_summary
 EOF
 
   for config_path in "${GENERATED_CONFIGS[@]}"; do

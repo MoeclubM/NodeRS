@@ -5,12 +5,10 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::net::UdpSocket;
-use tracing::debug;
 
 use crate::accounting::SessionControl;
-use crate::config::OutboundConfig;
 
-use super::rules::RouteRules;
+use super::routing::RoutingTable;
 use super::socksaddr::SocksAddr;
 use super::traffic::TrafficRecorder;
 use super::transport;
@@ -38,8 +36,7 @@ pub struct UotRequest {
 pub struct PreparedUotRelay {
     socket: Arc<UdpSocket>,
     mode: RelayMode,
-    route_rules: RouteRules,
-    outbound: OutboundConfig,
+    routing: RoutingTable,
 }
 
 #[derive(Clone)]
@@ -99,8 +96,7 @@ where
 
 pub async fn prepare(
     request: UotRequest,
-    route_rules: &RouteRules,
-    outbound: &OutboundConfig,
+    routing: &RoutingTable,
 ) -> anyhow::Result<PreparedUotRelay> {
     let socket = Arc::new(bind_udp_socket().await?);
     let mode = if request.is_connect {
@@ -108,10 +104,7 @@ pub async fn prepare(
             .destination
             .clone()
             .ok_or_else(|| anyhow::anyhow!("missing UOT connect destination"))?;
-        if route_rules.is_blocked(&destination, "udp") {
-            bail!("destination blocked by Xboard route rules: {destination}");
-        }
-        let target = transport::resolve_destination(&destination, route_rules, outbound)
+        let target = transport::resolve_destination(&destination, routing, "udp")
             .await?
             .into_iter()
             .next()
@@ -127,8 +120,7 @@ pub async fn prepare(
     Ok(PreparedUotRelay {
         socket,
         mode,
-        route_rules: route_rules.clone(),
-        outbound: outbound.clone(),
+        routing: routing.clone(),
     })
 }
 
@@ -141,8 +133,7 @@ impl PreparedUotRelay {
         download: TrafficRecorder,
     ) -> anyhow::Result<()> {
         let (reader, writer) = tokio::io::split(app_side);
-        let route_rules = self.route_rules.clone();
-        let outbound = self.outbound.clone();
+        let routing = self.routing.clone();
         let select_control = control.clone();
         let client_context = UdpRelayContext {
             socket: self.socket.clone(),
@@ -157,9 +148,8 @@ impl PreparedUotRelay {
             traffic: download,
         };
 
-        let mut client_task = tokio::spawn(async move {
-            relay_client_to_udp(reader, client_context, route_rules, outbound).await
-        });
+        let mut client_task =
+            tokio::spawn(async move { relay_client_to_udp(reader, client_context, routing).await });
         let mut server_task =
             tokio::spawn(async move { relay_udp_to_client(writer, server_context).await });
 
@@ -184,8 +174,7 @@ impl PreparedUotRelay {
 async fn relay_client_to_udp(
     mut reader: ReadHalf<DuplexStream>,
     context: UdpRelayContext,
-    route_rules: RouteRules,
-    outbound: OutboundConfig,
+    routing: RoutingTable,
 ) -> anyhow::Result<()> {
     let mut destination_cache = HashMap::new();
     loop {
@@ -196,23 +185,15 @@ async fn relay_client_to_udp(
         let Some(packet) = packet else {
             return Ok(());
         };
-        if route_rules.is_blocked(&packet.destination, "udp") {
-            debug!(destination = %packet.destination, "dropping blocked UOT packet");
-            continue;
-        }
         let sent = match &context.mode {
             RelayMode::Connect { .. } => tokio::select! {
                 _ = context.control.cancelled() => return Ok(()),
                 sent = context.socket.send(&packet.payload) => sent.context("send connected UDP payload")?,
             },
             RelayMode::Associate => {
-                let target = resolve_udp_target(
-                    &packet.destination,
-                    &route_rules,
-                    &outbound,
-                    &mut destination_cache,
-                )
-                .await?;
+                let target =
+                    resolve_udp_target(&packet.destination, &routing, &mut destination_cache)
+                        .await?;
                 tokio::select! {
                     _ = context.control.cancelled() => return Ok(()),
                     sent = context.socket.send_to(&packet.payload, target) => sent.with_context(|| format!("send UDP payload to {target}"))?,
@@ -268,15 +249,14 @@ async fn relay_udp_to_client(
 
 async fn resolve_udp_target(
     destination: &SocksAddr,
-    route_rules: &RouteRules,
-    outbound: &OutboundConfig,
+    routing: &RoutingTable,
     cache: &mut HashMap<String, SocketAddr>,
 ) -> anyhow::Result<SocketAddr> {
     let cache_key = destination.to_string();
     if let Some(target) = cache.get(&cache_key) {
         return Ok(*target);
     }
-    let target = transport::resolve_destination(destination, route_rules, outbound)
+    let target = transport::resolve_destination(destination, routing, "udp")
         .await?
         .into_iter()
         .next()

@@ -17,16 +17,14 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
-use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
-use crate::config::OutboundConfig;
-
 use super::activity::{ActivityTracker, HEARTBEAT_INTERVAL, SESSION_IDLE_TIMEOUT};
 use super::padding::PaddingScheme;
-use super::rules::RouteRules;
+use super::routing::RoutingTable;
 use super::socksaddr::SocksAddr;
 use super::traffic::TrafficRecorder;
 use super::transport;
 use super::uot;
+use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -46,7 +44,7 @@ const UOT_BRIDGE_BUFFER_SIZE: usize = 1024 * 1024;
 const PREFETCH_FIRST_DOWNLOAD_BYTES: usize = 32 * 1024;
 const FIRST_DOWNLOAD_PREFETCH_GRACE: std::time::Duration = std::time::Duration::from_millis(2);
 
-type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
+type TlsStream = tokio_boring::SslStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const PAYLOAD_POOL_MAX_CACHED: usize = 512;
 
@@ -55,8 +53,7 @@ pub async fn serve_connection(
     source: SocketAddr,
     accounting: Arc<Accounting>,
     padding: PaddingScheme,
-    route_rules: RouteRules,
-    outbound: OutboundConfig,
+    routing: RoutingTable,
 ) -> anyhow::Result<()> {
     let user = tokio::time::timeout(
         AUTHENTICATION_TIMEOUT,
@@ -73,8 +70,7 @@ pub async fn serve_connection(
         lease,
         accounting: accounting.clone(),
         padding,
-        route_rules,
-        outbound,
+        routing,
         activity,
         reader,
         writer: FrameWriter::spawn(writer),
@@ -116,8 +112,7 @@ struct Session {
     lease: SessionLease,
     accounting: Arc<Accounting>,
     padding: PaddingScheme,
-    route_rules: RouteRules,
-    outbound: OutboundConfig,
+    routing: RoutingTable,
     activity: Arc<ActivityTracker>,
     reader: ReadHalf<TlsStream>,
     writer: FrameWriter,
@@ -154,8 +149,7 @@ struct StreamState {
 struct StreamContext {
     writer: FrameWriter,
     control: Arc<SessionControl>,
-    route_rules: RouteRules,
-    outbound: OutboundConfig,
+    routing: RoutingTable,
     activity: Arc<ActivityTracker>,
     upload_traffic: TrafficRecorder,
     download_traffic: TrafficRecorder,
@@ -305,8 +299,7 @@ impl Session {
         let context = StreamContext {
             writer: writer.clone(),
             control: control.clone(),
-            route_rules: self.route_rules.clone(),
-            outbound: self.outbound.clone(),
+            routing: self.routing.clone(),
             activity: self.activity.clone(),
             upload_traffic: TrafficRecorder::upload(accounting.clone(), user.id),
             download_traffic: TrafficRecorder::download(accounting, user.id),
@@ -722,7 +715,7 @@ async fn handle_stream(
             Ok(request) => request,
             Err(error) => return Err(error),
         };
-        let prepared = uot::prepare(request, &context.route_rules, &context.outbound).await;
+        let prepared = uot::prepare(request, &context.routing).await;
         let result = async {
             match prepared {
                 Ok(prepared) => {
@@ -792,28 +785,9 @@ async fn handle_stream(
         return result;
     }
 
-    if context.route_rules.is_blocked(&destination, "tcp") {
-        let error = anyhow!("destination blocked by Xboard route rules: {destination}");
-        let result = async {
-            if context.send_synack {
-                write_frame(
-                    &context.writer,
-                    CMD_SYNACK,
-                    stream_id,
-                    error.to_string().as_bytes(),
-                )
-                .await?;
-            }
-            Err(error)
-        }
-        .await;
-        return result;
-    }
-
-    let mut remote =
-        transport::connect_tcp_destination(&destination, &context.route_rules, &context.outbound)
-            .await
-            .with_context(|| format!("connect remote destination {destination}"));
+    let mut remote = transport::connect_tcp_destination(&destination, &context.routing)
+        .await
+        .with_context(|| format!("connect remote destination {destination}"));
 
     let result = async {
         match remote.as_mut() {
@@ -948,6 +922,7 @@ async fn prefetch_remote_download_with_grace(
 
 #[cfg(test)]
 mod tests {
+    use super::super::traffic::TrafficRecorder;
     use super::channel::{
         ChannelReader, InboundMessage, PayloadBuffer, PayloadPool, bounded_inbound_channel,
         test_chunk,
@@ -967,7 +942,6 @@ mod tests {
         read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
-    use crate::server::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
     use std::io::IoSlice;
     use std::pin::Pin;

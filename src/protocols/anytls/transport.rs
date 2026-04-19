@@ -5,11 +5,11 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
-use crate::config::{IpStrategy, OutboundConfig};
+use crate::config::IpStrategy;
 
 use super::configure_tcp_stream;
 use super::dns;
-use super::rules::RouteRules;
+use super::routing::RoutingTable;
 use super::socksaddr::SocksAddr;
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
@@ -17,15 +17,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn connect_tcp_destination(
     destination: &SocksAddr,
-    route_rules: &RouteRules,
-    outbound: &OutboundConfig,
+    routing: &RoutingTable,
 ) -> anyhow::Result<TcpStream> {
+    let outbound = routing.outbound_for(destination, "tcp")?;
     match destination {
         SocksAddr::Ip(addr) => connect_target(*addr)
             .await
             .context("connect IP destination"),
         SocksAddr::Domain(host, port) => {
-            let resolved = resolve_destination(destination, route_rules, outbound)
+            let resolved = resolve_destination(destination, routing, "tcp")
                 .await
                 .with_context(|| format!("resolve {host}:{port}"))?;
             let mut last_error = None;
@@ -65,14 +65,14 @@ pub async fn connect_tcp_destination(
 
 pub async fn resolve_destination(
     destination: &SocksAddr,
-    route_rules: &RouteRules,
-    outbound: &OutboundConfig,
+    routing: &RoutingTable,
+    protocol: &str,
 ) -> anyhow::Result<Vec<SocketAddr>> {
+    let outbound = routing.outbound_for(destination, protocol)?;
     match destination {
         SocksAddr::Ip(addr) => Ok(vec![*addr]),
         SocksAddr::Domain(host, port) => {
-            let dns_server = route_rules.dns_server_for(host);
-            let resolved = dns::resolve_domain(host, dns_server, outbound)
+            let resolved = dns::resolve_domain(host, None, &outbound)
                 .await
                 .with_context(|| format!("resolve {host}:{port}"))?;
             if resolved.is_empty() {

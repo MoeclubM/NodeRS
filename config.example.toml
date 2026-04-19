@@ -1,34 +1,4 @@
 [panel]
-url = "https://xboard.example.com"
-token = "replace-me"
-node_id = 1
-timeout_seconds = 15
-
-[node]
-listen_ip = "::"
-
-[tls]
-cert_path = "cert.pem"
-key_path = "key.pem"
-reload_interval_seconds = 60
-
-[outbound]
-dns_resolver = "system"
-ip_strategy = "system"
-
-[tls.acme]
-enabled = false
-directory_url = "https://acme-v02.api.letsencrypt.org/directory"
-email = "admin@example.com"
-domain = "node.example.com"
-challenge_listen = "[::]:80"
-check_interval_seconds = 86400
-renew_before_days = 30
-account_key_path = "acme-account.pem"
-
-[report]
-status_interval_seconds = 60
-min_traffic_bytes = 0
-
-[log]
-level = "info"
+api = "https://xboard.example.com"
+key = "replace-me"
+machine_id = 1
