@@ -73,9 +73,11 @@ def ensure_tls_materials(temp_root: pathlib.Path) -> tuple[pathlib.Path, pathlib
 
 
 class MockPanel:
-    def __init__(self, port: int, server_port: int) -> None:
+    def __init__(self, port: int, server_port: int, cert_path: pathlib.Path, key_path: pathlib.Path) -> None:
         self.port = port
         self.server_port = server_port
+        self.cert_path = cert_path
+        self.key_path = key_path
         self._httpd = None
         self._thread = None
 
@@ -107,10 +109,17 @@ class MockPanel:
                     self._json(
                         {
                             "protocol": "anytls",
+                            "listen_ip": "127.0.0.1",
                             "server_port": panel.server_port,
                             "server_name": "localhost",
+                            "tls_settings": {"server_name": "localhost", "allow_insecure": False},
                             "padding_scheme": [],
                             "routes": [],
+                            "cert_config": {
+                                "cert_mode": "file",
+                                "cert_path": panel.cert_path.as_posix(),
+                                "key_path": panel.key_path.as_posix(),
+                            },
                             "base_config": {"pull_interval": 600, "push_interval": 600},
                         }
                     )
@@ -122,7 +131,6 @@ class MockPanel:
                                 {
                                     "id": 1,
                                     "uuid": "bench-user-uuid-a",
-                                    "speed_limit": 0,
                                     "device_limit": 0,
                                 }
                             ]
@@ -137,6 +145,18 @@ class MockPanel:
             def do_POST(self) -> None:
                 if not self._auth():
                     self._json({"error": "forbidden"}, 403)
+                    return
+                path = urlparse(self.path).path
+                if path.endswith("/handshake"):
+                    self._json({"websocket": {"enabled": False, "ws_url": ""}})
+                    return
+                if path.endswith("/machine/nodes"):
+                    self._json(
+                        {
+                            "nodes": [{"id": 1, "type": "anytls", "name": "bench"}],
+                            "base_config": {"pull_interval": 600, "push_interval": 600},
+                        }
+                    )
                     return
                 length = int(self.headers.get("Content-Length", "0"))
                 if length:
@@ -275,39 +295,19 @@ def main() -> int:
     sink_port = reserve_port()
     source_port = reserve_port()
 
-    panel = MockPanel(panel_port, server_port)
     processes: list[subprocess.Popen[str]] = []
     with tempfile.TemporaryDirectory(prefix="noders-perf-") as temp_dir:
         temp_root = pathlib.Path(temp_dir)
         cert_path, key_path = ensure_tls_materials(temp_root)
+        panel = MockPanel(panel_port, server_port, cert_path, key_path)
         config_path = temp_root / "config.toml"
         config_path.write_text(
             "\n".join(
                 [
                     "[panel]",
-                    f'url = "http://127.0.0.1:{panel_port}"',
-                    'token = "bench-token"',
-                    "node_id = 1",
-                    "timeout_seconds = 5",
-                    "",
-                    "[node]",
-                    'listen_ip = "127.0.0.1"',
-                    "",
-                    "[tls]",
-                    f'cert_path = "{cert_path.as_posix()}"',
-                    f'key_path = "{key_path.as_posix()}"',
-                    "reload_interval_seconds = 600",
-                    "",
-                    "[outbound]",
-                    'dns_resolver = "system"',
-                    'ip_strategy = "system"',
-                    "",
-                    "[report]",
-                    "status_interval_seconds = 600",
-                    "min_traffic_bytes = 0",
-                    "",
-                    "[log]",
-                    'level = "warn"',
+                    f'api = "http://127.0.0.1:{panel_port}"',
+                    'key = "bench-token"',
+                    "machine_id = 1",
                     "",
                 ]
             ),

@@ -678,6 +678,62 @@ def put_file(sftp: paramiko.SFTPClient, local_path: pathlib.Path, remote_path: s
     raise last_error
 
 
+def put_text_retry(
+    ssh: paramiko.SSHClient,
+    remote_path: str,
+    text: str,
+    mode: int = 0o644,
+) -> None:
+    last_error: Exception | None = None
+    for attempt in range(4):
+        sftp = None
+        try:
+            sftp = open_sftp_retry(ssh)
+            put_text(sftp, remote_path, text, mode)
+            return
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+            last_error = error
+            if attempt == 3:
+                raise RuntimeError(f"failed to upload remote text file {remote_path}") from error
+            reconnect_ssh(ssh)
+            time.sleep(min(1.5 * (attempt + 1), 5.0))
+        finally:
+            if sftp is not None:
+                with contextlib.suppress(Exception):
+                    sftp.close()
+    assert last_error is not None
+    raise last_error
+
+
+def put_file_retry(
+    ssh: paramiko.SSHClient,
+    local_path: pathlib.Path,
+    remote_path: str,
+    mode: int = 0o755,
+) -> None:
+    last_error: Exception | None = None
+    for attempt in range(4):
+        sftp = None
+        try:
+            sftp = open_sftp_retry(ssh)
+            put_file(sftp, local_path, remote_path, mode)
+            return
+        except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
+            last_error = error
+            if attempt == 3:
+                raise RuntimeError(
+                    f"failed to upload remote file {local_path} -> {remote_path}"
+                ) from error
+            reconnect_ssh(ssh)
+            time.sleep(min(1.5 * (attempt + 1), 5.0))
+        finally:
+            if sftp is not None:
+                with contextlib.suppress(Exception):
+                    sftp.close()
+    assert last_error is not None
+    raise last_error
+
+
 def get_file_retry(
     ssh: paramiko.SSHClient,
     *,
@@ -1021,30 +1077,13 @@ def start_sing_clients(
             user=USERS[index],
             socks_port=socks_port,
         )
-        last_error: Exception | None = None
-        for attempt in range(3):
-            sftp = None
-            try:
-                client_ssh = ensure_ssh_active(
-                    client_ssh,
-                    host=client_host,
-                    username=username,
-                    password=password,
-                )
-                sftp = open_sftp_retry(client_ssh)
-                put_text(sftp, cfg_path, cfg_text)
-                last_error = None
-                break
-            except (OSError, EOFError, ConnectionResetError, paramiko.SSHException) as error:
-                last_error = error
-                reconnect_ssh(client_ssh)
-                time.sleep(min(1.5 * (attempt + 1), 5.0))
-            finally:
-                if sftp is not None:
-                    with contextlib.suppress(Exception):
-                        sftp.close()
-        if last_error is not None:
-            raise last_error
+        client_ssh = ensure_ssh_active(
+            client_ssh,
+            host=client_host,
+            username=username,
+            password=password,
+        )
+        put_text_retry(client_ssh, cfg_path, cfg_text)
         start_bg(
             client_ssh,
             root=client_root,
@@ -1185,13 +1224,25 @@ def run_compare(
     return metrics, curve_summary, stdout_local, curve_local
 
 
-def current_node_config(*, panel_port: int, cert_path: str, key_path: str) -> str:
+def current_node_config(*, panel_port: int) -> str:
+    return "\n".join(
+        [
+            "[panel]",
+            f'api = "http://127.0.0.1:{panel_port}"',
+            'key = "bench-token"',
+            "machine_id = 1",
+            "",
+        ]
+    )
+
+
+def baseline_node_config(*, panel_port: int, cert_path: str, key_path: str) -> str:
     return "\n".join(
         [
             "[panel]",
             f'url = "http://127.0.0.1:{panel_port}"',
             'token = "bench-token"',
-            "node_id = 1",
+            "machine_id = 1",
             "timeout_seconds = 5",
             "",
             "[node]",
@@ -1263,28 +1314,25 @@ def install_remote_layout(
     for ssh, root in ((server_ssh, server_root), (client_ssh, client_root)):
         run(ssh, f"mkdir -p {shlex.quote(root)}/{{bin,config,logs,results,run}}")
 
-    server_sftp = open_sftp_retry(server_ssh)
-    client_sftp = open_sftp_retry(client_ssh)
-    try:
-        put_file(
-            server_sftp,
-            pathlib.Path(assets["current_source_archive"]),
-            f"{server_root}/run/current-source.tar.gz",
-            0o644,
-        )
-        put_file(
-            server_sftp,
-            pathlib.Path(assets["baseline_source_archive"]),
-            f"{server_root}/run/baseline-source.tar.gz",
-            0o644,
-        )
-        put_file(server_sftp, pathlib.Path(assets["sing"]), f"{server_root}/bin/sing-box")
+    put_file_retry(
+        server_ssh,
+        pathlib.Path(assets["current_source_archive"]),
+        f"{server_root}/run/current-source.tar.gz",
+        0o644,
+    )
+    put_file_retry(
+        server_ssh,
+        pathlib.Path(assets["baseline_source_archive"]),
+        f"{server_root}/run/baseline-source.tar.gz",
+        0o644,
+    )
+    put_file_retry(server_ssh, pathlib.Path(assets["sing"]), f"{server_root}/bin/sing-box")
 
-        put_file(client_sftp, pathlib.Path(assets["sing"]), f"{client_root}/bin/sing-box")
-        put_file(client_sftp, pathlib.Path(assets["compare_script"]), f"{client_root}/bin/benchmark_compare_socks.py")
+    put_file_retry(client_ssh, pathlib.Path(assets["sing"]), f"{client_root}/bin/sing-box")
+    put_file_retry(client_ssh, pathlib.Path(assets["compare_script"]), f"{client_root}/bin/benchmark_compare_socks.py")
 
-        padding_scheme = json.dumps(padding_scheme_for_profile(padding_profile))
-        mock_panel = """#!/usr/bin/env python3
+    padding_scheme = json.dumps(padding_scheme_for_profile(padding_profile))
+    mock_panel = """#!/usr/bin/env python3
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1319,10 +1367,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         if path.endswith('/config'):
-            self._json({'protocol': 'anytls', 'server_port': args.server_port, 'server_name': args.server_name, 'padding_scheme': padding_scheme, 'routes': [], 'base_config': {'pull_interval': 600, 'push_interval': 600}})
+            self._json({
+                'protocol': 'anytls',
+                'listen_ip': '0.0.0.0',
+                'server_port': args.server_port,
+                'server_name': args.server_name,
+                'tls_settings': {'server_name': args.server_name, 'allow_insecure': False},
+                'padding_scheme': padding_scheme,
+                'routes': [],
+                'cert_config': {
+                    'cert_mode': 'file',
+                    'cert_path': '__CERT_PATH__',
+                    'key_path': '__KEY_PATH__',
+                },
+                'base_config': {'pull_interval': 600, 'push_interval': 600},
+            })
             return
         if path.endswith('/user'):
-            self._json({'users': [{'id': idx + 1, 'uuid': user, 'speed_limit': 0, 'device_limit': 0} for idx, user in enumerate(users)]})
+            self._json({'users': [{'id': idx + 1, 'uuid': user, 'device_limit': 0} for idx, user in enumerate(users)]})
             return
         if path.endswith('/alivelist'):
             self._json({'alive': {}})
@@ -1332,6 +1394,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth():
             self._json({'error': 'forbidden'}, 403)
             return
+        path = urlparse(self.path).path
+        if path.endswith('/handshake'):
+            self._json({'websocket': {'enabled': False, 'ws_url': ''}})
+            return
+        if path.endswith('/machine/nodes'):
+            self._json({'nodes': [{'id': 1, 'type': 'anytls', 'name': 'bench'}], 'base_config': {'pull_interval': 600, 'push_interval': 600}})
+            return
         length = int(self.headers.get('Content-Length', '0'))
         if length:
             self.rfile.read(length)
@@ -1340,10 +1409,12 @@ class Handler(BaseHTTPRequestHandler):
 httpd = ThreadingHTTPServer((host, int(port)), Handler)
 httpd.serve_forever()
 """
-        mock_panel = mock_panel.replace("__PADDING_SCHEME__", padding_scheme)
-        put_text(server_sftp, f"{server_root}/bin/mock_panel.py", mock_panel, 0o755)
+    mock_panel = mock_panel.replace("__PADDING_SCHEME__", padding_scheme)
+    mock_panel = mock_panel.replace("__CERT_PATH__", f"{server_root}/config/tls.crt")
+    mock_panel = mock_panel.replace("__KEY_PATH__", f"{server_root}/config/tls.key")
+    put_text_retry(server_ssh, f"{server_root}/bin/mock_panel.py", mock_panel, 0o755)
 
-        http_target = """#!/usr/bin/env python3
+    http_target = """#!/usr/bin/env python3
 import argparse
 import base64
 import hashlib
@@ -1496,24 +1567,33 @@ class Handler(BaseHTTPRequestHandler):
 httpd = ThreadingHTTPServer((host, int(port)), Handler)
 httpd.serve_forever()
 """
-        put_text(server_sftp, f"{server_root}/bin/http_target.py", http_target, 0o755)
-        cert_path = f"{server_root}/config/tls.crt"
-        key_path = f"{server_root}/config/tls.key"
-        put_text(server_sftp, f"{server_root}/config/current.toml", current_node_config(panel_port=PORTS["panel_current"], cert_path=cert_path, key_path=key_path))
-        put_text(server_sftp, f"{server_root}/config/baseline.toml", current_node_config(panel_port=PORTS["panel_v031"], cert_path=cert_path, key_path=key_path))
-        put_text(
-            server_sftp,
-            f"{server_root}/config/sing-box.json",
-            sing_server_config(
-                server_name=server_name,
-                cert_path=cert_path,
-                key_path=key_path,
-                padding_scheme=padding_scheme_for_profile(padding_profile),
-            ),
-        )
-    finally:
-        server_sftp.close()
-        client_sftp.close()
+    put_text_retry(server_ssh, f"{server_root}/bin/http_target.py", http_target, 0o755)
+    cert_path = f"{server_root}/config/tls.crt"
+    key_path = f"{server_root}/config/tls.key"
+    put_text_retry(
+        server_ssh,
+        f"{server_root}/config/current.toml",
+        current_node_config(panel_port=PORTS["panel_current"]),
+    )
+    put_text_retry(
+        server_ssh,
+        f"{server_root}/config/baseline.toml",
+        baseline_node_config(
+            panel_port=PORTS["panel_v031"],
+            cert_path=cert_path,
+            key_path=key_path,
+        ),
+    )
+    put_text_retry(
+        server_ssh,
+        f"{server_root}/config/sing-box.json",
+        sing_server_config(
+            server_name=server_name,
+            cert_path=cert_path,
+            key_path=key_path,
+            padding_scheme=padding_scheme_for_profile(padding_profile),
+        ),
+    )
 
 
 def build_remote_binaries(server_ssh: paramiko.SSHClient, *, server_root: str) -> None:
@@ -1538,7 +1618,78 @@ chmod +x \
   {shlex.quote(server_root)}/bin/noders-anytls-baseline \
   {shlex.quote(server_root)}/bin/bench_anytls
 """
-    run(server_ssh, cmd, timeout=3600)
+    pid_path = f"{server_root}/run/build-binaries.pid"
+    status_path = f"{server_root}/run/build-binaries.status"
+    log_path = f"{server_root}/logs/build-binaries.log"
+    launch_cmd = f"""
+set -e
+rm -f {shlex.quote(pid_path)} {shlex.quote(status_path)}
+mkdir -p {shlex.quote(server_root)}/logs {shlex.quote(server_root)}/run
+nohup bash -lc {shlex.quote(
+    "set -e\n"
+    f"trap 'status=$?; printf \"%s\" \"$status\" > {shlex.quote(status_path)}; rm -f {shlex.quote(pid_path)}' EXIT\n"
+    + cmd.strip()
+)} > {shlex.quote(log_path)} 2>&1 < /dev/null &
+echo $! > {shlex.quote(pid_path)}
+"""
+    run(server_ssh, launch_cmd, timeout=20)
+
+    deadline = time.time() + 3600
+    while time.time() < deadline:
+        try:
+            _, status_text, _ = run(
+                server_ssh,
+                f"""
+set -e
+if [ -f {shlex.quote(status_path)} ]; then
+  cat {shlex.quote(status_path)}
+elif [ -f {shlex.quote(pid_path)} ]; then
+  echo RUNNING
+else
+  echo MISSING
+fi
+""",
+                timeout=15,
+            )
+        except (TimeoutError, OSError, EOFError, ConnectionResetError, paramiko.SSHException):
+            reconnect_ssh(server_ssh)
+            time.sleep(2.0)
+            continue
+        status = status_text.strip()
+        if status == "RUNNING":
+            time.sleep(5.0)
+            continue
+        if status == "0":
+            return
+        log_tail = ""
+        with contextlib.suppress(Exception):
+            _, log_tail, _ = run(server_ssh, f"tail -n 200 {shlex.quote(log_path)}", timeout=20, check=False)
+        raise RuntimeError(
+            f"remote build failed with status {status or 'unknown'}\nLOG:\n{log_tail}"
+        )
+
+    with contextlib.suppress(Exception):
+        run(
+            server_ssh,
+            f"""
+set +e
+if [ -f {shlex.quote(pid_path)} ]; then
+  pid=$(cat {shlex.quote(pid_path)} 2>/dev/null)
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f {shlex.quote(pid_path)}
+fi
+""",
+            timeout=10,
+            check=False,
+        )
+    log_tail = ""
+    with contextlib.suppress(Exception):
+        _, log_tail, _ = run(server_ssh, f"tail -n 200 {shlex.quote(log_path)}", timeout=20, check=False)
+    raise TimeoutError(f"remote build timed out after 3600s\nLOG:\n{log_tail}")
 
 
 TARGET_SERVICE_SPECS = {

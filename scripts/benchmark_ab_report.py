@@ -362,10 +362,19 @@ def ensure_tls_materials(work_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.
 
 
 class MockPanel:
-    def __init__(self, port: int, server_port: int, padding_scheme: list[str]):
+    def __init__(
+        self,
+        port: int,
+        server_port: int,
+        padding_scheme: list[str],
+        cert_path: pathlib.Path,
+        key_path: pathlib.Path,
+    ):
         self.port = port
         self.server_port = server_port
         self.padding_scheme = padding_scheme
+        self.cert_path = cert_path
+        self.key_path = key_path
         self.httpd: ThreadingHTTPServer | None = None
 
     def start(self) -> None:
@@ -396,10 +405,17 @@ class MockPanel:
                     self._json(
                         {
                             "protocol": "anytls",
+                            "listen_ip": "127.0.0.1",
                             "server_port": panel.server_port,
                             "server_name": "localhost",
+                            "tls_settings": {"server_name": "localhost", "allow_insecure": False},
                             "padding_scheme": panel.padding_scheme,
                             "routes": [],
+                            "cert_config": {
+                                "cert_mode": "file",
+                                "cert_path": panel.cert_path.as_posix(),
+                                "key_path": panel.key_path.as_posix(),
+                            },
                             "base_config": {"pull_interval": 600, "push_interval": 600},
                         }
                     )
@@ -411,7 +427,6 @@ class MockPanel:
                                 {
                                     "id": index + 1,
                                     "uuid": user,
-                                    "speed_limit": 0,
                                     "device_limit": 0,
                                 }
                                 for index, user in enumerate(USERS)
@@ -427,6 +442,18 @@ class MockPanel:
             def do_POST(self) -> None:
                 if not self._auth():
                     self._json({"error": "forbidden"}, 403)
+                    return
+                path = urlparse(self.path).path
+                if path.endswith("/handshake"):
+                    self._json({"websocket": {"enabled": False, "ws_url": ""}})
+                    return
+                if path.endswith("/machine/nodes"):
+                    self._json(
+                        {
+                            "nodes": [{"id": 1, "type": "anytls", "name": "bench"}],
+                            "base_config": {"pull_interval": 600, "push_interval": 600},
+                        }
+                    )
                     return
                 length = int(self.headers.get("Content-Length", "0"))
                 if length:
@@ -716,36 +743,14 @@ def write_node_config(
     path: pathlib.Path,
     *,
     panel_port: int,
-    cert_path: pathlib.Path,
-    key_path: pathlib.Path,
 ) -> None:
     path.write_text(
         "\n".join(
             [
                 "[panel]",
-                f'url = "http://127.0.0.1:{panel_port}"',
-                'token = "bench-token"',
-                "node_id = 1",
-                "timeout_seconds = 5",
-                "",
-                "[node]",
-                'listen_ip = "127.0.0.1"',
-                "",
-                "[tls]",
-                f'cert_path = "{cert_path.as_posix()}"',
-                f'key_path = "{key_path.as_posix()}"',
-                "reload_interval_seconds = 600",
-                "",
-                "[outbound]",
-                'dns_resolver = "system"',
-                'ip_strategy = "system"',
-                "",
-                "[report]",
-                "status_interval_seconds = 600",
-                "min_traffic_bytes = 0",
-                "",
-                "[log]",
-                'level = "warn"',
+                f'api = "http://127.0.0.1:{panel_port}"',
+                'key = "bench-token"',
+                "machine_id = 1",
                 "",
             ]
         ),
@@ -907,10 +912,10 @@ def benchmark_impl(
                 write_node_config(
                     node_config,
                     panel_port=panel_port,
-                    cert_path=cert_path,
-                    key_path=key_path,
                 )
-                stack.enter_context(MockPanel(panel_port, server_port, padding_scheme))
+                stack.enter_context(
+                    MockPanel(panel_port, server_port, padding_scheme, cert_path, key_path)
+                )
                 stack.enter_context(
                     started_process(
                         [str(implementation.binary), str(node_config)],
@@ -1037,7 +1042,7 @@ def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str) -> 
         return None
 
     try:
-        release = github_json(f"https://api.github.com/repos/MoeclubM/NodeRS-AnyTLS/releases/tags/{ref}")
+        release = github_json(f"https://api.github.com/repos/MoeclubM/NodeRS/releases/tags/{ref}")
     except urllib.error.HTTPError:
         return None
     asset = next((item for item in release.get("assets", []) if item["name"] == asset_name), None)

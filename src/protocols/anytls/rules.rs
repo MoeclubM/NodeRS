@@ -27,7 +27,7 @@ impl DnsRule {
 }
 
 #[derive(Debug, Clone)]
-enum DomainMatcher {
+pub(super) enum DomainMatcher {
     Exact(String),
     Suffix(String),
     Keyword(String),
@@ -35,7 +35,7 @@ enum DomainMatcher {
 }
 
 impl DomainMatcher {
-    fn matches(&self, domain: &str) -> bool {
+    pub(super) fn matches(&self, domain: &str) -> bool {
         match self {
             Self::Exact(expected) => domain == expected,
             Self::Suffix(suffix) => domain == suffix || domain.ends_with(&format!(".{suffix}")),
@@ -129,7 +129,7 @@ impl RouteRules {
     }
 }
 
-fn compile_domain_matcher(item: &str) -> anyhow::Result<Option<DomainMatcher>> {
+pub(super) fn compile_domain_matcher(item: &str) -> anyhow::Result<Option<DomainMatcher>> {
     let item = item.trim();
     if item.is_empty() {
         return Ok(None);
@@ -167,7 +167,7 @@ fn destination_candidates(destination: &SocksAddr) -> [String; 2] {
     }
 }
 
-fn normalize_domain(domain: &str) -> String {
+pub(super) fn normalize_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 

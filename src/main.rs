@@ -2,9 +2,10 @@ mod accounting;
 mod acme;
 mod config;
 mod panel;
+mod protocols;
 mod runtime;
-mod server;
 mod status;
+mod ws;
 
 use anyhow::Context;
 use std::path::PathBuf;
@@ -23,8 +24,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("load config from {}", config_path.display()))?;
 
-    let level = config.log.level.parse().unwrap_or(LevelFilter::INFO);
-    tracing_subscriber::fmt().with_max_level(level).init();
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::INFO)
+        .init();
 
     runtime::run(config).await
 }
