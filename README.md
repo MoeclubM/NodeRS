@@ -1,6 +1,6 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. This repository currently ships the AnyTLS implementation, so the installed binary, service, and state names remain `noders-anytls`.
+NodeRS is a pure Rust Xboard machine-node runtime. This repository currently ships the AnyTLS implementation, and the installed binary remains `noders-anytls`.
 
 ## Overview
 
@@ -29,7 +29,7 @@ TLS is no longer read from the local config file.
 
 - AnyTLS nodes must receive `cert_config` from Xboard
 - `listen_ip`, `server_port`, `server_name`, `tls_settings`, `padding_scheme`, and `routes` are all taken from the panel response
-- Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, and `letsencrypt`
+- Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, and `http`
 - File or path mode requires `cert_path` and `key_path`
 - Inline or PEM mode requires certificate PEM content and private key PEM content
 - ACME mode requires `cert_path` and `key_path`, and uses `cert_config.domain` or the panel `server_name` as the certificate domain
@@ -39,30 +39,12 @@ TLS is no longer read from the local config file.
 ## Support Matrix
 
 - Supported panel fields: `listen_ip`, `server_port`, `server_name`, `padding_scheme`, `routes`, and `cert_config`
-- Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, or `letsencrypt`
+- Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, or `http`
 - Supported `custom_outbounds` types: `direct`, `dns`, and `block`
 - Supported `custom_routes` actions: `outbound`, `reject`, and `block`
 - Supported `custom_routes` match fields: `network`, `protocol`, `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`, `ip_cidr`, `ip_is_private`, `port`, and `port_range`
 - Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`
 - Unsupported `custom_outbounds` types, unsupported `custom_routes` fields or actions, and malformed ECH settings fail explicitly during config sync; they are not ignored silently
-
-## Migrate Legacy Config
-
-The installer and release bundle no longer migrate legacy `UniProxy` or node-based configs automatically.
-
-Use `scripts/migrate_config.py` before switching an old deployment to the machine-based version:
-
-```bash
-python3 scripts/migrate_config.py /etc/noders/anytls/nodes/1.toml
-```
-
-The script prompts for the new `machine_id`, writes a backup next to the source file, and by default writes the migrated config to `/etc/noders/anytls/machines/<machine_id>.toml`.
-
-You can also run it non-interactively:
-
-```bash
-python3 scripts/migrate_config.py /etc/noders/anytls/nodes/1.toml --machine-id 9
-```
 
 ## Install
 
@@ -99,29 +81,29 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/instal
 - Config root: `/etc/noders/anytls`
 - Machine config: `/etc/noders/anytls/machines/<machine_id>.toml`
 - State: `/var/lib/noders/anytls`
-- systemd service: `noders-anytls-<machine_id>`
-- OpenRC service: `noders-anytls-<machine_id>`
+- systemd service: `noders-<machine_id>`
+- OpenRC service: `noders-<machine_id>`
 
 ## Common Operations
 
 ### systemd
 
 ```bash
-systemctl status noders-anytls-1 --no-pager -l
-journalctl -u noders-anytls-1 -n 100 --no-pager
-journalctl -u noders-anytls-1 -f
-systemctl restart noders-anytls-1
-systemctl stop noders-anytls-1
-systemctl enable noders-anytls-1
+systemctl status noders-1 --no-pager -l
+journalctl -u noders-1 -n 100 --no-pager
+journalctl -u noders-1 -f
+systemctl restart noders-1
+systemctl stop noders-1
+systemctl enable noders-1
 ```
 
 ### OpenRC
 
 ```bash
-rc-service noders-anytls-1 status
-rc-service noders-anytls-1 restart
-tail -n 100 /var/log/noders-anytls/noders-anytls-1.log
-tail -f /var/log/noders-anytls/noders-anytls-1.log
+rc-service noders-1 status
+rc-service noders-1 restart
+tail -n 100 /var/log/noders-anytls/noders-1.log
+tail -f /var/log/noders-anytls/noders-1.log
 ```
 
 ## Upgrade
@@ -130,17 +112,7 @@ tail -f /var/log/noders-anytls/noders-anytls-1.log
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-If you are upgrading from a legacy node-based deployment, migrate the config first with `scripts/migrate_config.py`, then reinstall with the new machine-based installer.
-
-Example migration path:
-
-```bash
-python3 scripts/migrate_config.py /etc/noders/anytls/nodes/1.toml --machine-id 9
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
-  --api https://api.example.com \
-  --key machine_key \
-  --machine-id 9
-```
+If an existing host still uses old `noders-anytls-<machine_id>` units, uninstall and reinstall to switch to the new `noders-<machine_id>` service names.
 
 ## Uninstall
 

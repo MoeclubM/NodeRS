@@ -243,7 +243,7 @@ render_openrc_service_file() {
 #!/sbin/openrc-run
 
 name="${SERVICE_NAME}-${machine_id}"
-description="NodeRS-AnyTLS service for machine ${machine_id}"
+description="NodeRS service for machine ${machine_id}"
 command="${PREFIX}/bin/noders-anytls"
 command_args="${config_path}"
 command_user="${service_user}:${service_group}"

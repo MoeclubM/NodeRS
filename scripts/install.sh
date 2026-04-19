@@ -7,7 +7,8 @@ COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
-SERVICE_NAME="noders-anytls"
+SERVICE_NAME="noders"
+LEGACY_SERVICE_NAME="noders-anytls"
 SERVICE_USER="noders-anytls"
 VERSION="latest"
 NO_SERVICE=0
@@ -312,6 +313,9 @@ install_service() {
     IFS='|' read -r _ _ machine_id <<<"$spec"
     config_path="$(node_config_path "$machine_id")"
     service_unit="${SERVICE_NAME}-${machine_id}"
+    if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
+      stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+    fi
     unit_path="/etc/systemd/system/${service_unit}.service"
     render_service_file "$staging_dir" "$unit_path" "$config_path"
     INSTALLED_SERVICES+=("$service_unit")
@@ -340,13 +344,20 @@ remove_single_node() {
   unit_name="${SERVICE_NAME}-${machine_id}"
 
   stop_disable_unit "$unit_name"
+  if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
+    stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+  fi
   rm -f "$config_path"
 }
 
 remove_all_nodes() {
   local unit_path unit_name
   if command -v systemctl >/dev/null 2>&1; then
-    for unit_path in /etc/systemd/system/${SERVICE_NAME}.service /etc/systemd/system/${SERVICE_NAME}-*.service; do
+    for unit_path in \
+      /etc/systemd/system/${SERVICE_NAME}.service \
+      /etc/systemd/system/${SERVICE_NAME}-*.service \
+      /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
+      /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service; do
       [[ -e "$unit_path" ]] || continue
       unit_name="$(basename "$unit_path" .service)"
       systemctl disable --now "$unit_name" >/dev/null 2>&1 || true

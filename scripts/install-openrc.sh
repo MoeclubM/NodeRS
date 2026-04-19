@@ -7,7 +7,8 @@ COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
-SERVICE_NAME="noders-anytls"
+SERVICE_NAME="noders"
+LEGACY_SERVICE_NAME="noders-anytls"
 SERVICE_USER="noders-anytls"
 SERVICE_GROUP="noders-anytls"
 OPENRC_DIR="/etc/init.d"
@@ -307,6 +308,9 @@ install_service() {
     config_path="$(node_config_path "$machine_id")"
     service_path="$(node_service_path "$machine_id")"
     service_unit="${SERVICE_NAME}-${machine_id}"
+    if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
+      stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+    fi
     render_service_file "$service_path" "$machine_id" "$config_path" "$service_user" "$service_group"
     INSTALLED_SERVICES+=("$service_unit")
   done
@@ -355,12 +359,17 @@ remove_single_node() {
   pid_path="$(node_service_pid_path "$machine_id")"
 
   stop_disable_unit "$unit_name"
+  if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
+    stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+  fi
   rm -f "$config_path" "$log_path" "$pid_path"
 }
 
 remove_all_nodes() {
   local unit_path unit_name
-  for unit_path in "${OPENRC_DIR%/}/${SERVICE_NAME}-"*; do
+  for unit_path in \
+    "${OPENRC_DIR%/}/${SERVICE_NAME}-"* \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-"*; do
     [[ -e "$unit_path" ]] || continue
     unit_name="$(basename "$unit_path")"
     stop_disable_unit "$unit_name"
