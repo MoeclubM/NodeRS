@@ -113,7 +113,7 @@ impl EffectiveTlsConfig {
                     ech: effective_ech_config(remote)?,
                 })
             }
-            "acme" | "letsencrypt" => {
+            "acme" | "letsencrypt" | "http" => {
                 let cert_config = remote
                     .cert_config
                     .as_ref()
@@ -498,6 +498,37 @@ mod tests {
             }
             _ => unreachable!("expected ACME TLS source"),
         }
+    }
+
+    #[test]
+    fn accepts_http_cert_mode_as_acme() {
+        let remote = NodeConfigResponse {
+            protocol: "anytls".to_string(),
+            listen_ip: "0.0.0.0".to_string(),
+            server_port: 443,
+            network: String::new(),
+            network_settings: None,
+            server_name: "node.example.com".to_string(),
+            tls_settings: Default::default(),
+            padding_scheme: Vec::new(),
+            routes: Vec::new(),
+            custom_outbounds: Vec::new(),
+            custom_routes: Vec::new(),
+            cert_config: Some(crate::panel::CertConfig {
+                cert_mode: "http".to_string(),
+                cert_path: "/var/lib/noders/anytls/node.example.com/fullchain.pem".to_string(),
+                key_path: "/var/lib/noders/anytls/node.example.com/privkey.pem".to_string(),
+                email: "ops@example.com".to_string(),
+                ..Default::default()
+            }),
+            base_config: None,
+        };
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("http cert mode");
+        assert!(matches!(
+            effective.tls.source,
+            tls::TlsMaterialSource::Acme { .. }
+        ));
     }
 
     #[test]

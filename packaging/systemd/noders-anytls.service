@@ -1,5 +1,5 @@
 [Unit]
-Description=NodeRS-AnyTLS service
+Description=NodeRS service
 After=network-online.target
 Wants=network-online.target
 

@@ -10,7 +10,8 @@ STATE_DIR="/var/lib/noders/anytls"
 OPENRC_DIR="/etc/init.d"
 RUN_DIR="/run/noders-anytls"
 LOG_DIR="/var/log/noders-anytls"
-SERVICE_NAME="noders-anytls"
+SERVICE_NAME="noders"
+LEGACY_SERVICE_NAME="noders-anytls"
 VERSION="latest"
 NO_RESTART=0
 TMP_ROOT=""
@@ -247,7 +248,11 @@ discover_units() {
 
     local unit_path unit_name
     shopt -s nullglob
-    for unit_path in /etc/systemd/system/${SERVICE_NAME}.service /etc/systemd/system/${SERVICE_NAME}-*.service; do
+    for unit_path in \
+      /etc/systemd/system/${SERVICE_NAME}.service \
+      /etc/systemd/system/${SERVICE_NAME}-*.service \
+      /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
+      /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service; do
       [[ -f "$unit_path" ]] || continue
       unit_name="$(basename "$unit_path" .service)"
       DISCOVERED_UNITS+=("$unit_name")
@@ -261,7 +266,11 @@ discover_units() {
 
     local service_path unit_name
     shopt -s nullglob
-    for service_path in /etc/init.d/${SERVICE_NAME} /etc/init.d/${SERVICE_NAME}-*; do
+    for service_path in \
+      /etc/init.d/${SERVICE_NAME} \
+      /etc/init.d/${SERVICE_NAME}-* \
+      /etc/init.d/${LEGACY_SERVICE_NAME} \
+      /etc/init.d/${LEGACY_SERVICE_NAME}-*; do
       [[ -f "$service_path" ]] || continue
       unit_name="$(basename "$service_path")"
       DISCOVERED_UNITS+=("$unit_name")
@@ -332,7 +341,11 @@ discover_openrc_service_account() {
 
   local unit_path command_user
   shopt -s nullglob
-  for unit_path in /etc/init.d/${SERVICE_NAME} /etc/init.d/${SERVICE_NAME}-*; do
+  for unit_path in \
+    /etc/init.d/${SERVICE_NAME} \
+    /etc/init.d/${SERVICE_NAME}-* \
+    /etc/init.d/${LEGACY_SERVICE_NAME} \
+    /etc/init.d/${LEGACY_SERVICE_NAME}-*; do
     [[ -f "$unit_path" ]] || continue
     command_user="$(sed -n 's/^command_user="\([^"]*\)"$/\1/p' "$unit_path" | head -n1)"
     if [[ -n "$command_user" ]]; then
