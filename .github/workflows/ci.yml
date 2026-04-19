@@ -15,6 +15,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install clang for bindgen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
@@ -39,6 +45,12 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install clang for bindgen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
