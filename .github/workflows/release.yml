@@ -40,11 +40,12 @@ jobs:
             quay.io/pypa/manylinux2014_x86_64:latest \
             bash -lc '
               set -euo pipefail
-              yum install -y curl git tar gzip which
+              yum install -y curl git tar gzip which clang clang-devel llvm llvm-devel
               if ! command -v rustup >/dev/null 2>&1; then
                 curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
               fi
               export PATH="${CARGO_HOME}/bin:${PATH}"
+              export LIBCLANG_PATH="$(llvm-config --libdir)"
               cargo fetch --locked
               bash scripts/verify-pure-rust.sh
               cargo test --locked --offline
@@ -78,7 +79,8 @@ jobs:
       - name: Install musl tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
