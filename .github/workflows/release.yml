@@ -20,66 +20,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Build GNU release binary in manylinux2014
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
-        run: |
-          set -euo pipefail
-          uid="$(id -u)"
-          gid="$(id -g)"
-          docker run --rm \
-            -e BIN_NAME="${BIN_NAME}" \
-            -e RELEASE_TAG="${RELEASE_TAG:-dev}" \
-            -e HOST_UID="${uid}" \
-            -e HOST_GID="${gid}" \
-            -e CARGO_HOME=/tmp/cargo \
-            -e RUSTUP_HOME=/tmp/rustup \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            -w /workspace \
-            quay.io/pypa/manylinux2014_x86_64:latest \
-            bash -lc '
-              set -euo pipefail
-              yum install -y curl git tar gzip which clang clang-devel llvm llvm-devel
-              if ! command -v rustup >/dev/null 2>&1; then
-                curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
-              fi
-              export PATH="${CARGO_HOME}/bin:${PATH}"
-              export LIBCLANG_PATH="$(llvm-config --libdir)"
-              cargo fetch --locked
-              bash scripts/verify-pure-rust.sh
-              cargo test --locked --offline
-              cargo build --locked --release --target x86_64-unknown-linux-gnu
-              bash scripts/package-release-bundle.sh \
-                --release-tag "${RELEASE_TAG}" \
-                --target x86_64-unknown-linux-gnu \
-                --asset-suffix linux-amd64
-              chown -R "${HOST_UID}:${HOST_GID}" dist target
-            '
-
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: linux-release-bundle-linux-amd64
-          path: dist/*
-          if-no-files-found: error
-
-  build-musl:
-    name: Build musl release bundle (linux-amd64-musl)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain with musl target
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      - name: Install musl tools
+      - name: Install GNU build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools clang libclang-dev llvm-dev
+          sudo apt-get install -y clang libclang-dev llvm-dev
           echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
 
       - name: Cache cargo artifacts
@@ -93,6 +40,52 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --offline
+
+      - name: Build release binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Prepare release package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
+        run: |
+          set -euo pipefail
+          bash scripts/package-release-bundle.sh \
+            --release-tag "${RELEASE_TAG:-dev}" \
+            --target x86_64-unknown-linux-gnu \
+            --asset-suffix linux-amd64
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-release-bundle-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  build-musl:
+    name: Build musl release bundle (linux-amd64-musl)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rust-cross/rust-musl-cross:x86_64-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve libclang path
+        run: |
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Enforce pure Rust protocol implementation
+        run: bash scripts/verify-pure-rust.sh
+
+      - name: Run tests
+        run: cargo test --locked --offline --target x86_64-unknown-linux-musl
 
       - name: Build release binary
         run: cargo build --locked --release --target x86_64-unknown-linux-musl
