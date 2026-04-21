@@ -5,6 +5,7 @@ NodeRS is a pure Rust Xboard machine-node runtime. This repository currently shi
 ## Overview
 
 - Linux only
+- Prebuilt release bundles are published for `linux-amd64`, `linux-amd64-musl`, `linux-arm64`, and `linux-arm64-musl`; install and upgrade scripts auto-detect `x86_64`/`aarch64` plus `glibc`/`musl`
 - Compatible with Xboard `/api/v2/server/*` and `/api/v2/server/machine/*`
 - One local process manages every AnyTLS node assigned to the same Xboard machine
 - Node membership, users, routes, listen address, port, and TLS are supplied by the panel

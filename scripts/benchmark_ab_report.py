@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import pathlib
+import re
 import shutil
 import socket
 import subprocess
@@ -127,7 +128,10 @@ NETEM_PROFILES = {
     "jittery-lossy": ["delay", "40ms", "150ms", "distribution", "paretonormal", "loss", "6%"],
 }
 
-FIXED_COMPARE_TAGS = ["v0.0.33"]
+# Pre-v0.1.0 releases still used the legacy single-node panel config and cannot be exercised by
+# the current machine-mode benchmark harness.
+FIXED_COMPARE_TAGS = ["v0.1.0"]
+MIN_COMPATIBLE_COMPARE_TAG = (0, 1, 0)
 
 
 def throughput_cases(cases: list[Case]) -> list[Case]:
@@ -151,7 +155,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Total number of previous tags to benchmark. The default keeps only the fixed release baseline "
-        "v0.0.33.",
+        "v0.1.0.",
     )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
@@ -222,6 +226,18 @@ def run_best_effort(
     )
 
 
+def parse_semver_tag(tag: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag.strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def is_compatible_compare_tag(tag: str) -> bool:
+    version = parse_semver_tag(tag)
+    return version is not None and version >= MIN_COMPATIBLE_COMPARE_TAG
+
+
 def select_previous_tags(limit: int) -> list[str]:
     if limit <= 0:
         return []
@@ -233,7 +249,7 @@ def select_previous_tags(limit: int) -> list[str]:
         if line.strip().startswith("v")
     ]
     selected: list[str] = []
-    available = [tag for tag in tags if tag not in head_tags]
+    available = [tag for tag in tags if tag not in head_tags and is_compatible_compare_tag(tag)]
 
     for tag in FIXED_COMPARE_TAGS:
         if tag in available and tag not in selected:
@@ -1032,6 +1048,8 @@ def release_asset_name_for_target(ref: str, target: str) -> str | None:
     target_asset_names = {
         "x86_64-unknown-linux-musl": f"noders-anytls-{ref}-linux-amd64-musl.tar.gz",
         "x86_64-unknown-linux-gnu": f"noders-anytls-{ref}-linux-amd64.tar.gz",
+        "aarch64-unknown-linux-musl": f"noders-anytls-{ref}-linux-arm64-musl.tar.gz",
+        "aarch64-unknown-linux-gnu": f"noders-anytls-{ref}-linux-arm64.tar.gz",
     }
     return target_asset_names.get(target)
 
@@ -1114,7 +1132,13 @@ def github_json(url: str) -> dict:
         return json.load(response)
 
 
-def download_sing_box(output_dir: pathlib.Path, version: str) -> tuple[pathlib.Path, str]:
+def sing_box_asset_name_for_target(target: str) -> str:
+    if target.startswith("aarch64-"):
+        return "linux-arm64.tar.gz"
+    return "linux-amd64.tar.gz"
+
+
+def download_sing_box(output_dir: pathlib.Path, version: str, target: str) -> tuple[pathlib.Path, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     if version != "latest":
         cached_binary = output_dir / f"sing-box-{version}"
@@ -1129,16 +1153,17 @@ def download_sing_box(output_dir: pathlib.Path, version: str) -> tuple[pathlib.P
     if binary_local.exists():
         return binary_local, tag_name
 
+    asset_name_suffix = sing_box_asset_name_for_target(target)
     asset = next(
         (
             item
             for item in release.get("assets", [])
-            if item["name"].endswith("linux-amd64.tar.gz") and "with-pgo" not in item["name"]
+            if item["name"].endswith(asset_name_suffix) and "with-pgo" not in item["name"]
         ),
         None,
     )
     if asset is None:
-        raise RuntimeError(f"unable to find linux-amd64 sing-box asset in release {tag_name}")
+        raise RuntimeError(f"unable to find {asset_name_suffix} sing-box asset in release {tag_name}")
 
     archive_path = output_dir / asset["name"]
     urllib.request.urlretrieve(asset["browser_download_url"], archive_path)
@@ -1753,7 +1778,7 @@ def main() -> int:
             )
         )
 
-    sing_binary, sing_version = download_sing_box(output_dir / "sing-box", args.sing_version)
+    sing_binary, sing_version = download_sing_box(output_dir / "sing-box", args.sing_version, args.target)
     implementations.append(
         Implementation(
             label="SingBox",

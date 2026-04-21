@@ -62,6 +62,55 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-arm64-gnu:
+    name: Build GNU release bundle (linux-arm64)
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GNU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Enforce pure Rust protocol implementation
+        run: bash scripts/verify-pure-rust.sh
+
+      - name: Run tests
+        run: cargo test --locked --offline --target aarch64-unknown-linux-gnu
+
+      - name: Build release binary
+        run: cargo build --locked --release --target aarch64-unknown-linux-gnu
+
+      - name: Prepare release package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
+        run: |
+          set -euo pipefail
+          bash scripts/package-release-bundle.sh \
+            --release-tag "${RELEASE_TAG:-dev}" \
+            --target aarch64-unknown-linux-gnu \
+            --asset-suffix linux-arm64
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-release-bundle-linux-arm64
+          path: dist/*
+          if-no-files-found: error
+
   build-musl:
     name: Build musl release bundle (linux-amd64-musl)
     runs-on: ubuntu-latest
@@ -108,9 +157,55 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-arm64-musl:
+    name: Build musl release bundle (linux-arm64-musl)
+    runs-on: ubuntu-22.04-arm
+    container:
+      image: ghcr.io/rust-cross/rust-musl-cross:aarch64-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve libclang path
+        run: |
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Enforce pure Rust protocol implementation
+        run: bash scripts/verify-pure-rust.sh
+
+      - name: Run tests
+        run: cargo test --locked --offline --target aarch64-unknown-linux-musl
+
+      - name: Build release binary
+        run: cargo build --locked --release --target aarch64-unknown-linux-musl
+
+      - name: Prepare release package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
+        run: |
+          set -euo pipefail
+          bash scripts/package-release-bundle.sh \
+            --release-tag "${RELEASE_TAG:-dev}" \
+            --target aarch64-unknown-linux-musl \
+            --asset-suffix linux-arm64-musl
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-release-bundle-linux-arm64-musl
+          path: dist/*
+          if-no-files-found: error
+
   publish:
     name: Publish Linux release assets
-    needs: [build-gnu, build-musl]
+    needs: [build-gnu, build-arm64-gnu, build-musl, build-arm64-musl]
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch'
     steps:

@@ -75,38 +75,43 @@ detect_linux_libc() {
 }
 
 detect_release_asset_suffix() {
-  local arch libc_family glibc_version
+  local arch libc_family glibc_version asset_prefix
   arch="$(uname -m)"
   case "$arch" in
     x86_64|amd64)
-      libc_family="$(detect_linux_libc)"
-      if [[ "$libc_family" == "glibc" ]]; then
-        glibc_version="$(detect_glibc_version)"
-        if [[ -n "$glibc_version" ]] && version_at_least "$glibc_version" "$GNU_GLIBC_FLOOR"; then
-          printf 'linux-amd64\n'
-          return
-        fi
-        if [[ -n "$glibc_version" ]]; then
-          echo "Detected glibc ${glibc_version}; falling back to linux-amd64-musl because GNU builds target glibc >= ${GNU_GLIBC_FLOOR}." >&2
-        else
-          echo "Detected glibc but could not determine the exact version; falling back to linux-amd64-musl for compatibility." >&2
-        fi
-        printf 'linux-amd64-musl\n'
-        return
-      fi
-
-      if [[ "$libc_family" == "musl" ]]; then
-        echo "Detected musl userspace; using linux-amd64-musl release bundle." >&2
-      else
-        echo "Unable to detect the host libc; using linux-amd64-musl release bundle for compatibility." >&2
-      fi
-      printf 'linux-amd64-musl\n'
+      asset_prefix='linux-amd64'
+      ;;
+    aarch64|arm64)
+      asset_prefix='linux-arm64'
       ;;
     *)
       echo "Unsupported architecture for prebuilt releases: $arch" >&2
       exit 1
       ;;
   esac
+
+  libc_family="$(detect_linux_libc)"
+  if [[ "$libc_family" == "glibc" ]]; then
+    glibc_version="$(detect_glibc_version)"
+    if [[ -n "$glibc_version" ]] && version_at_least "$glibc_version" "$GNU_GLIBC_FLOOR"; then
+      printf '%s\n' "$asset_prefix"
+      return
+    fi
+    if [[ -n "$glibc_version" ]]; then
+      echo "Detected glibc ${glibc_version}; falling back to ${asset_prefix}-musl because GNU builds target glibc >= ${GNU_GLIBC_FLOOR}." >&2
+    else
+      echo "Detected glibc but could not determine the exact version; falling back to ${asset_prefix}-musl for compatibility." >&2
+    fi
+    printf '%s-musl\n' "$asset_prefix"
+    return
+  fi
+
+  if [[ "$libc_family" == "musl" ]]; then
+    echo "Detected musl userspace; using ${asset_prefix}-musl release bundle." >&2
+  else
+    echo "Unable to detect the host libc; using ${asset_prefix}-musl release bundle for compatibility." >&2
+  fi
+  printf '%s-musl\n' "$asset_prefix"
 }
 
 parse_args() {

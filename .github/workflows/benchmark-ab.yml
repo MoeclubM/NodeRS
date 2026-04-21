@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       compare_count:
-        description: Total previous tags to compare; default keeps only the fixed release baseline v0.0.33
+        description: Total previous tags to compare; default keeps only the fixed machine-mode release baseline v0.1.0
         required: false
         default: "1"
       sing_box_version:
