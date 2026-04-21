@@ -70,6 +70,7 @@ pub(super) struct PayloadBuffer {
 }
 
 impl PayloadBuffer {
+    #[cfg(test)]
     pub(super) fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
@@ -85,6 +86,7 @@ impl PayloadBuffer {
         self.bytes.clear();
     }
 
+    #[cfg(test)]
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }

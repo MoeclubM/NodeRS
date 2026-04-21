@@ -53,12 +53,12 @@ PADDING_PROFILES = {
     "product-default": [],
     "standard-padding": STANDARD_PADDING_SCHEME,
 }
-RELEASE_BASELINE_TAG = "v0.0.33"
+RELEASE_BASELINE_TAG = "v0.1.0"
 RELEASE_BASELINE_LABEL = RELEASE_BASELINE_TAG
 
 PORTS = {
     "panel_current": 21080,
-    "panel_v031": 21081,
+    "panel_baseline": 21081,
     "tcp_source_small": 29080,
     "tcp_sink": 29081,
     "tcp_source_large": 29082,
@@ -67,7 +67,7 @@ PORTS = {
     "udp_sink": 29092,
     "http_target": 29100,
     "current": 24443,
-    "v031": 24444,
+    "baseline": 24444,
     "sing": 24445,
     "socks_base": 20880,
 }
@@ -1579,7 +1579,7 @@ httpd.serve_forever()
         server_ssh,
         f"{server_root}/config/baseline.toml",
         baseline_node_config(
-            panel_port=PORTS["panel_v031"],
+            panel_port=PORTS["panel_baseline"],
             cert_path=cert_path,
             key_path=key_path,
         ),
@@ -1764,9 +1764,9 @@ chmod 600 {shlex.quote(server_root)}/config/tls.key
         raise RuntimeError(f"expected benchmark ports to be free on server, found listeners:\n{out}")
 
     start_bg(server_ssh, root=server_root, name="panel-current", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_current']} --server-port {PORTS['current']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_current"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="panel-baseline", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_v031']} --server-port {PORTS['v031']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_v031"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="panel-baseline", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_baseline']} --server-port {PORTS['baseline']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_baseline"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="noders-current", cmd=f"{server_root}/bin/noders-anytls-current {server_root}/config/current.toml", ready_host="127.0.0.1", ready_port=PORTS["current"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="noders-baseline", cmd=f"{server_root}/bin/noders-anytls-baseline {server_root}/config/baseline.toml", ready_host="127.0.0.1", ready_port=PORTS["v031"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="noders-baseline", cmd=f"{server_root}/bin/noders-anytls-baseline {server_root}/config/baseline.toml", ready_host="127.0.0.1", ready_port=PORTS["baseline"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="sing-box", cmd=f"{server_root}/bin/sing-box run -c {server_root}/config/sing-box.json", ready_host="127.0.0.1", ready_port=PORTS["sing"], ready_label="server")
 
 
@@ -2039,7 +2039,7 @@ def main() -> None:
             ping_host = SINGLE_HOST_HOST_IP
 
         print("[phase] wait server ports from client", flush=True)
-        for port in [PORTS["current"], PORTS["v031"], PORTS["sing"]]:
+        for port in [PORTS["current"], PORTS["baseline"], PORTS["sing"]]:
             wait_port(
                 client_ssh,
                 connect_host,
@@ -2053,8 +2053,8 @@ def main() -> None:
         summary["ping"] = ping_summary(client_ssh, ping_host, local_run=local_run, exec_prefix=client_exec_prefix)
 
         raw_results: list[dict] = []
-        impls = [("current", PORTS["current"]), (RELEASE_BASELINE_LABEL, PORTS["v031"]), ("SingBox", PORTS["sing"])]
-        server_ports = [PORTS["current"], PORTS["v031"], PORTS["sing"]]
+        impls = [("current", PORTS["current"]), (RELEASE_BASELINE_LABEL, PORTS["baseline"]), ("SingBox", PORTS["sing"])]
+        server_ports = [PORTS["current"], PORTS["baseline"], PORTS["sing"]]
         for scenario in scenarios:
             print(f"[scenario] {scenario.name} attempts={scenario.attempts}", flush=True)
             ensure_target_service(server_ssh, server_root=server_root, target_key=scenario.target_key)
