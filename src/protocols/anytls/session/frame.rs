@@ -36,9 +36,10 @@ pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
 // This queue doubles as the effective upload window between the AnyTLS session and the
-// outbound socket. Weak-link uploads stall early when this window is too tight because
-// whole-frame forwarding falls into backpressure retries far more often than the socket itself.
-pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+// outbound socket. Whole-frame forwarding remains latency-sensitive when the window is too
+// small, because a single 10 MiB to 25 MiB browser upload can start oscillating on queue
+// backpressure long before the outbound socket itself is saturated.
+pub(super) const STREAM_INBOUND_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PayloadTier {

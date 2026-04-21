@@ -109,11 +109,6 @@ impl PayloadBuffer {
     pub(super) fn len(&self) -> usize {
         self.bytes.len()
     }
-
-    pub(super) fn into_vec(mut self) -> Vec<u8> {
-        self.recycler = None;
-        std::mem::take(&mut self.bytes)
-    }
 }
 
 impl Drop for PayloadBuffer {

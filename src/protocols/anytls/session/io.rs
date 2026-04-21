@@ -16,10 +16,10 @@ use super::channel::{BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
 use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 use super::frame::{
-    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, DEFAULT_UPLOAD_BATCH_SIZE,
-    LARGE_UPLOAD_BATCH_IOVECS, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
-    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
-    SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
+    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
+    MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
+    SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN, SMALL_UPLOAD_BATCH_IOVECS,
+    download_coalesce_target, upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame, write_frame_immediate};
 #[cfg(target_env = "musl")]
@@ -502,14 +502,7 @@ fn upload_batch_policy_for_chunks(
     } else {
         front_len
     };
-    let policy = upload_batch_policy(effective_front_len);
-    if front_offset > 0 && policy.max_iovecs == LARGE_UPLOAD_BATCH_IOVECS {
-        return super::frame::UploadBatchPolicy {
-            max_bytes: DEFAULT_UPLOAD_BATCH_SIZE,
-            max_iovecs: DEFAULT_UPLOAD_BATCH_IOVECS,
-        };
-    }
-    policy
+    upload_batch_policy(effective_front_len)
 }
 
 #[cfg(test)]
