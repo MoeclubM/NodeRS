@@ -566,7 +566,9 @@ impl CertConfig {
     }
 
     pub fn extra_string(&self, aliases: &[&[&str]]) -> Option<String> {
-        lookup_extra_alias(&self.extra, aliases).and_then(value_to_trimmed_string)
+        aliases
+            .iter()
+            .find_map(|path| lookup_extra_string_path(&self.extra, path))
     }
 
     pub fn extra_strings(&self, aliases: &[&[&str]]) -> Vec<String> {
@@ -593,6 +595,67 @@ fn split_cert_domains(raw: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
+}
+
+fn lookup_extra_string_path(
+    object: &serde_json::Map<String, Value>,
+    path: &[&str],
+) -> Option<String> {
+    let (first, rest) = path.split_first()?;
+    let value = lookup_extra_key(object, first)?;
+    if rest.is_empty() {
+        return value_to_trimmed_string(value);
+    }
+
+    match value {
+        Value::Object(next) => lookup_extra_string_path(next, rest),
+        Value::String(text) if rest.len() == 1 => lookup_key_value_text(text, rest[0]),
+        _ => None,
+    }
+}
+
+fn lookup_key_value_text(text: &str, key: &str) -> Option<String> {
+    let normalized_key = normalize_extra_key(key);
+    text.lines().find_map(|line| {
+        let (candidate, value) = parse_key_value_line(line)?;
+        if normalize_extra_key(candidate) == normalized_key {
+            Some(strip_wrapping_quotes(value).to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_key_value_line(line: &str) -> Option<(&str, &str)> {
+    let mut line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    if let Some(rest) = line
+        .strip_prefix("export ")
+        .or_else(|| line.strip_prefix("export\t"))
+    {
+        line = rest.trim_start();
+    }
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some((key, value.trim()))
+    }
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 fn lookup_extra_alias<'a>(
@@ -1413,6 +1476,36 @@ mod tests {
         assert_eq!(cert.acme_challenge().as_deref(), Some("dns-01"));
         assert_eq!(cert.cloudflare_api_token().as_deref(), Some("token-abc"));
         assert_eq!(cert.cloudflare_api_key().as_deref(), Some("cf-key"));
+        assert_eq!(
+            cert.cloudflare_api_email().as_deref(),
+            Some("dns@example.com")
+        );
+        assert_eq!(cert.alidns_access_key_id().as_deref(), Some("ali-id"));
+        assert_eq!(
+            cert.alidns_access_key_secret().as_deref(),
+            Some("ali-secret")
+        );
+    }
+
+    #[test]
+    fn cert_config_resolves_dns_provider_credentials_from_env_text_block() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "dns",
+                "provider": "cloudflare",
+                "env": "CF_API_TOKEN=token-abc\nexport CF_API_EMAIL=dns@example.com\n# ignored\nALICLOUD_ACCESS_KEY_ID=ali-id\r\nALICLOUD_ACCESS_KEY_SECRET='ali-secret'"
+            }
+        }))
+        .expect("parse config");
+
+        let cert = config.cert_config.expect("cert config");
+        assert_eq!(cert.cloudflare_api_token().as_deref(), Some("token-abc"));
         assert_eq!(
             cert.cloudflare_api_email().as_deref(),
             Some("dns@example.com")

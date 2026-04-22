@@ -744,6 +744,73 @@ mod tests {
     }
 
     #[test]
+    fn accepts_dns_cert_mode_with_env_text_block() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "dns",
+                "provider": "cloudflare",
+                "env": "CF_API_TOKEN=token-abc"
+            }
+        }))
+        .expect("parse remote");
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("dns cert mode");
+        match effective.tls.source {
+            tls::TlsMaterialSource::Acme { config, .. } => match config.challenge {
+                acme::AcmeChallengeConfig::Dns01(acme::Dns01Config { provider, .. }) => {
+                    match provider {
+                        acme::DnsProviderConfig::Cloudflare { api_token, .. } => {
+                            assert_eq!(api_token.as_deref(), Some("token-abc"));
+                        }
+                        _ => unreachable!("expected cloudflare DNS provider"),
+                    }
+                }
+                _ => unreachable!("expected dns-01 ACME challenge"),
+            },
+            _ => unreachable!("expected ACME TLS source"),
+        }
+    }
+
+    #[test]
+    fn infers_cloudflare_provider_from_env_text_block() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "acme",
+                "env": "CF_API_TOKEN=token-abc"
+            }
+        }))
+        .expect("parse remote");
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("acme dns provider");
+        match effective.tls.source {
+            tls::TlsMaterialSource::Acme { config, .. } => match config.challenge {
+                acme::AcmeChallengeConfig::Dns01(acme::Dns01Config { provider, .. }) => {
+                    match provider {
+                        acme::DnsProviderConfig::Cloudflare { api_token, .. } => {
+                            assert_eq!(api_token.as_deref(), Some("token-abc"));
+                        }
+                        _ => unreachable!("expected cloudflare DNS provider"),
+                    }
+                }
+                _ => unreachable!("expected dns-01 ACME challenge"),
+            },
+            _ => unreachable!("expected ACME TLS source"),
+        }
+    }
+
+    #[test]
     fn acme_mode_with_dns_provider_defaults_to_dns01() {
         let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
             "protocol": "anytls",
