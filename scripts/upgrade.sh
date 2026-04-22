@@ -317,7 +317,13 @@ discover_restart_targets() {
   local unit_name
   case "$SERVICE_MANAGER" in
     systemd)
-      RESTART_TARGET_UNITS=("${ACTIVE_UNITS[@]}")
+      for unit_name in "${DISCOVERED_UNITS[@]}"; do
+        case "$(systemctl show -p ActiveState --value "$unit_name" 2>/dev/null || true)" in
+          active|activating|reloading|failed)
+            RESTART_TARGET_UNITS+=("$unit_name")
+            ;;
+        esac
+      done
       ;;
     openrc)
       for unit_name in "${DISCOVERED_UNITS[@]}"; do

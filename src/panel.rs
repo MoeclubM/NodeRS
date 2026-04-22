@@ -505,7 +505,47 @@ impl CertConfig {
             &["env", "CF_DNS_API_TOKEN"],
             &["env", "CF_API_TOKEN"],
             &["env", "CLOUDFLARE_API_TOKEN"],
+            &["environment_variables", "CF_DNS_API_TOKEN"],
+            &["environment_variables", "CF_API_TOKEN"],
+            &["environment_variables", "CLOUDFLARE_API_TOKEN"],
+            &["credentials", "CF_DNS_API_TOKEN"],
+            &["credentials", "CF_API_TOKEN"],
+            &["credentials", "CLOUDFLARE_API_TOKEN"],
+            &["cloudflare", "env", "CF_DNS_API_TOKEN"],
+            &["cloudflare", "env", "CF_API_TOKEN"],
+            &["cloudflare", "env", "CLOUDFLARE_API_TOKEN"],
+            &["cloudflare", "environment_variables", "CF_DNS_API_TOKEN"],
+            &["cloudflare", "environment_variables", "CF_API_TOKEN"],
+            &[
+                "cloudflare",
+                "environment_variables",
+                "CLOUDFLARE_API_TOKEN",
+            ],
+            &["cloudflare", "credentials", "CF_DNS_API_TOKEN"],
+            &["cloudflare", "credentials", "CF_API_TOKEN"],
+            &["cloudflare", "credentials", "CLOUDFLARE_API_TOKEN"],
+            &["dns", "env", "CF_DNS_API_TOKEN"],
+            &["dns", "env", "CF_API_TOKEN"],
+            &["dns", "env", "CLOUDFLARE_API_TOKEN"],
+            &["dns", "environment_variables", "CF_DNS_API_TOKEN"],
+            &["dns", "environment_variables", "CF_API_TOKEN"],
+            &["dns", "environment_variables", "CLOUDFLARE_API_TOKEN"],
+            &["dns", "credentials", "CF_DNS_API_TOKEN"],
+            &["dns", "credentials", "CF_API_TOKEN"],
+            &["dns", "credentials", "CLOUDFLARE_API_TOKEN"],
+            &["provider", "env", "CF_DNS_API_TOKEN"],
+            &["provider", "env", "CF_API_TOKEN"],
+            &["provider", "env", "CLOUDFLARE_API_TOKEN"],
+            &["provider", "environment_variables", "CF_DNS_API_TOKEN"],
+            &["provider", "environment_variables", "CF_API_TOKEN"],
+            &["provider", "environment_variables", "CLOUDFLARE_API_TOKEN"],
+            &["provider", "credentials", "CF_DNS_API_TOKEN"],
+            &["provider", "credentials", "CF_API_TOKEN"],
+            &["provider", "credentials", "CLOUDFLARE_API_TOKEN"],
         ])
+        .or_else(|| {
+            self.extra_env_string(&["CF_DNS_API_TOKEN", "CF_API_TOKEN", "CLOUDFLARE_API_TOKEN"])
+        })
     }
 
     pub fn cloudflare_api_key(&self) -> Option<String> {
@@ -518,7 +558,30 @@ impl CertConfig {
             &["provider", "api_key"],
             &["env", "CF_API_KEY"],
             &["env", "CLOUDFLARE_API_KEY"],
+            &["environment_variables", "CF_API_KEY"],
+            &["environment_variables", "CLOUDFLARE_API_KEY"],
+            &["credentials", "CF_API_KEY"],
+            &["credentials", "CLOUDFLARE_API_KEY"],
+            &["cloudflare", "env", "CF_API_KEY"],
+            &["cloudflare", "env", "CLOUDFLARE_API_KEY"],
+            &["cloudflare", "environment_variables", "CF_API_KEY"],
+            &["cloudflare", "environment_variables", "CLOUDFLARE_API_KEY"],
+            &["cloudflare", "credentials", "CF_API_KEY"],
+            &["cloudflare", "credentials", "CLOUDFLARE_API_KEY"],
+            &["dns", "env", "CF_API_KEY"],
+            &["dns", "env", "CLOUDFLARE_API_KEY"],
+            &["dns", "environment_variables", "CF_API_KEY"],
+            &["dns", "environment_variables", "CLOUDFLARE_API_KEY"],
+            &["dns", "credentials", "CF_API_KEY"],
+            &["dns", "credentials", "CLOUDFLARE_API_KEY"],
+            &["provider", "env", "CF_API_KEY"],
+            &["provider", "env", "CLOUDFLARE_API_KEY"],
+            &["provider", "environment_variables", "CF_API_KEY"],
+            &["provider", "environment_variables", "CLOUDFLARE_API_KEY"],
+            &["provider", "credentials", "CF_API_KEY"],
+            &["provider", "credentials", "CLOUDFLARE_API_KEY"],
         ])
+        .or_else(|| self.extra_env_string(&["CF_API_KEY", "CLOUDFLARE_API_KEY"]))
     }
 
     pub fn cloudflare_api_email(&self) -> Option<String> {
@@ -530,7 +593,34 @@ impl CertConfig {
             &["provider", "email"],
             &["env", "CF_API_EMAIL"],
             &["env", "CLOUDFLARE_API_EMAIL"],
+            &["environment_variables", "CF_API_EMAIL"],
+            &["environment_variables", "CLOUDFLARE_API_EMAIL"],
+            &["credentials", "CF_API_EMAIL"],
+            &["credentials", "CLOUDFLARE_API_EMAIL"],
+            &["cloudflare", "env", "CF_API_EMAIL"],
+            &["cloudflare", "env", "CLOUDFLARE_API_EMAIL"],
+            &["cloudflare", "environment_variables", "CF_API_EMAIL"],
+            &[
+                "cloudflare",
+                "environment_variables",
+                "CLOUDFLARE_API_EMAIL",
+            ],
+            &["cloudflare", "credentials", "CF_API_EMAIL"],
+            &["cloudflare", "credentials", "CLOUDFLARE_API_EMAIL"],
+            &["dns", "env", "CF_API_EMAIL"],
+            &["dns", "env", "CLOUDFLARE_API_EMAIL"],
+            &["dns", "environment_variables", "CF_API_EMAIL"],
+            &["dns", "environment_variables", "CLOUDFLARE_API_EMAIL"],
+            &["dns", "credentials", "CF_API_EMAIL"],
+            &["dns", "credentials", "CLOUDFLARE_API_EMAIL"],
+            &["provider", "env", "CF_API_EMAIL"],
+            &["provider", "env", "CLOUDFLARE_API_EMAIL"],
+            &["provider", "environment_variables", "CF_API_EMAIL"],
+            &["provider", "environment_variables", "CLOUDFLARE_API_EMAIL"],
+            &["provider", "credentials", "CF_API_EMAIL"],
+            &["provider", "credentials", "CLOUDFLARE_API_EMAIL"],
         ])
+        .or_else(|| self.extra_env_string(&["CF_API_EMAIL", "CLOUDFLARE_API_EMAIL"]))
     }
 
     pub fn alidns_access_key_id(&self) -> Option<String> {
@@ -546,7 +636,51 @@ impl CertConfig {
             &["env", "ALICLOUD_ACCESS_KEY_ID"],
             &["env", "ALIDNS_ACCESS_KEY_ID"],
             &["env", "ALIYUN_ACCESS_KEY_ID"],
+            &["environment_variables", "ALICLOUD_ACCESS_KEY_ID"],
+            &["environment_variables", "ALIDNS_ACCESS_KEY_ID"],
+            &["environment_variables", "ALIYUN_ACCESS_KEY_ID"],
+            &["credentials", "ALICLOUD_ACCESS_KEY_ID"],
+            &["credentials", "ALIDNS_ACCESS_KEY_ID"],
+            &["credentials", "ALIYUN_ACCESS_KEY_ID"],
+            &["alidns", "env", "ALICLOUD_ACCESS_KEY_ID"],
+            &["alidns", "env", "ALIDNS_ACCESS_KEY_ID"],
+            &["alidns", "env", "ALIYUN_ACCESS_KEY_ID"],
+            &["alidns", "environment_variables", "ALICLOUD_ACCESS_KEY_ID"],
+            &["alidns", "environment_variables", "ALIDNS_ACCESS_KEY_ID"],
+            &["alidns", "environment_variables", "ALIYUN_ACCESS_KEY_ID"],
+            &["alidns", "credentials", "ALICLOUD_ACCESS_KEY_ID"],
+            &["alidns", "credentials", "ALIDNS_ACCESS_KEY_ID"],
+            &["alidns", "credentials", "ALIYUN_ACCESS_KEY_ID"],
+            &["dns", "env", "ALICLOUD_ACCESS_KEY_ID"],
+            &["dns", "env", "ALIDNS_ACCESS_KEY_ID"],
+            &["dns", "env", "ALIYUN_ACCESS_KEY_ID"],
+            &["dns", "environment_variables", "ALICLOUD_ACCESS_KEY_ID"],
+            &["dns", "environment_variables", "ALIDNS_ACCESS_KEY_ID"],
+            &["dns", "environment_variables", "ALIYUN_ACCESS_KEY_ID"],
+            &["dns", "credentials", "ALICLOUD_ACCESS_KEY_ID"],
+            &["dns", "credentials", "ALIDNS_ACCESS_KEY_ID"],
+            &["dns", "credentials", "ALIYUN_ACCESS_KEY_ID"],
+            &["provider", "env", "ALICLOUD_ACCESS_KEY_ID"],
+            &["provider", "env", "ALIDNS_ACCESS_KEY_ID"],
+            &["provider", "env", "ALIYUN_ACCESS_KEY_ID"],
+            &[
+                "provider",
+                "environment_variables",
+                "ALICLOUD_ACCESS_KEY_ID",
+            ],
+            &["provider", "environment_variables", "ALIDNS_ACCESS_KEY_ID"],
+            &["provider", "environment_variables", "ALIYUN_ACCESS_KEY_ID"],
+            &["provider", "credentials", "ALICLOUD_ACCESS_KEY_ID"],
+            &["provider", "credentials", "ALIDNS_ACCESS_KEY_ID"],
+            &["provider", "credentials", "ALIYUN_ACCESS_KEY_ID"],
         ])
+        .or_else(|| {
+            self.extra_env_string(&[
+                "ALICLOUD_ACCESS_KEY_ID",
+                "ALIDNS_ACCESS_KEY_ID",
+                "ALIYUN_ACCESS_KEY_ID",
+            ])
+        })
     }
 
     pub fn alidns_access_key_secret(&self) -> Option<String> {
@@ -562,13 +696,81 @@ impl CertConfig {
             &["env", "ALICLOUD_ACCESS_KEY_SECRET"],
             &["env", "ALIDNS_ACCESS_KEY_SECRET"],
             &["env", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["environment_variables", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["environment_variables", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["environment_variables", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["credentials", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["credentials", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["credentials", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["alidns", "env", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["alidns", "env", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["alidns", "env", "ALIYUN_ACCESS_KEY_SECRET"],
+            &[
+                "alidns",
+                "environment_variables",
+                "ALICLOUD_ACCESS_KEY_SECRET",
+            ],
+            &[
+                "alidns",
+                "environment_variables",
+                "ALIDNS_ACCESS_KEY_SECRET",
+            ],
+            &[
+                "alidns",
+                "environment_variables",
+                "ALIYUN_ACCESS_KEY_SECRET",
+            ],
+            &["alidns", "credentials", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["alidns", "credentials", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["alidns", "credentials", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["dns", "env", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["dns", "env", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["dns", "env", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["dns", "environment_variables", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["dns", "environment_variables", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["dns", "environment_variables", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["dns", "credentials", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["dns", "credentials", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["dns", "credentials", "ALIYUN_ACCESS_KEY_SECRET"],
+            &["provider", "env", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["provider", "env", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["provider", "env", "ALIYUN_ACCESS_KEY_SECRET"],
+            &[
+                "provider",
+                "environment_variables",
+                "ALICLOUD_ACCESS_KEY_SECRET",
+            ],
+            &[
+                "provider",
+                "environment_variables",
+                "ALIDNS_ACCESS_KEY_SECRET",
+            ],
+            &[
+                "provider",
+                "environment_variables",
+                "ALIYUN_ACCESS_KEY_SECRET",
+            ],
+            &["provider", "credentials", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["provider", "credentials", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["provider", "credentials", "ALIYUN_ACCESS_KEY_SECRET"],
         ])
+        .or_else(|| {
+            self.extra_env_string(&[
+                "ALICLOUD_ACCESS_KEY_SECRET",
+                "ALIDNS_ACCESS_KEY_SECRET",
+                "ALIYUN_ACCESS_KEY_SECRET",
+            ])
+        })
     }
 
     pub fn extra_string(&self, aliases: &[&[&str]]) -> Option<String> {
         aliases
             .iter()
             .find_map(|path| lookup_extra_string_path(&self.extra, path))
+    }
+
+    pub fn extra_env_string(&self, env_keys: &[&str]) -> Option<String> {
+        lookup_env_keys_in_object(&self.extra, env_keys)
     }
 
     pub fn extra_strings(&self, aliases: &[&[&str]]) -> Vec<String> {
@@ -624,6 +826,33 @@ fn lookup_key_value_text(text: &str, key: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn lookup_env_keys_in_object(
+    object: &serde_json::Map<String, Value>,
+    env_keys: &[&str],
+) -> Option<String> {
+    env_keys
+        .iter()
+        .find_map(|key| lookup_extra_key(object, key).and_then(value_to_trimmed_string))
+        .or_else(|| {
+            object
+                .values()
+                .find_map(|value| lookup_env_keys_in_value(value, env_keys))
+        })
+}
+
+fn lookup_env_keys_in_value(value: &Value, env_keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(object) => lookup_env_keys_in_object(object, env_keys),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| lookup_env_keys_in_value(value, env_keys)),
+        Value::String(text) => env_keys
+            .iter()
+            .find_map(|key| lookup_key_value_text(text, key)),
+        _ => None,
+    }
 }
 
 fn parse_key_value_line(line: &str) -> Option<(&str, &str)> {
@@ -1500,6 +1729,44 @@ mod tests {
                 "cert_mode": "dns",
                 "provider": "cloudflare",
                 "env": "CF_API_TOKEN=token-abc\nexport CF_API_EMAIL=dns@example.com\n# ignored\nALICLOUD_ACCESS_KEY_ID=ali-id\r\nALICLOUD_ACCESS_KEY_SECRET='ali-secret'"
+            }
+        }))
+        .expect("parse config");
+
+        let cert = config.cert_config.expect("cert config");
+        assert_eq!(cert.cloudflare_api_token().as_deref(), Some("token-abc"));
+        assert_eq!(
+            cert.cloudflare_api_email().as_deref(),
+            Some("dns@example.com")
+        );
+        assert_eq!(cert.alidns_access_key_id().as_deref(), Some("ali-id"));
+        assert_eq!(
+            cert.alidns_access_key_secret().as_deref(),
+            Some("ali-secret")
+        );
+    }
+
+    #[test]
+    fn cert_config_resolves_dns_provider_credentials_from_nested_env_block() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "dns",
+                "provider": "cloudflare",
+                "cloudflare": {
+                    "environment_variables": "CF_API_TOKEN=token-abc\nCF_API_EMAIL=dns@example.com"
+                },
+                "dns": {
+                    "credentials": {
+                        "ALICLOUD_ACCESS_KEY_ID": "ali-id",
+                        "ALICLOUD_ACCESS_KEY_SECRET": "ali-secret"
+                    }
+                }
             }
         }))
         .expect("parse config");
