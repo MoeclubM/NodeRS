@@ -1,13 +1,13 @@
 mod activity;
-mod dns;
+pub(crate) mod dns;
 mod padding;
-mod routing;
-mod rules;
+pub(crate) mod routing;
+pub(crate) mod rules;
 mod session;
-mod socksaddr;
-mod tls;
-mod traffic;
-mod transport;
+pub(crate) mod socksaddr;
+pub(crate) mod tls;
+pub(crate) mod traffic;
+pub(crate) mod transport;
 mod uot;
 
 use anyhow::Context;
@@ -15,14 +15,15 @@ use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 
 use crate::accounting::Accounting;
-use crate::panel::{NodeConfigResponse, RouteConfig};
+use crate::acme;
+use crate::panel::{CertConfig, NodeConfigResponse, PanelUser, RouteConfig};
 
 use self::padding::PaddingScheme;
 use self::routing::RoutingTable;
@@ -43,7 +44,7 @@ pub struct EffectiveNodeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffectiveTlsConfig {
+pub(crate) struct EffectiveTlsConfig {
     pub source: tls::TlsMaterialSource,
     pub ech: Option<tls::EchConfigSource>,
 }
@@ -68,23 +69,25 @@ impl EffectiveNodeConfig {
 }
 
 impl EffectiveTlsConfig {
-    fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
+    pub(crate) fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         let cert_mode = remote
             .cert_config
             .as_ref()
             .map(|config| config.cert_mode())
             .unwrap_or("self_signed");
-        match cert_mode {
+        let normalized_cert_mode = cert_mode.to_ascii_lowercase();
+        match normalized_cert_mode.as_str() {
             "file" | "path" => {
                 let cert_config = remote
                     .cert_config
                     .as_ref()
                     .context("Xboard cert_config is required for file certificate mode")?;
-                let cert_path = cert_config.cert_path.trim();
-                let key_path = cert_config.key_path.trim();
-                if cert_path.is_empty() || key_path.is_empty() {
-                    anyhow::bail!("Xboard cert_config must include cert_path and key_path");
-                }
+                let cert_path = cert_config
+                    .resolved_cert_path()
+                    .context("Xboard cert_config must include cert_path and key_path")?;
+                let key_path = cert_config
+                    .resolved_key_path()
+                    .context("Xboard cert_config must include cert_path and key_path")?;
                 Ok(Self {
                     source: tls::TlsMaterialSource::Files {
                         cert_path: cert_path.into(),
@@ -98,64 +101,43 @@ impl EffectiveTlsConfig {
                     .cert_config
                     .as_ref()
                     .context("Xboard cert_config is required for inline certificate mode")?;
-                let cert_pem = cert_config.cert_pem();
-                let key_pem = cert_config.key_pem();
-                if cert_pem.is_empty() || key_pem.is_empty() {
-                    anyhow::bail!(
-                        "Xboard cert_config inline mode must include certificate PEM and private key PEM"
-                    );
-                }
+                let cert_pem = cert_config.resolved_cert_pem().context(
+                    "Xboard cert_config inline mode must include certificate PEM and private key PEM",
+                )?;
+                let key_pem = cert_config.resolved_key_pem().context(
+                    "Xboard cert_config inline mode must include certificate PEM and private key PEM",
+                )?;
                 Ok(Self {
                     source: tls::TlsMaterialSource::Inline {
-                        cert_pem: cert_pem.as_bytes().to_vec(),
-                        key_pem: key_pem.as_bytes().to_vec(),
+                        cert_pem: cert_pem.into_bytes(),
+                        key_pem: key_pem.into_bytes(),
                     },
                     ech: effective_ech_config(remote)?,
                 })
             }
-            "acme" | "letsencrypt" | "http" => {
+            "acme" | "letsencrypt" | "http" | "dns" => {
                 let cert_config = remote
                     .cert_config
                     .as_ref()
                     .context("Xboard cert_config is required for ACME certificate mode")?;
-                let domain = if !cert_config.domain().is_empty() {
-                    cert_config.domain().to_string()
-                } else if !remote.server_name.trim().is_empty() {
-                    remote.server_name.trim().to_string()
-                } else if !remote.tls_settings.server_name.trim().is_empty() {
-                    remote.tls_settings.server_name.trim().to_string()
-                } else {
+                let domains = effective_acme_domains(remote, cert_config);
+                if domains.is_empty() {
                     anyhow::bail!(
-                        "Xboard cert_config acme mode must include domain or server_name"
+                        "Xboard cert_config acme mode must include domain, domains, or server_name"
                     );
-                };
-                let cert_path = if cert_config.cert_path.trim().is_empty() {
-                    let storage_name: String = domain
-                        .chars()
-                        .map(|ch| {
-                            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                                ch
-                            } else {
-                                '_'
-                            }
-                        })
-                        .collect();
-                    let storage_name = if storage_name.is_empty() {
-                        "default"
-                    } else {
-                        storage_name.as_str()
-                    };
-                    PathBuf::from(format!("acme/{storage_name}/fullchain.pem"))
+                }
+                let storage_name = acme_storage_name(&domains);
+                let cert_path = cert_config
+                    .resolved_cert_path()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("acme/{storage_name}/fullchain.pem")));
+                let key_path = if let Some(key_path) = cert_config.resolved_key_path() {
+                    key_path.into()
                 } else {
-                    cert_config.cert_path.trim().into()
-                };
-                let key_path = if cert_config.key_path.trim().is_empty() {
                     cert_path
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("acme"))
                         .join("privkey.pem")
-                } else {
-                    cert_config.key_path.trim().into()
                 };
                 let account_key_path = if !cert_config.account_key_path().is_empty() {
                     cert_config.account_key_path().into()
@@ -166,12 +148,17 @@ impl EffectiveTlsConfig {
                     source: tls::TlsMaterialSource::Acme {
                         cert_path,
                         key_path,
-                        directory_url: cert_config.directory_url().to_string(),
-                        email: cert_config.email().to_string(),
-                        domain,
-                        challenge_listen: cert_config.challenge_listen().to_string(),
-                        renew_before_days: cert_config.renew_before_days(),
-                        account_key_path,
+                        config: acme::AcmeConfig {
+                            directory_url: cert_config.directory_url().to_string(),
+                            email: cert_config.email().to_string(),
+                            domains,
+                            renew_before_days: cert_config.renew_before_days(),
+                            account_key_path,
+                            challenge: effective_acme_challenge(
+                                normalized_cert_mode.as_str(),
+                                cert_config,
+                            )?,
+                        },
                     },
                     ech: effective_ech_config(remote)?,
                 })
@@ -198,8 +185,152 @@ impl EffectiveTlsConfig {
                     ech: effective_ech_config(remote)?,
                 })
             }
-            cert_mode => anyhow::bail!("unsupported Xboard cert_config.cert_mode {cert_mode}"),
+            _ => anyhow::bail!("unsupported Xboard cert_config.cert_mode {cert_mode}"),
         }
+    }
+}
+
+fn effective_acme_domains(remote: &NodeConfigResponse, cert_config: &CertConfig) -> Vec<String> {
+    let mut domains = cert_config.domains();
+    if domains.is_empty() {
+        let server_name = remote.server_name.trim();
+        if !server_name.is_empty() {
+            domains.push(server_name.to_string());
+        }
+        let tls_server_name = remote.tls_settings.server_name.trim();
+        if !tls_server_name.is_empty()
+            && !domains
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(tls_server_name))
+        {
+            domains.push(tls_server_name.to_string());
+        }
+    }
+    domains
+}
+
+fn acme_storage_name(domains: &[String]) -> String {
+    let candidate = domains
+        .iter()
+        .find(|domain| !domain.trim().starts_with("*."))
+        .or_else(|| domains.first())
+        .map(|domain| domain.trim().trim_start_matches("*."))
+        .unwrap_or_default();
+    let storage_name: String = candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if storage_name.is_empty() {
+        "default".to_string()
+    } else {
+        storage_name
+    }
+}
+
+fn effective_acme_challenge(
+    cert_mode: &str,
+    cert_config: &CertConfig,
+) -> anyhow::Result<acme::AcmeChallengeConfig> {
+    let challenge_name = match cert_mode {
+        "dns" => "dns",
+        "http" => "http",
+        _ => match cert_config
+            .acme_challenge()
+            .as_deref()
+            .and_then(normalize_acme_challenge_name)
+        {
+            Some(challenge) => challenge,
+            None if cert_config.dns_provider().is_some()
+                || infer_dns_provider(cert_config).is_some() =>
+            {
+                "dns"
+            }
+            None => "http",
+        },
+    };
+
+    match challenge_name {
+        "http" => Ok(acme::AcmeChallengeConfig::Http01 {
+            listen: cert_config.challenge_listen().to_string(),
+        }),
+        "dns" => Ok(acme::AcmeChallengeConfig::Dns01(acme::Dns01Config {
+            provider: build_dns_provider_config(cert_config)?,
+            propagation_timeout_secs: cert_config.dns_propagation_timeout_secs(),
+            propagation_interval_secs: cert_config.dns_propagation_interval_secs(),
+        })),
+        other => anyhow::bail!("unsupported Xboard cert_config ACME challenge {other}"),
+    }
+}
+
+fn normalize_acme_challenge_name(challenge: &str) -> Option<&'static str> {
+    match challenge.trim().to_ascii_lowercase().as_str() {
+        "http" | "http01" | "http-01" => Some("http"),
+        "dns" | "dns01" | "dns-01" => Some("dns"),
+        _ => None,
+    }
+}
+
+fn infer_dns_provider(cert_config: &CertConfig) -> Option<&'static str> {
+    if cert_config.cloudflare_api_token().is_some()
+        || cert_config.cloudflare_api_key().is_some()
+        || cert_config.cloudflare_api_email().is_some()
+        || cert_config.dns_zone_id().is_some()
+    {
+        Some("cloudflare")
+    } else if cert_config.alidns_access_key_id().is_some()
+        || cert_config.alidns_access_key_secret().is_some()
+    {
+        Some("alidns")
+    } else {
+        None
+    }
+}
+
+fn build_dns_provider_config(cert_config: &CertConfig) -> anyhow::Result<acme::DnsProviderConfig> {
+    let provider_name = cert_config
+        .dns_provider()
+        .or_else(|| infer_dns_provider(cert_config).map(ToString::to_string))
+        .context("Xboard cert_config dns mode requires dns_provider or provider credentials")?;
+    match provider_name.trim().to_ascii_lowercase().as_str() {
+        "cloudflare" | "cf" => {
+            let api_token = cert_config.cloudflare_api_token();
+            let api_key = cert_config.cloudflare_api_key();
+            let api_email = cert_config.cloudflare_api_email();
+            if api_token.is_none() && !(api_key.is_some() && api_email.is_some()) {
+                anyhow::bail!(
+                    "Xboard cert_config cloudflare dns mode requires api_token or api_key + api_email"
+                );
+            }
+            Ok(acme::DnsProviderConfig::Cloudflare {
+                api_token,
+                api_key,
+                api_email,
+                zone_id: cert_config.dns_zone_id(),
+                zone_name: cert_config.dns_zone_name(),
+                ttl: cert_config.dns_ttl(),
+            })
+        }
+        "alidns" | "aliyun" | "ali" => {
+            let access_key_id = cert_config
+                .alidns_access_key_id()
+                .context("Xboard cert_config alidns dns mode requires access_key_id")?;
+            let access_key_secret = cert_config
+                .alidns_access_key_secret()
+                .context("Xboard cert_config alidns dns mode requires access_key_secret")?;
+            Ok(acme::DnsProviderConfig::AliDns {
+                access_key_id,
+                access_key_secret,
+                zone_name: cert_config.dns_zone_name(),
+                ttl: cert_config.dns_ttl(),
+            })
+        }
+        other => anyhow::bail!("unsupported Xboard cert_config dns_provider {other}"),
     }
 }
 
@@ -252,30 +383,29 @@ pub struct ServerController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::NodeConfigResponse;
+    use crate::panel::{
+        CertConfig, NodeConfigResponse, NodeEchSettings, NodeTlsSettings, PanelUser,
+    };
 
-    #[test]
-    fn fills_default_padding_from_remote_config() {
-        let remote = NodeConfigResponse {
+    fn base_remote() -> NodeConfigResponse {
+        NodeConfigResponse {
             protocol: "anytls".to_string(),
             listen_ip: "0.0.0.0".to_string(),
             server_port: 443,
-            network: String::new(),
-            network_settings: None,
             server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
+            cert_config: Some(CertConfig {
                 cert_mode: "file".to_string(),
                 cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
                 key_path: "/etc/ssl/private/privkey.pem".to_string(),
                 ..Default::default()
             }),
-            base_config: None,
-        };
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fills_default_padding_from_remote_config() {
+        let remote = base_remote();
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("effective config");
         assert_eq!(effective.listen_ip, "0.0.0.0");
         assert_eq!(effective.padding_scheme, PaddingScheme::default_lines());
@@ -292,15 +422,6 @@ mod tests {
     #[test]
     fn keeps_supported_custom_routing_fields() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
             custom_outbounds: vec![serde_json::json!({
                 "tag": "ipv6-first",
                 "type": "direct",
@@ -310,13 +431,7 @@ mod tests {
                 "domain_suffix": ["example.com"],
                 "outbound": "ipv6-first"
             })],
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "file".to_string(),
-                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
-                key_path: "/etc/ssl/private/privkey.pem".to_string(),
-                ..Default::default()
-            }),
-            base_config: None,
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("effective config");
@@ -327,32 +442,16 @@ mod tests {
     #[test]
     fn accepts_ech_key_payload() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: crate::panel::NodeTlsSettings {
+            tls_settings: NodeTlsSettings {
                 server_name: "node.example.com".to_string(),
                 allow_insecure: false,
-                ech: crate::panel::NodeEchSettings {
+                ech: NodeEchSettings {
                     enabled: true,
                     key: "-----BEGIN ECH KEYS-----\nAAAA\n-----END ECH KEYS-----".to_string(),
                     ..Default::default()
                 },
             },
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "file".to_string(),
-                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
-                key_path: "/etc/ssl/private/privkey.pem".to_string(),
-                ..Default::default()
-            }),
-            base_config: None,
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("ech");
@@ -365,31 +464,15 @@ mod tests {
     #[test]
     fn rejects_ech_without_key() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: crate::panel::NodeTlsSettings {
+            tls_settings: NodeTlsSettings {
                 server_name: "node.example.com".to_string(),
                 allow_insecure: false,
-                ech: crate::panel::NodeEchSettings {
+                ech: NodeEchSettings {
                     enabled: true,
                     ..Default::default()
                 },
             },
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "file".to_string(),
-                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
-                key_path: "/etc/ssl/private/privkey.pem".to_string(),
-                ..Default::default()
-            }),
-            base_config: None,
+            ..base_remote()
         };
 
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("ech");
@@ -398,26 +481,13 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_cert_mode() {
-        let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "pkcs12".to_string(),
-                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
-                key_path: "/etc/ssl/private/privkey.pem".to_string(),
-                ..Default::default()
-            }),
-            base_config: None,
-        };
+        let mut remote = base_remote();
+        remote.cert_config = Some(CertConfig {
+            cert_mode: "pkcs12".to_string(),
+            cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
+            key_path: "/etc/ssl/private/privkey.pem".to_string(),
+            ..Default::default()
+        });
 
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("cert mode");
         assert!(error.to_string().contains("cert_config.cert_mode"));
@@ -426,18 +496,7 @@ mod tests {
     #[test]
     fn accepts_inline_cert_mode() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
+            cert_config: Some(CertConfig {
                 cert_mode: "inline".to_string(),
                 cert_path: String::new(),
                 key_path: String::new(),
@@ -446,7 +505,7 @@ mod tests {
                 key_pem: "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----".to_string(),
                 ..Default::default()
             }),
-            base_config: None,
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("inline cert mode");
@@ -457,27 +516,81 @@ mod tests {
     }
 
     #[test]
+    fn accepts_path_cert_mode_with_extended_aliases() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "path",
+                "certificate_path": "/etc/ssl/fullchain.pem",
+                "private_key_path": "/etc/ssl/privkey.pem"
+            }
+        }))
+        .expect("parse remote");
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("path cert mode");
+        match effective.tls.source {
+            tls::TlsMaterialSource::Files {
+                cert_path,
+                key_path,
+            } => {
+                assert_eq!(cert_path, PathBuf::from("/etc/ssl/fullchain.pem"));
+                assert_eq!(key_path, PathBuf::from("/etc/ssl/privkey.pem"));
+            }
+            _ => unreachable!("expected file TLS source"),
+        }
+    }
+
+    #[test]
+    fn accepts_content_cert_mode_with_extended_aliases() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "content",
+                "cert_content": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+                "key_content": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----"
+            }
+        }))
+        .expect("parse remote");
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("content cert mode");
+        match effective.tls.source {
+            tls::TlsMaterialSource::Inline { cert_pem, key_pem } => {
+                assert!(
+                    String::from_utf8(cert_pem)
+                        .expect("cert pem")
+                        .contains("BEGIN CERTIFICATE")
+                );
+                assert!(
+                    String::from_utf8(key_pem)
+                        .expect("key pem")
+                        .contains("BEGIN PRIVATE KEY")
+                );
+            }
+            _ => unreachable!("expected inline TLS source"),
+        }
+    }
+
+    #[test]
     fn accepts_acme_cert_mode() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
+            cert_config: Some(CertConfig {
                 cert_mode: "acme".to_string(),
                 cert_path: "/var/lib/noders/anytls/node.example.com/fullchain.pem".to_string(),
                 key_path: "/var/lib/noders/anytls/node.example.com/privkey.pem".to_string(),
                 email: "ops@example.com".to_string(),
                 ..Default::default()
             }),
-            base_config: None,
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("acme cert mode");
@@ -489,12 +602,7 @@ mod tests {
             tls::TlsMaterialSource::Acme {
                 cert_path,
                 key_path,
-                directory_url,
-                email,
-                domain,
-                challenge_listen,
-                renew_before_days,
-                account_key_path,
+                config,
             } => {
                 assert_eq!(
                     cert_path,
@@ -505,17 +613,22 @@ mod tests {
                     PathBuf::from("/var/lib/noders/anytls/node.example.com/privkey.pem")
                 );
                 assert_eq!(
-                    directory_url,
+                    config.directory_url,
                     "https://acme-v02.api.letsencrypt.org/directory"
                 );
-                assert_eq!(email, "ops@example.com");
-                assert_eq!(domain, "node.example.com");
-                assert_eq!(challenge_listen, "0.0.0.0:80");
-                assert_eq!(renew_before_days, 30);
+                assert_eq!(config.email, "ops@example.com");
+                assert_eq!(config.domains, vec!["node.example.com".to_string()]);
+                assert_eq!(config.renew_before_days, 30);
                 assert_eq!(
-                    account_key_path,
+                    config.account_key_path,
                     PathBuf::from("/var/lib/noders/anytls/node.example.com/fullchain.account.pem")
                 );
+                match config.challenge {
+                    acme::AcmeChallengeConfig::Http01 { listen } => {
+                        assert_eq!(listen, "0.0.0.0:80");
+                    }
+                    _ => unreachable!("expected http-01 ACME challenge"),
+                }
             }
             _ => unreachable!("expected ACME TLS source"),
         }
@@ -524,23 +637,12 @@ mod tests {
     #[test]
     fn accepts_http_cert_mode_as_acme() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
+            cert_config: Some(CertConfig {
                 cert_mode: "http".to_string(),
                 email: "ops@example.com".to_string(),
                 ..Default::default()
             }),
-            base_config: None,
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("http cert mode");
@@ -548,8 +650,7 @@ mod tests {
             tls::TlsMaterialSource::Acme {
                 cert_path,
                 key_path,
-                account_key_path,
-                ..
+                config,
             } => {
                 assert_eq!(
                     cert_path,
@@ -557,10 +658,133 @@ mod tests {
                 );
                 assert_eq!(key_path, PathBuf::from("acme/node.example.com/privkey.pem"));
                 assert_eq!(
-                    account_key_path,
+                    config.account_key_path,
                     PathBuf::from("acme/node.example.com/fullchain.account.pem")
                 );
+                match config.challenge {
+                    acme::AcmeChallengeConfig::Http01 { listen } => {
+                        assert_eq!(listen, "0.0.0.0:80");
+                    }
+                    _ => unreachable!("expected http-01 ACME challenge"),
+                }
             }
+            _ => unreachable!("expected ACME TLS source"),
+        }
+    }
+
+    #[test]
+    fn accepts_dns_cert_mode_as_dns01_acme() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "dns",
+                "domains": ["example.com", "*.example.com"],
+                "provider": "cloudflare",
+                "zone_id": "zone-123",
+                "env": {
+                    "CF_DNS_API_TOKEN": "token-abc"
+                },
+                "propagation_timeout": 240,
+                "propagation_interval": 7
+            }
+        }))
+        .expect("parse remote");
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("dns cert mode");
+        match effective.tls.source {
+            tls::TlsMaterialSource::Acme {
+                cert_path,
+                key_path,
+                config,
+            } => {
+                assert_eq!(cert_path, PathBuf::from("acme/example.com/fullchain.pem"));
+                assert_eq!(key_path, PathBuf::from("acme/example.com/privkey.pem"));
+                assert_eq!(
+                    config.account_key_path,
+                    PathBuf::from("acme/example.com/fullchain.account.pem")
+                );
+                assert_eq!(
+                    config.domains,
+                    vec!["example.com".to_string(), "*.example.com".to_string()]
+                );
+                match config.challenge {
+                    acme::AcmeChallengeConfig::Dns01(acme::Dns01Config {
+                        provider,
+                        propagation_timeout_secs,
+                        propagation_interval_secs,
+                    }) => {
+                        assert_eq!(propagation_timeout_secs, 240);
+                        assert_eq!(propagation_interval_secs, 7);
+                        match provider {
+                            acme::DnsProviderConfig::Cloudflare {
+                                api_token,
+                                zone_id,
+                                zone_name,
+                                ttl,
+                                ..
+                            } => {
+                                assert_eq!(api_token.as_deref(), Some("token-abc"));
+                                assert_eq!(zone_id.as_deref(), Some("zone-123"));
+                                assert_eq!(zone_name, None);
+                                assert_eq!(ttl, None);
+                            }
+                            _ => unreachable!("expected cloudflare DNS provider"),
+                        }
+                    }
+                    _ => unreachable!("expected dns-01 ACME challenge"),
+                }
+            }
+            _ => unreachable!("expected ACME TLS source"),
+        }
+    }
+
+    #[test]
+    fn acme_mode_with_dns_provider_defaults_to_dns01() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "acme",
+                "provider": "alidns",
+                "zone_name": "example.com",
+                "env": {
+                    "ALICLOUD_ACCESS_KEY_ID": "akid",
+                    "ALICLOUD_ACCESS_KEY_SECRET": "aksecret"
+                }
+            }
+        }))
+        .expect("parse remote");
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("acme dns provider");
+        match effective.tls.source {
+            tls::TlsMaterialSource::Acme { config, .. } => match config.challenge {
+                acme::AcmeChallengeConfig::Dns01(acme::Dns01Config { provider, .. }) => {
+                    match provider {
+                        acme::DnsProviderConfig::AliDns {
+                            access_key_id,
+                            access_key_secret,
+                            zone_name,
+                            ttl,
+                        } => {
+                            assert_eq!(access_key_id, "akid");
+                            assert_eq!(access_key_secret, "aksecret");
+                            assert_eq!(zone_name.as_deref(), Some("example.com"));
+                            assert_eq!(ttl, None);
+                        }
+                        _ => unreachable!("expected alidns provider"),
+                    }
+                }
+                _ => unreachable!("expected dns-01 ACME challenge"),
+            },
             _ => unreachable!("expected ACME TLS source"),
         }
     }
@@ -568,19 +792,8 @@ mod tests {
     #[test]
     fn defaults_to_self_signed_when_cert_config_is_missing() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
             cert_config: None,
-            base_config: None,
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("self-signed");
@@ -595,22 +808,13 @@ mod tests {
     #[test]
     fn treats_cert_mode_none_as_self_signed() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
-            network: String::new(),
-            network_settings: None,
             server_name: String::new(),
-            tls_settings: crate::panel::NodeTlsSettings {
+            tls_settings: NodeTlsSettings {
                 server_name: "tls.example.com".to_string(),
                 ..Default::default()
             },
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig::default()),
-            base_config: None,
+            cert_config: Some(CertConfig::default()),
+            ..base_remote()
         };
 
         let effective = EffectiveNodeConfig::from_remote(&remote).expect("self-signed");
@@ -625,24 +829,8 @@ mod tests {
     #[test]
     fn rejects_unsupported_network() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
             network: "ws".to_string(),
-            network_settings: None,
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "file".to_string(),
-                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
-                key_path: "/etc/ssl/private/privkey.pem".to_string(),
-                ..Default::default()
-            }),
-            base_config: None,
+            ..base_remote()
         };
 
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network");
@@ -652,32 +840,30 @@ mod tests {
     #[test]
     fn rejects_unsupported_network_settings() {
         let remote = NodeConfigResponse {
-            protocol: "anytls".to_string(),
-            listen_ip: "0.0.0.0".to_string(),
-            server_port: 443,
             network: "tcp".to_string(),
             network_settings: Some(serde_json::json!({
                 "header": {
                     "type": "none"
                 }
             })),
-            server_name: "node.example.com".to_string(),
-            tls_settings: Default::default(),
-            padding_scheme: Vec::new(),
-            routes: Vec::new(),
-            custom_outbounds: Vec::new(),
-            custom_routes: Vec::new(),
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "file".to_string(),
-                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
-                key_path: "/etc/ssl/private/privkey.pem".to_string(),
-                ..Default::default()
-            }),
-            base_config: None,
+            ..base_remote()
         };
 
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network settings");
         assert!(error.to_string().contains("networkSettings"));
+    }
+
+    #[test]
+    fn rejects_anytls_users_without_uuid() {
+        let controller = ServerController::new(Accounting::new());
+        let error = controller
+            .replace_users(&[PanelUser {
+                id: 1,
+                ..Default::default()
+            }])
+            .expect_err("missing uuid should be rejected");
+
+        assert!(error.to_string().contains("missing uuid"));
     }
 }
 
@@ -697,6 +883,16 @@ impl ServerController {
             routing: Arc::new(RwLock::new(RoutingTable::default())),
             inner: Mutex::new(None),
         }
+    }
+
+    pub fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
+        for user in users {
+            if user.uuid.trim().is_empty() {
+                anyhow::bail!("AnyTLS user {} is missing uuid", user.id);
+            }
+        }
+        self.accounting.replace_users(users);
+        Ok(())
     }
 
     pub async fn apply_config(&self, config: EffectiveNodeConfig) -> anyhow::Result<()> {
@@ -877,14 +1073,14 @@ async fn accept_loop(
     }
 }
 
-pub(super) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
+pub(crate) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
     let socket = SockRef::from(stream);
     let _ = socket.set_tcp_keepalive(&keepalive);
 }
 
-fn bind_listeners(listen_ip: &str, port: u16) -> anyhow::Result<Vec<TcpListener>> {
+pub(crate) fn bind_listeners(listen_ip: &str, port: u16) -> anyhow::Result<Vec<TcpListener>> {
     let specs = listener_specs(listen_ip, port)?;
     let mut listeners = Vec::new();
     for spec in specs {
@@ -900,6 +1096,24 @@ fn bind_listeners(listen_ip: &str, port: u16) -> anyhow::Result<Vec<TcpListener>
         anyhow::bail!("no AnyTLS listeners could be started");
     }
     Ok(listeners)
+}
+
+pub(crate) fn bind_udp_sockets(listen_ip: &str, port: u16) -> anyhow::Result<Vec<UdpSocket>> {
+    let specs = listener_specs(listen_ip, port)?;
+    let mut sockets = Vec::new();
+    for spec in specs {
+        match bind_udp_socket(spec.bind_addr, spec.only_v6) {
+            Ok(socket) => sockets.push(socket),
+            Err(error) if spec.optional => {
+                warn!(%error, listen = %spec.bind_addr, "optional UDP socket bind failed")
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if sockets.is_empty() {
+        anyhow::bail!("no UDP sockets could be started");
+    }
+    Ok(sockets)
 }
 
 fn bind_listener(bind_addr: SocketAddr, only_v6: bool) -> anyhow::Result<TcpListener> {
@@ -927,6 +1141,30 @@ fn bind_listener(bind_addr: SocketAddr, only_v6: bool) -> anyhow::Result<TcpList
         .with_context(|| format!("set nonblocking on {bind_addr}"))?;
     let std_listener: std::net::TcpListener = socket.into();
     TcpListener::from_std(std_listener).with_context(|| format!("adopt listener {bind_addr}"))
+}
+
+fn bind_udp_socket(bind_addr: SocketAddr, only_v6: bool) -> anyhow::Result<UdpSocket> {
+    let domain = if bind_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .with_context(|| format!("create UDP socket for {bind_addr}"))?;
+    socket.set_reuse_address(true).ok();
+    if bind_addr.is_ipv6() {
+        socket
+            .set_only_v6(only_v6)
+            .with_context(|| format!("set IPv6-only UDP mode for {bind_addr}"))?;
+    }
+    socket
+        .bind(&bind_addr.into())
+        .with_context(|| format!("bind UDP {bind_addr}"))?;
+    socket
+        .set_nonblocking(true)
+        .with_context(|| format!("set UDP nonblocking on {bind_addr}"))?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket).with_context(|| format!("adopt UDP socket {bind_addr}"))
 }
 
 #[derive(Clone, Copy)]
@@ -963,7 +1201,7 @@ fn listener_specs(listen_ip: &str, port: u16) -> anyhow::Result<Vec<ListenerSpec
     }])
 }
 
-fn effective_listen_ip(remote: &NodeConfigResponse) -> String {
+pub(crate) fn effective_listen_ip(remote: &NodeConfigResponse) -> String {
     let listen_ip = remote.listen_ip.trim();
     if listen_ip.is_empty() {
         DEFAULT_LISTEN_IP.to_string()

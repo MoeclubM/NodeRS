@@ -1,6 +1,6 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. This repository currently ships the AnyTLS implementation, and the installed binary remains `noders-anytls`.
+NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, VLESS, Trojan, and Shadowsocks protocol handlers, and the installed binary remains `noders-anytls` for compatibility.
 
 ## Overview
 
@@ -28,24 +28,29 @@ NodeRS currently runs in Xboard machine mode only.
 
 TLS is no longer read from the local config file.
 
-- AnyTLS nodes must receive `cert_config` from Xboard
-- `listen_ip`, `server_port`, `server_name`, `tls_settings`, `padding_scheme`, and `routes` are all taken from the panel response
-- Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, and `http`
+- AnyTLS, VLESS, and Trojan nodes receive TLS from Xboard `cert_config`
+- `listen_ip`, `server_port`, `server_name`, `tls_settings`, and `routes` are taken from the panel response; `padding_scheme` is currently AnyTLS-specific
+- Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, and `dns`
 - File or path mode requires `cert_path` and `key_path`
-- Inline or PEM mode requires certificate PEM content and private key PEM content
-- ACME mode uses `cert_config.domain` or the panel `server_name` as the certificate domain
+- Inline or PEM mode requires certificate PEM content and private key PEM content; the pushed certificate may be CA-issued or self-signed because NodeRS only validates that the PEM/key pair is usable
+- Xboard passes `cert_config` through as a JSON object; NodeRS accepts both `mode` and `cert_mode`, along with common aliases for certificate paths, inline PEM content, domains, and provider credentials
+- ACME mode supports multiple domains and uses `cert_config.domain`, `cert_config.domains`, or the panel `server_name` / `tls_settings.server_name`
+- `cert_mode = http` uses ACME HTTP-01; `cert_mode = dns` uses ACME DNS-01; `cert_mode = acme` / `letsencrypt` defaults to HTTP-01 unless a DNS challenge or DNS provider is supplied
+- DNS-01 currently supports Cloudflare and AliDNS provider APIs
 - If ACME mode does not deliver `cert_path` or `key_path`, NodeRS stores them under `acme/<domain>/fullchain.pem` and `acme/<domain>/privkey.pem` relative to the working directory; in the installed service this resolves under `/var/lib/noders/anytls`
-- Optional ACME fields are `email`, `directory_url` or `directory`, `challenge_listen` or `http01_listen`, `renew_before_days`, and `account_key_path`
+- Optional ACME fields are `email`, `directory_url` or `directory`, `challenge_listen` or `http01_listen`, `renew_before_days`, `account_key_path`, DNS propagation settings, and provider-specific credentials such as Cloudflare API tokens or AliDNS access keys
+- `cert_mode = none`, `self_signed`, or `self-signed` generates a local self-signed certificate automatically when the panel does not push a PEM or ACME configuration
 - Any other `cert_mode` fails explicitly during config sync
 
 ## Support Matrix
 
 - Supported panel fields: `listen_ip`, `server_port`, `server_name`, `padding_scheme`, `routes`, and `cert_config`
-- Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, or `http`
+- Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, or `dns`
 - Supported `custom_outbounds` types: `direct`, `dns`, and `block`
 - Supported `custom_routes` actions: `outbound`, `reject`, and `block`
 - Supported `custom_routes` match fields: `network`, `protocol`, `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`, `ip_cidr`, `ip_is_private`, `port`, and `port_range`
-- Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`
+- Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`, for AnyTLS/VLESS/Trojan TLS listeners
+- `padding_scheme` is consumed by AnyTLS only; VLESS and Trojan ignore it because their wire formats do not use AnyTLS padding frames
 - Unsupported `custom_outbounds` types, unsupported `custom_routes` fields or actions, and malformed ECH settings fail explicitly during config sync; they are not ignored silently
 
 ## Install
@@ -82,11 +87,35 @@ Multiple APIs may reuse the same `machine_id` on one host. NodeRS derives a stab
 
 - Project name in documentation: `NodeRS`
 - Binary: `/usr/local/bin/noders-anytls`
+- Manager command: `/usr/local/bin/noders`
 - Config root: `/etc/noders/anytls`
 - Machine config: `/etc/noders/anytls/machines/<machine_id>-<api_hash>.toml`
 - State: `/var/lib/noders/anytls`
 - systemd service: `noders-<machine_id>-<api_hash>`
 - OpenRC service: `noders-<machine_id>-<api_hash>`
+
+## Manager Script
+
+After installation, the `noders` command provides a small management entrypoint similar to V2bX-style helper scripts.
+
+- `noders` without arguments opens an interactive menu
+- `noders update` upgrades the installed binary
+- `noders uninstall --all` removes the whole installation
+- `noders start`, `noders stop`, and `noders restart` operate on all discovered NodeRS services by default
+- `noders log` shows logs for all discovered services by default
+- When multiple instances exist, you may pass a full service name, a `machine_id`, or an instance suffix to target one or more services
+
+Examples:
+
+```bash
+noders
+noders update
+noders restart
+noders restart 1
+noders log -f
+noders uninstall --machine-id 1
+noders uninstall --all
+```
 
 ## Common Operations
 
