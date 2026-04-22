@@ -401,6 +401,7 @@ install_from_bundle() {
 
   install -d "$PREFIX/bin"
   install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
+  install_management_support "$staging_dir"
 }
 
 restart_active_units() {
@@ -477,6 +478,7 @@ print_summary() {
   cat <<EOF
 Upgraded NodeRS
   Binary: $PREFIX/bin/noders-anytls
+  Manager: $PREFIX/bin/noders
   Config: $CONFIG_DIR
 EOF
 

@@ -1,22 +1,37 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use boring::nid::Nid;
+use boring::x509::X509;
+use hmac::{Hmac, Mac};
 use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest::Client;
 use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket, lookup_host};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tracing::warn;
+
+type HmacSha1 = Hmac<Sha1>;
 
 const ACME_CONTENT_TYPE: &str = "application/jose+json";
 const ACME_JWS_ALGORITHM: &str = "ES256";
@@ -24,15 +39,59 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_ATTEMPTS: usize = 90;
 const HTTP_BUFFER_SIZE: usize = 8192;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_PROPAGATION_RESOLVERS: &[&str] = &["1.1.1.1:53", "8.8.8.8:53"];
+const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+const ALIDNS_API_ENDPOINT: &str = "https://alidns.aliyuncs.com/";
+const ALIDNS_API_VERSION: &str = "2015-01-09";
+const ALIDNS_QUERY_ESCAPE_SET: AsciiSet = NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+static NEXT_DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+static NEXT_ALIDNS_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcmeConfig {
     pub directory_url: String,
     pub email: String,
-    pub domain: String,
-    pub challenge_listen: String,
+    pub domains: Vec<String>,
     pub renew_before_days: u64,
     pub account_key_path: PathBuf,
+    pub challenge: AcmeChallengeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcmeChallengeConfig {
+    Http01 { listen: String },
+    Dns01(Dns01Config),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dns01Config {
+    pub provider: DnsProviderConfig,
+    pub propagation_timeout_secs: u64,
+    pub propagation_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsProviderConfig {
+    Cloudflare {
+        api_token: Option<String>,
+        api_key: Option<String>,
+        api_email: Option<String>,
+        zone_id: Option<String>,
+        zone_name: Option<String>,
+        ttl: Option<u64>,
+    },
+    AliDns {
+        access_key_id: String,
+        access_key_secret: String,
+        zone_name: Option<String>,
+        ttl: Option<u64>,
+    },
 }
 
 pub async fn ensure_certificate(
@@ -40,11 +99,12 @@ pub async fn ensure_certificate(
     cert_path: &Path,
     key_path: &Path,
 ) -> anyhow::Result<bool> {
+    let domains = normalize_domains(&config.domains);
     ensure!(
-        !config.domain.trim().is_empty(),
-        "ACME domain must not be empty when ACME mode is used"
+        !domains.is_empty(),
+        "ACME domains must not be empty when ACME mode is used"
     );
-    if !needs_renewal(cert_path, key_path, config.renew_before_days).await? {
+    if !needs_renewal(cert_path, key_path, &domains, config.renew_before_days).await? {
         return Ok(false);
     }
 
@@ -57,43 +117,17 @@ pub async fn ensure_certificate(
     let acme = AcmeClient::new(client, directory, account_key)?;
     let account = acme.ensure_account(&config.email).await?;
 
-    let mut order = acme.new_order(&account.kid, &config.domain).await?;
-    let authorization_url = order
-        .authorizations
-        .first()
-        .cloned()
-        .context("ACME order did not include any authorizations")?;
-    let authorization = acme
-        .fetch_authorization(&account.kid, &authorization_url)
-        .await?;
-
-    if authorization.status != "valid" {
-        let challenge = authorization
-            .challenges
-            .into_iter()
-            .find(|challenge| challenge.kind == "http-01")
-            .context("ACME authorization did not expose an http-01 challenge")?;
-        let key_authorization = build_key_authorization(&challenge.token, acme.jwk_thumbprint());
-        let server = Http01ChallengeServer::start(
-            &config.challenge_listen,
-            challenge.token.clone(),
-            key_authorization,
-        )
-        .await?;
-        let challenge_result = async {
-            if challenge.status != "valid" {
-                acme.trigger_challenge(&account.kid, &challenge.url).await?;
-            }
-            acme.poll_authorization_valid(&account.kid, &authorization_url)
-                .await
-        }
-        .await;
-        server.stop();
-        challenge_result?;
-    }
+    let mut order = acme.new_order(&account.kid, &domains).await?;
+    authorize_order(
+        &acme,
+        &account.kid,
+        &config.challenge,
+        &order.authorizations,
+    )
+    .await?;
 
     let domain_key = load_or_create_domain_key(key_path).await?;
-    let csr_der = build_certificate_signing_request(&domain_key, &config.domain)?;
+    let csr_der = build_certificate_signing_request(&domain_key, &domains)?;
     order = acme
         .finalize_order(&account.kid, &order.url, &order.finalize, &csr_der)
         .await?;
@@ -115,6 +149,7 @@ pub async fn ensure_certificate(
 async fn needs_renewal(
     cert_path: &Path,
     key_path: &Path,
+    domains: &[String],
     renew_before_days: u64,
 ) -> anyhow::Result<bool> {
     if tokio::fs::metadata(cert_path).await.is_err() || tokio::fs::metadata(key_path).await.is_err()
@@ -124,12 +159,49 @@ async fn needs_renewal(
     let cert_pem = tokio::fs::read(cert_path)
         .await
         .with_context(|| format!("read certificate {}", cert_path.display()))?;
+    if !certificate_matches_domains(&cert_pem, domains)? {
+        return Ok(true);
+    }
     let not_after = match first_certificate_not_after(&cert_pem) {
         Ok(timestamp) => timestamp,
         Err(_) => return Ok(true),
     };
     let renew_after = not_after.saturating_sub(renew_before_days.saturating_mul(24 * 60 * 60));
     Ok(unix_now() >= renew_after)
+}
+
+fn certificate_matches_domains(cert_pem: &[u8], domains: &[String]) -> anyhow::Result<bool> {
+    let certificate = X509::stack_from_pem(cert_pem)
+        .context("parse certificate PEM")?
+        .into_iter()
+        .next()
+        .context("certificate PEM did not include any certificates")?;
+
+    let mut actual = HashSet::new();
+    if let Some(subject_alt_names) = certificate.subject_alt_names() {
+        for name in subject_alt_names {
+            if let Some(dns_name) = name.dnsname() {
+                actual.insert(dns_name.trim().trim_end_matches('.').to_ascii_lowercase());
+            }
+        }
+    }
+    if actual.is_empty() {
+        for entry in certificate.subject_name().entries_by_nid(Nid::COMMONNAME) {
+            if let Ok(common_name) = entry.data().as_utf8() {
+                actual.insert(
+                    common_name
+                        .to_string()
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase(),
+                );
+            }
+        }
+    }
+
+    Ok(domains
+        .iter()
+        .all(|domain| actual.contains(&domain.trim().trim_end_matches('.').to_ascii_lowercase())))
 }
 
 async fn fetch_directory(client: &Client, directory_url: &str) -> anyhow::Result<AcmeDirectory> {
@@ -143,6 +215,218 @@ async fn fetch_directory(client: &Client, directory_url: &str) -> anyhow::Result
         .json::<AcmeDirectory>()
         .await
         .context("decode ACME directory")
+}
+
+async fn authorize_order(
+    acme: &AcmeClient,
+    kid: &str,
+    challenge: &AcmeChallengeConfig,
+    authorization_urls: &[String],
+) -> anyhow::Result<()> {
+    let mut authorizations = Vec::with_capacity(authorization_urls.len());
+    for authorization_url in authorization_urls {
+        let authorization = acme.fetch_authorization(kid, authorization_url).await?;
+        authorizations.push((authorization_url.clone(), authorization));
+    }
+
+    match challenge {
+        AcmeChallengeConfig::Http01 { listen } => {
+            authorize_http01(acme, kid, listen, &authorizations).await
+        }
+        AcmeChallengeConfig::Dns01(config) => {
+            authorize_dns01(acme, kid, config, &authorizations).await
+        }
+    }
+}
+
+async fn authorize_http01(
+    acme: &AcmeClient,
+    kid: &str,
+    listen: &str,
+    authorizations: &[(String, AuthorizationBody)],
+) -> anyhow::Result<()> {
+    let mut responses = HashMap::new();
+    let mut pending = Vec::new();
+
+    for (authorization_url, authorization) in authorizations {
+        if authorization.status == "valid" {
+            continue;
+        }
+        let challenge = authorization
+            .challenges
+            .iter()
+            .find(|challenge| challenge.kind == "http-01")
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "ACME authorization for {} did not expose an http-01 challenge",
+                    authorization.identifier.value
+                )
+            })?;
+        responses.insert(
+            challenge.token.clone(),
+            build_key_authorization(&challenge.token, acme.jwk_thumbprint()),
+        );
+        pending.push(Http01PendingChallenge {
+            authorization_url: authorization_url.clone(),
+            challenge_url: challenge.url,
+            challenge_status: challenge.status,
+        });
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let server = Http01ChallengeServer::start(listen, responses).await?;
+    let challenge_result = async {
+        for pending_challenge in &pending {
+            if pending_challenge.challenge_status != "valid" {
+                acme.trigger_challenge(kid, &pending_challenge.challenge_url)
+                    .await?;
+            }
+        }
+        for pending_challenge in &pending {
+            acme.poll_authorization_valid(kid, &pending_challenge.authorization_url)
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    server.stop();
+    challenge_result
+}
+
+async fn authorize_dns01(
+    acme: &AcmeClient,
+    kid: &str,
+    config: &Dns01Config,
+    authorizations: &[(String, AuthorizationBody)],
+) -> anyhow::Result<()> {
+    let provider = DnsProvider::new(acme.client.clone(), config.provider.clone());
+    let mut pending = Vec::new();
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (authorization_url, authorization) in authorizations {
+        if authorization.status == "valid" {
+            continue;
+        }
+        let challenge = authorization
+            .challenges
+            .iter()
+            .find(|challenge| challenge.kind == "dns-01")
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "ACME authorization for {} did not expose a dns-01 challenge",
+                    authorization.identifier.value
+                )
+            })?;
+        let record = DnsChallengeRecord {
+            fqdn: build_dns01_record_name(&authorization.identifier.value),
+            value: build_dns01_txt_value(&challenge.token, acme.jwk_thumbprint()),
+        };
+        if seen.insert((record.fqdn.to_ascii_lowercase(), record.value.clone())) {
+            records.push(record.clone());
+        }
+        pending.push(Dns01PendingChallenge {
+            authorization_url: authorization_url.clone(),
+            challenge_url: challenge.url,
+            challenge_status: challenge.status,
+        });
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut handles = Vec::with_capacity(records.len());
+    for record in &records {
+        handles.push(provider.create_txt_record(record).await?);
+    }
+
+    let challenge_result = async {
+        wait_for_dns_propagation(
+            &records,
+            config.propagation_timeout_secs,
+            config.propagation_interval_secs,
+        )
+        .await?;
+        for pending_challenge in &pending {
+            if pending_challenge.challenge_status != "valid" {
+                acme.trigger_challenge(kid, &pending_challenge.challenge_url)
+                    .await?;
+            }
+        }
+        for pending_challenge in &pending {
+            acme.poll_authorization_valid(kid, &pending_challenge.authorization_url)
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    let cleanup_result = cleanup_dns_records(&provider, handles).await;
+    match challenge_result {
+        Ok(()) => cleanup_result,
+        Err(error) => {
+            if let Err(cleanup_error) = cleanup_result {
+                warn!(%cleanup_error, "cleanup ACME dns-01 records failed");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn cleanup_dns_records(
+    provider: &DnsProvider,
+    handles: Vec<DnsRecordHandle>,
+) -> anyhow::Result<()> {
+    for handle in handles {
+        provider.delete_record(handle).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_dns_propagation(
+    records: &[DnsChallengeRecord],
+    timeout_secs: u64,
+    interval_secs: u64,
+) -> anyhow::Result<()> {
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let started_at = tokio::time::Instant::now();
+
+    loop {
+        let mut missing = Vec::new();
+        for record in records {
+            if !txt_record_visible(record).await {
+                missing.push(format!("{}={}", record.fqdn, record.value));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if started_at.elapsed() >= timeout {
+            bail!(
+                "timed out waiting for DNS propagation for {}",
+                missing.join(", ")
+            );
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn txt_record_visible(record: &DnsChallengeRecord) -> bool {
+    for resolver in DNS_PROPAGATION_RESOLVERS {
+        match lookup_txt_records(&record.fqdn, resolver).await {
+            Ok(values) if values.iter().any(|value| value == &record.value) => return true,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    false
 }
 
 struct AcmeClient {
@@ -181,19 +465,19 @@ struct OrderState {
     certificate: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct AuthorizationBody {
     status: String,
     identifier: AuthorizationIdentifier,
     challenges: Vec<AuthorizationChallenge>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct AuthorizationIdentifier {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct AuthorizationChallenge {
     #[serde(rename = "type")]
     kind: String,
@@ -248,12 +532,18 @@ impl AcmeClient {
         Ok(AccountHandle { kid: location })
     }
 
-    async fn new_order(&self, kid: &str, domain: &str) -> anyhow::Result<OrderState> {
+    async fn new_order(&self, kid: &str, domains: &[String]) -> anyhow::Result<OrderState> {
+        let identifiers = domains
+            .iter()
+            .map(|domain| {
+                json!({
+                    "type": "dns",
+                    "value": domain,
+                })
+            })
+            .collect::<Vec<_>>();
         let payload = json!({
-            "identifiers": [{
-                "type": "dns",
-                "value": domain,
-            }],
+            "identifiers": identifiers,
         });
         let response = self
             .signed_request(&self.directory.new_order, Some(kid), Some(&payload))
@@ -358,11 +648,13 @@ impl AcmeClient {
         kid: &str,
         certificate_url: &str,
     ) -> anyhow::Result<String> {
-        self.signed_request(certificate_url, Some(kid), None)
-            .await?
-            .text()
-            .await
-            .context("read ACME certificate chain")
+        let response = self
+            .signed_request(certificate_url, Some(kid), None)
+            .await?;
+        response
+            .error_for_status_ref()
+            .context("request ACME certificate chain")?;
+        response.text().await.context("read ACME certificate chain")
     }
 
     async fn signed_request(
@@ -464,22 +756,716 @@ impl OrderState {
     }
 }
 
+#[derive(Debug)]
+struct Http01PendingChallenge {
+    authorization_url: String,
+    challenge_url: String,
+    challenge_status: String,
+}
+
+#[derive(Debug, Clone)]
+struct DnsChallengeRecord {
+    fqdn: String,
+    value: String,
+}
+
+#[derive(Debug)]
+struct Dns01PendingChallenge {
+    authorization_url: String,
+    challenge_url: String,
+    challenge_status: String,
+}
+
+#[derive(Debug)]
+enum DnsRecordHandle {
+    Cloudflare { zone_id: String, record_id: String },
+    AliDns { record_id: String },
+}
+
+#[derive(Debug, Clone)]
+enum DnsProvider {
+    Cloudflare(CloudflareDnsProvider),
+    AliDns(AliDnsProvider),
+}
+
+impl DnsProvider {
+    fn new(client: Client, config: DnsProviderConfig) -> Self {
+        match config {
+            DnsProviderConfig::Cloudflare {
+                api_token,
+                api_key,
+                api_email,
+                zone_id,
+                zone_name,
+                ttl,
+            } => Self::Cloudflare(CloudflareDnsProvider {
+                client,
+                api_token,
+                api_key,
+                api_email,
+                zone_id,
+                zone_name,
+                ttl,
+            }),
+            DnsProviderConfig::AliDns {
+                access_key_id,
+                access_key_secret,
+                zone_name,
+                ttl,
+            } => Self::AliDns(AliDnsProvider {
+                client,
+                access_key_id,
+                access_key_secret,
+                zone_name,
+                ttl,
+            }),
+        }
+    }
+
+    async fn create_txt_record(
+        &self,
+        record: &DnsChallengeRecord,
+    ) -> anyhow::Result<DnsRecordHandle> {
+        match self {
+            Self::Cloudflare(provider) => provider.create_txt_record(record).await,
+            Self::AliDns(provider) => provider.create_txt_record(record).await,
+        }
+    }
+
+    async fn delete_record(&self, handle: DnsRecordHandle) -> anyhow::Result<()> {
+        match (self, handle) {
+            (Self::Cloudflare(provider), DnsRecordHandle::Cloudflare { zone_id, record_id }) => {
+                provider.delete_record(&zone_id, &record_id).await
+            }
+            (Self::AliDns(provider), DnsRecordHandle::AliDns { record_id }) => {
+                provider.delete_record(&record_id).await
+            }
+            (Self::Cloudflare(_), other) => {
+                bail!("Cloudflare DNS provider received mismatched record handle {other:?}")
+            }
+            (Self::AliDns(_), other) => {
+                bail!("AliDNS provider received mismatched record handle {other:?}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CloudflareDnsProvider {
+    client: Client,
+    api_token: Option<String>,
+    api_key: Option<String>,
+    api_email: Option<String>,
+    zone_id: Option<String>,
+    zone_name: Option<String>,
+    ttl: Option<u64>,
+}
+
+impl CloudflareDnsProvider {
+    async fn create_txt_record(
+        &self,
+        record: &DnsChallengeRecord,
+    ) -> anyhow::Result<DnsRecordHandle> {
+        let zone_id = self.resolve_zone_id(&record.fqdn).await?;
+        let response: CloudflareDnsRecord = self
+            .cloudflare_json(
+                self.client
+                    .post(format!("{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records"))
+                    .json(&json!({
+                        "type": "TXT",
+                        "name": record.fqdn.trim_end_matches('.'),
+                        "content": record.value,
+                        "ttl": self.ttl.unwrap_or(60).max(1),
+                    })),
+                "create DNS record",
+            )
+            .await?;
+        Ok(DnsRecordHandle::Cloudflare {
+            zone_id,
+            record_id: response.id,
+        })
+    }
+
+    async fn delete_record(&self, zone_id: &str, record_id: &str) -> anyhow::Result<()> {
+        let _: Value = self
+            .cloudflare_json(
+                self.client.delete(format!(
+                    "{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records/{record_id}"
+                )),
+                "delete DNS record",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_zone_id(&self, fqdn: &str) -> anyhow::Result<String> {
+        if let Some(zone_id) = &self.zone_id {
+            return Ok(zone_id.clone());
+        }
+
+        let mut candidates = Vec::new();
+        if let Some(zone_name) = &self.zone_name {
+            candidates.push(zone_name.clone());
+        }
+        for candidate in zone_candidates_from_name(fqdn) {
+            if !candidates
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&candidate))
+            {
+                candidates.push(candidate);
+            }
+        }
+
+        for zone_name in candidates {
+            let zones: Vec<CloudflareZone> = self
+                .cloudflare_json(
+                    self.client
+                        .get(format!("{CLOUDFLARE_API_BASE}/zones"))
+                        .query(&[
+                            ("name", zone_name.as_str()),
+                            ("page", "1"),
+                            ("per_page", "1"),
+                        ]),
+                    "lookup zone",
+                )
+                .await?;
+            if let Some(zone) = zones.into_iter().next() {
+                return Ok(zone.id);
+            }
+        }
+
+        bail!("unable to resolve Cloudflare zone for {fqdn}")
+    }
+
+    fn apply_auth(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        if let Some(api_token) = &self.api_token {
+            Ok(request.bearer_auth(api_token))
+        } else if let (Some(api_email), Some(api_key)) = (&self.api_email, &self.api_key) {
+            Ok(request
+                .header("X-Auth-Email", api_email)
+                .header("X-Auth-Key", api_key))
+        } else {
+            bail!("Cloudflare dns-01 requires api_token or api_key + api_email")
+        }
+    }
+
+    async fn cloudflare_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        context: &str,
+    ) -> anyhow::Result<T> {
+        let response = self
+            .apply_auth(request)?
+            .send()
+            .await
+            .with_context(|| format!("Cloudflare {context}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("read Cloudflare {context} response"))?;
+        let value: Value = serde_json::from_str(&body)
+            .with_context(|| format!("decode Cloudflare {context} response"))?;
+        let success = value
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(status.is_success());
+        if !status.is_success() || !success {
+            bail!(
+                "Cloudflare {context} failed: {}",
+                summarize_cloudflare_error_value(&value)
+            );
+        }
+        serde_json::from_value(value.get("result").cloned().unwrap_or(Value::Null))
+            .with_context(|| format!("decode Cloudflare {context} result"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareZone {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareDnsRecord {
+    id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AliDnsProvider {
+    client: Client,
+    access_key_id: String,
+    access_key_secret: String,
+    zone_name: Option<String>,
+    ttl: Option<u64>,
+}
+
+impl AliDnsProvider {
+    async fn create_txt_record(
+        &self,
+        record: &DnsChallengeRecord,
+    ) -> anyhow::Result<DnsRecordHandle> {
+        let zone_name = self.resolve_zone_name(&record.fqdn).await?;
+        let rr = relative_record_name(&record.fqdn, &zone_name)?;
+        let response = self
+            .signed_request(
+                "AddDomainRecord",
+                &[
+                    ("DomainName", zone_name),
+                    ("RR", rr),
+                    ("Type", "TXT".to_string()),
+                    ("Value", record.value.clone()),
+                    ("TTL", self.ttl.unwrap_or(600).to_string()),
+                ],
+            )
+            .await?;
+        let record_id = response
+            .get("RecordId")
+            .and_then(json_value_to_string)
+            .context("AliDNS AddDomainRecord response did not include RecordId")?;
+        Ok(DnsRecordHandle::AliDns { record_id })
+    }
+
+    async fn delete_record(&self, record_id: &str) -> anyhow::Result<()> {
+        let _ = self
+            .signed_request("DeleteDomainRecord", &[("RecordId", record_id.to_string())])
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_zone_name(&self, fqdn: &str) -> anyhow::Result<String> {
+        if let Some(zone_name) = &self.zone_name {
+            return Ok(zone_name.clone());
+        }
+
+        for candidate in zone_candidates_from_name(fqdn) {
+            match self
+                .signed_request("DescribeDomainInfo", &[("DomainName", candidate.clone())])
+                .await
+            {
+                Ok(_) => return Ok(candidate),
+                Err(error) if is_alidns_missing_domain_error(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        bail!("unable to resolve AliDNS zone for {fqdn}")
+    }
+
+    async fn signed_request(
+        &self,
+        action: &str,
+        extra_params: &[(impl AsRef<str>, String)],
+    ) -> anyhow::Result<Value> {
+        let mut params = BTreeMap::new();
+        params.insert("AccessKeyId".to_string(), self.access_key_id.clone());
+        params.insert("Action".to_string(), action.to_string());
+        params.insert("Format".to_string(), "JSON".to_string());
+        params.insert("SignatureMethod".to_string(), "HMAC-SHA1".to_string());
+        params.insert("SignatureNonce".to_string(), next_alidns_nonce());
+        params.insert("SignatureVersion".to_string(), "1.0".to_string());
+        params.insert(
+            "Timestamp".to_string(),
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .context("format AliDNS timestamp")?,
+        );
+        params.insert("Version".to_string(), ALIDNS_API_VERSION.to_string());
+        for (key, value) in extra_params {
+            params.insert(key.as_ref().to_string(), value.clone());
+        }
+
+        let canonicalized = params
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    alidns_percent_encode(key),
+                    alidns_percent_encode(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let string_to_sign = format!("GET&%2F&{}", alidns_percent_encode(&canonicalized));
+        let signature = alidns_signature(&self.access_key_secret, &string_to_sign)?;
+        params.insert("Signature".to_string(), signature);
+
+        let response = self
+            .client
+            .get(ALIDNS_API_ENDPOINT)
+            .query(&params)
+            .send()
+            .await
+            .with_context(|| format!("AliDNS {action}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("read AliDNS {action} response"))?;
+        let value: Value = serde_json::from_str(&body)
+            .with_context(|| format!("decode AliDNS {action} response"))?;
+        if let Some(code) = value.get("Code").and_then(Value::as_str) {
+            let message = value
+                .get("Message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            bail!("AliDNS {action} failed with {code}: {message}");
+        }
+        if !status.is_success() {
+            bail!("AliDNS {action} request failed with {status}: {body}");
+        }
+        Ok(value)
+    }
+}
+
+fn is_alidns_missing_domain_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("InvalidDomainName.NoExist")
+        || text.contains("DomainRecordNotBelongToUser")
+        || text.contains("Forbidden.DomainNotBelongToUser")
+}
+
+fn build_dns01_record_name(identifier: &str) -> String {
+    let domain = identifier
+        .trim()
+        .trim_end_matches('.')
+        .trim_start_matches("*.");
+    format!("_acme-challenge.{domain}")
+}
+
+fn build_dns01_txt_value(token: &str, thumbprint: &str) -> String {
+    let key_authorization = build_key_authorization(token, thumbprint);
+    base64url(Sha256::digest(key_authorization.as_bytes()))
+}
+
+fn zone_candidates_from_name(name: &str) -> Vec<String> {
+    let labels = name
+        .trim()
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if labels.len() < 2 {
+        return Vec::new();
+    }
+
+    let start = if labels
+        .first()
+        .is_some_and(|label| label.eq_ignore_ascii_case("_acme-challenge"))
+    {
+        1
+    } else {
+        0
+    };
+
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for index in start..labels.len() - 1 {
+        let candidate = labels[index..].join(".");
+        if candidate.contains('.') && seen.insert(candidate.to_ascii_lowercase()) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn relative_record_name(fqdn: &str, zone_name: &str) -> anyhow::Result<String> {
+    let fqdn = fqdn.trim().trim_end_matches('.').to_ascii_lowercase();
+    let zone_name = zone_name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if fqdn == zone_name {
+        return Ok("@".to_string());
+    }
+    let suffix = format!(".{zone_name}");
+    if let Some(relative) = fqdn.strip_suffix(&suffix) {
+        return Ok(relative.to_string());
+    }
+    bail!("record {fqdn} does not belong to zone {zone_name}")
+}
+
+fn summarize_cloudflare_error_value(value: &Value) -> String {
+    if let Some(errors) = value.get("errors").and_then(Value::as_array) {
+        let summary = errors
+            .iter()
+            .map(|error| {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                match error.get("code").and_then(Value::as_i64) {
+                    Some(code) => format!("{code}: {message}"),
+                    None => message.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        if !summary.is_empty() {
+            return summary.join("; ");
+        }
+    }
+    value.to_string()
+}
+
+fn json_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn alidns_percent_encode(text: &str) -> String {
+    utf8_percent_encode(text, &ALIDNS_QUERY_ESCAPE_SET).to_string()
+}
+
+fn alidns_signature(secret: &str, string_to_sign: &str) -> anyhow::Result<String> {
+    let mut mac = HmacSha1::new_from_slice(format!("{secret}&").as_bytes())
+        .context("initialize AliDNS HMAC")?;
+    mac.update(string_to_sign.as_bytes());
+    Ok(STANDARD.encode(mac.finalize().into_bytes()))
+}
+
+fn next_alidns_nonce() -> String {
+    format!(
+        "noders-{}-{}",
+        unix_now(),
+        NEXT_ALIDNS_NONCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+async fn lookup_txt_records(name: &str, nameserver: &str) -> anyhow::Result<Vec<String>> {
+    let servers = resolve_nameserver_endpoints(nameserver).await?;
+    let mut last_error = None;
+    for server in servers {
+        match query_txt_server(server, name).await {
+            Ok(records) if !records.is_empty() => return Ok(records),
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    Ok(Vec::new())
+}
+
+async fn resolve_nameserver_endpoints(spec: &str) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    let (host, port) = parse_nameserver_spec(spec)?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    let resolved = lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("resolve nameserver {spec}"))?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        bail!("no addresses resolved for nameserver {spec}")
+    }
+    Ok(resolved)
+}
+
+fn parse_nameserver_spec(spec: &str) -> anyhow::Result<(String, u16)> {
+    let spec = spec.trim().trim_end_matches('/');
+    ensure!(!spec.is_empty(), "empty nameserver specification");
+
+    let spec = if let Some(rest) = spec.strip_prefix("udp://") {
+        rest
+    } else if let Some(rest) = spec.strip_prefix("dns://") {
+        rest
+    } else if spec.contains("://") {
+        bail!("unsupported DNS scheme in {spec}")
+    } else {
+        spec
+    };
+
+    if let Ok(ip) = spec.parse::<std::net::IpAddr>() {
+        return Ok((ip.to_string(), 53));
+    }
+
+    if let Ok(addr) = spec.parse::<std::net::SocketAddr>() {
+        return Ok((addr.ip().to_string(), addr.port()));
+    }
+
+    if let Some(host) = spec.strip_prefix('[') {
+        let (host, port) = host
+            .split_once(']')
+            .ok_or_else(|| anyhow!("invalid bracketed nameserver {spec}"))?;
+        if port.is_empty() {
+            return Ok((host.to_string(), 53));
+        }
+        let port = port
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow!("invalid bracketed nameserver {spec}"))?
+            .parse::<u16>()?;
+        return Ok((host.to_string(), port));
+    }
+
+    if let Some((host, port)) = spec.rsplit_once(':')
+        && !host.contains(':')
+    {
+        return Ok((host.to_string(), port.parse::<u16>()?));
+    }
+
+    Ok((spec.to_string(), 53))
+}
+
+async fn query_txt_server(server: std::net::SocketAddr, name: &str) -> anyhow::Result<Vec<String>> {
+    let bind_addr = if server.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind UDP socket for DNS TXT query to {server}"))?;
+    let id = NEXT_DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+    let query = build_dns_query(name, 16, id)?;
+    socket
+        .send_to(&query, server)
+        .await
+        .with_context(|| format!("send DNS TXT query to {server}"))?;
+
+    let mut response = [0u8; 1500];
+    let (received, from) = timeout(DNS_QUERY_TIMEOUT, socket.recv_from(&mut response))
+        .await
+        .context("DNS TXT query timed out")?
+        .with_context(|| format!("read DNS TXT response from {server}"))?;
+    ensure!(
+        from.ip() == server.ip(),
+        "unexpected DNS response source {from}"
+    );
+    parse_txt_response(&response[..received], id)
+}
+
+fn build_dns_query(name: &str, record_type: u16, id: u16) -> anyhow::Result<Vec<u8>> {
+    let mut packet = Vec::with_capacity(512);
+    packet.extend_from_slice(&id.to_be_bytes());
+    packet.extend_from_slice(&0x0100u16.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    encode_dns_name(name, &mut packet)?;
+    packet.extend_from_slice(&record_type.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes());
+    Ok(packet)
+}
+
+fn encode_dns_name(name: &str, packet: &mut Vec<u8>) -> anyhow::Result<()> {
+    let normalized = name.trim().trim_end_matches('.');
+    ensure!(!normalized.is_empty(), "DNS host must not be empty");
+    for label in normalized.split('.') {
+        ensure!(!label.is_empty(), "DNS label must not be empty");
+        ensure!(label.len() <= 63, "DNS label too long in {name}");
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+    Ok(())
+}
+
+fn parse_txt_response(packet: &[u8], id: u16) -> anyhow::Result<Vec<String>> {
+    ensure!(packet.len() >= 12, "DNS response too short");
+    ensure!(
+        read_dns_u16(packet, 0)? == id,
+        "DNS transaction ID mismatch"
+    );
+    let flags = read_dns_u16(packet, 2)?;
+    ensure!(flags & 0x8000 != 0, "DNS response missing QR bit");
+    let rcode = flags & 0x000f;
+    ensure!(rcode == 0, "DNS server returned rcode {rcode}");
+
+    let questions = read_dns_u16(packet, 4)? as usize;
+    let answers = read_dns_u16(packet, 6)? as usize;
+    let mut offset = 12usize;
+
+    for _ in 0..questions {
+        offset = skip_dns_name(packet, offset)?;
+        ensure!(offset + 4 <= packet.len(), "DNS question truncated");
+        offset += 4;
+    }
+
+    let mut records = Vec::new();
+    for _ in 0..answers {
+        offset = skip_dns_name(packet, offset)?;
+        ensure!(offset + 10 <= packet.len(), "DNS answer header truncated");
+        let rr_type = read_dns_u16(packet, offset)?;
+        let rr_class = read_dns_u16(packet, offset + 2)?;
+        let rd_len = read_dns_u16(packet, offset + 8)? as usize;
+        offset += 10;
+        ensure!(
+            offset + rd_len <= packet.len(),
+            "DNS answer payload truncated"
+        );
+        if rr_class == 1 && rr_type == 16 {
+            records.push(parse_txt_rdata(&packet[offset..offset + rd_len])?);
+        }
+        offset += rd_len;
+    }
+
+    Ok(records)
+}
+
+fn parse_txt_rdata(rdata: &[u8]) -> anyhow::Result<String> {
+    let mut offset = 0usize;
+    let mut text = String::new();
+    while offset < rdata.len() {
+        let len = *rdata
+            .get(offset)
+            .ok_or_else(|| anyhow!("truncated DNS TXT record"))? as usize;
+        offset += 1;
+        ensure!(offset + len <= rdata.len(), "truncated DNS TXT chunk");
+        text.push_str(
+            std::str::from_utf8(&rdata[offset..offset + len]).context("decode DNS TXT chunk")?,
+        );
+        offset += len;
+    }
+    Ok(text)
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> anyhow::Result<usize> {
+    loop {
+        ensure!(offset < packet.len(), "DNS name out of bounds");
+        let len = packet[offset];
+        if len & 0b1100_0000 == 0b1100_0000 {
+            ensure!(offset + 1 < packet.len(), "DNS pointer truncated");
+            return Ok(offset + 2);
+        }
+        if len == 0 {
+            return Ok(offset + 1);
+        }
+        offset += 1;
+        ensure!(offset + len as usize <= packet.len(), "DNS label truncated");
+        offset += len as usize;
+    }
+}
+
+fn read_dns_u16(packet: &[u8], offset: usize) -> anyhow::Result<u16> {
+    ensure!(offset + 2 <= packet.len(), "read_dns_u16 out of bounds");
+    Ok(u16::from_be_bytes([packet[offset], packet[offset + 1]]))
+}
+
 struct Http01ChallengeServer {
     handle: JoinHandle<()>,
 }
 
 impl Http01ChallengeServer {
-    async fn start(listen: &str, token: String, key_authorization: String) -> anyhow::Result<Self> {
+    async fn start(listen: &str, responses: HashMap<String, String>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(listen)
             .await
             .with_context(|| format!("bind ACME http-01 listener on {listen}"))?;
-        let expected_path = format!("/.well-known/acme-challenge/{token}");
+        let responses = Arc::new(
+            responses
+                .into_iter()
+                .map(|(token, body)| (format!("/.well-known/acme-challenge/{token}"), body))
+                .collect::<HashMap<_, _>>(),
+        );
         let handle = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let path = expected_path.clone();
-                let response_body = key_authorization.clone();
+                let responses = responses.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_http_request(stream, &path, &response_body).await {
+                    if let Err(error) = serve_http_request(stream, responses).await {
                         tracing::debug!(%error, "serve ACME http-01 request failed");
                     }
                 });
@@ -495,8 +1481,7 @@ impl Http01ChallengeServer {
 
 async fn serve_http_request(
     mut stream: tokio::net::TcpStream,
-    expected_path: &str,
-    response_body: &str,
+    responses: Arc<HashMap<String, String>>,
 ) -> anyhow::Result<()> {
     let request = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async {
         let mut buffer = Vec::with_capacity(1024);
@@ -521,10 +1506,9 @@ async fn serve_http_request(
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1));
-    let (status_line, body) = if path == Some(expected_path) {
-        ("HTTP/1.1 200 OK", response_body)
-    } else {
-        ("HTTP/1.1 404 Not Found", "not found")
+    let (status_line, body) = match path.and_then(|path| responses.get(path)) {
+        Some(body) => ("HTTP/1.1 200 OK", body.as_str()),
+        None => ("HTTP/1.1 404 Not Found", "not found"),
     };
     let response = format!(
         "{status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -667,17 +1651,36 @@ fn sign_base64url(key: &SigningKey, message: &[u8]) -> anyhow::Result<String> {
 
 fn build_certificate_signing_request(
     private_key: &KeyPair,
-    domain: &str,
+    domains: &[String],
 ) -> anyhow::Result<Vec<u8>> {
-    let mut params = CertificateParams::new(vec![domain.to_string()])
-        .context("build ACME certificate parameters")?;
+    let domains = normalize_domains(domains);
+    ensure!(!domains.is_empty(), "ACME CSR domains must not be empty");
+
+    let mut params =
+        CertificateParams::new(domains.clone()).context("build ACME certificate parameters")?;
     let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, domain);
+    distinguished_name.push(DnType::CommonName, &domains[0]);
     params.distinguished_name = distinguished_name;
     let csr = params
         .serialize_request(private_key)
         .context("serialize P-256 certificate signing request")?;
     Ok(csr.der().as_ref().to_vec())
+}
+
+fn normalize_domains(domains: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for domain in domains {
+        let domain = domain.trim().trim_end_matches('.');
+        if domain.is_empty() {
+            continue;
+        }
+        let key = domain.to_ascii_lowercase();
+        if seen.insert(key) {
+            normalized.push(domain.to_string());
+        }
+    }
+    normalized
 }
 
 fn first_certificate_not_after(cert_pem: &[u8]) -> anyhow::Result<u64> {
@@ -911,6 +1914,15 @@ mod tests {
     }
 
     #[test]
+    fn builds_dns01_record_name_and_value() {
+        assert_eq!(
+            build_dns01_record_name("*.example.com"),
+            "_acme-challenge.example.com"
+        );
+        assert!(!build_dns01_txt_value("token", "thumb").is_empty());
+    }
+
+    #[test]
     fn parses_utc_time() {
         assert_eq!(parse_der_time(0x17, b"260308000000Z").unwrap(), 1772928000);
     }
@@ -920,6 +1932,22 @@ mod tests {
         assert_eq!(
             parse_der_time(0x18, b"20260308000000Z").unwrap(),
             1772928000
+        );
+    }
+
+    #[test]
+    fn zone_candidates_skip_acme_label() {
+        assert_eq!(
+            zone_candidates_from_name("_acme-challenge.foo.example.com"),
+            vec!["foo.example.com".to_string(), "example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn relative_record_name_strips_zone() {
+        assert_eq!(
+            relative_record_name("_acme-challenge.example.com", "example.com").unwrap(),
+            "_acme-challenge"
         );
     }
 
@@ -963,8 +1991,7 @@ mod tests {
 
         let server = Http01ChallengeServer::start(
             &address.to_string(),
-            "abc".to_string(),
-            "abc.thumb".to_string(),
+            HashMap::from([("abc".to_string(), "abc.thumb".to_string())]),
         )
         .await
         .unwrap();
@@ -979,5 +2006,17 @@ mod tests {
 
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("abc.thumb"));
+    }
+
+    #[test]
+    fn parses_txt_response() {
+        let response = [
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x10, 0x00,
+            0x01, 0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x05, 0x04,
+            b't', b'e', b's', b't',
+        ];
+        let parsed = parse_txt_response(&response, 0x1234).expect("parse TXT response");
+        assert_eq!(parsed, vec!["test".to_string()]);
     }
 }

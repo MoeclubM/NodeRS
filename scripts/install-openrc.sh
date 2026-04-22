@@ -424,6 +424,7 @@ remove_all_nodes() {
   done
 
   rm -f "$PREFIX/bin/noders-anytls"
+  remove_management_support
   rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$RUN_DIR"
   remove_service_account
 }
@@ -467,6 +468,7 @@ print_summary() {
   cat <<EOF
 Installed NodeRS (OpenRC)
   Binary: $PREFIX/bin/noders-anytls
+  Manager: $PREFIX/bin/noders
   State:  $STATE_DIR
   Logs:   $LOG_DIR
 EOF
@@ -487,6 +489,7 @@ install_from_bundle() {
 
   ensure_directories
   install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
+  install_management_support "$staging_dir"
   write_xboard_configs "$staging_dir"
   install_service
   print_summary

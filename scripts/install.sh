@@ -405,6 +405,7 @@ remove_all_nodes() {
   fi
 
   rm -f "$PREFIX/bin/noders-anytls"
+  remove_management_support
   rm -rf "$CONFIG_DIR" "$STATE_DIR"
   if id "$SERVICE_USER" >/dev/null 2>&1; then
     userdel "$SERVICE_USER" >/dev/null 2>&1 || true
@@ -453,6 +454,7 @@ print_summary() {
   cat <<EOF
 Installed NodeRS
   Binary: $PREFIX/bin/noders-anytls
+  Manager: $PREFIX/bin/noders
   State:  $STATE_DIR
 EOF
 
@@ -470,6 +472,7 @@ install_from_bundle() {
 
   ensure_directories
   install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
+  install_management_support "$staging_dir"
   write_xboard_configs "$staging_dir"
   install_service "$staging_dir"
   print_summary

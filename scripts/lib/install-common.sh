@@ -249,6 +249,645 @@ openrc_node_service_log_path() {
   printf '%s\n' "${LOG_DIR%/}/${SERVICE_NAME}-${1}.log"
 }
 
+support_root_dir() {
+  printf '%s\n' "${PREFIX%/}/lib/noders"
+}
+
+write_manager_install_env() {
+  local target
+  target="$1"
+
+  : > "$target"
+  printf 'PREFIX=%q\n' "$PREFIX" >> "$target"
+  printf 'CONFIG_DIR=%q\n' "$CONFIG_DIR" >> "$target"
+  printf 'STATE_DIR=%q\n' "$STATE_DIR" >> "$target"
+  printf 'SERVICE_NAME=%q\n' "$SERVICE_NAME" >> "$target"
+  printf 'LEGACY_SERVICE_NAME=%q\n' "$LEGACY_SERVICE_NAME" >> "$target"
+  if [[ -n "${LOG_DIR:-}" ]]; then
+    printf 'LOG_DIR=%q\n' "$LOG_DIR" >> "$target"
+  fi
+  if [[ -n "${RUN_DIR:-}" ]]; then
+    printf 'RUN_DIR=%q\n' "$RUN_DIR" >> "$target"
+  fi
+}
+
+write_management_script() {
+  local target
+  target="$1"
+
+  cat > "$target" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_PREFIX="/usr/local"
+DEFAULT_CONFIG_DIR="/etc/noders/anytls"
+DEFAULT_STATE_DIR="/var/lib/noders/anytls"
+DEFAULT_LOG_DIR="/var/log/noders-anytls"
+DEFAULT_RUN_DIR="/run/noders-anytls"
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SUPPORT_DIR=""
+PREFIX=""
+CONFIG_DIR=""
+STATE_DIR=""
+LOG_DIR=""
+RUN_DIR=""
+SERVICE_NAME="noders"
+LEGACY_SERVICE_NAME="noders-anytls"
+SERVICE_MANAGER="none"
+
+declare -a DISCOVERED_UNITS=()
+declare -a RESOLVED_UNITS=()
+
+action_usage() {
+  cat <<'USAGE'
+Usage: noders <command> [options] [selector...]
+
+Commands:
+  update [--version <tag>] [--no-restart]
+      Upgrade the installed NodeRS binary.
+
+  uninstall [--all | --machine-id <id> | --machine <url> <key> <id>]
+      Remove one machine instance or the whole installation.
+
+  start [all|selector...]
+  stop [all|selector...]
+  restart [all|selector...]
+      Control discovered NodeRS services. With no selector, all services are targeted.
+
+  log [-f|--follow] [-n|--lines <count>] [all|selector...]
+      Show NodeRS logs. With no selector, all services are targeted.
+
+  help
+      Show this help message.
+
+Selectors:
+  - Full service name, for example: noders-1-123456789
+  - Machine ID, for example: 1
+  - Instance suffix, for example: 1-123456789
+  - all
+
+Examples:
+  noders
+  noders update
+  noders restart
+  noders restart 1
+  noders log -f
+  noders uninstall --machine-id 1
+  noders uninstall --all
+USAGE
+}
+
+append_unique_unit() {
+  local candidate existing
+  candidate="$1"
+  for existing in "${DISCOVERED_UNITS[@]:-}"; do
+    if [[ "$existing" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  DISCOVERED_UNITS+=("$candidate")
+}
+
+append_resolved_unit() {
+  local candidate existing
+  candidate="$1"
+  for existing in "${RESOLVED_UNITS[@]:-}"; do
+    if [[ "$existing" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  RESOLVED_UNITS+=("$candidate")
+}
+
+discover_support_dir() {
+  if [[ -f "$SCRIPT_DIR/install.sh" && -f "$SCRIPT_DIR/lib/install-common.sh" ]]; then
+    SUPPORT_DIR="$SCRIPT_DIR"
+    return
+  fi
+
+  local prefix_candidate
+  prefix_candidate="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+  if [[ -f "$prefix_candidate/lib/noders/install.sh" && -f "$prefix_candidate/lib/noders/lib/install-common.sh" ]]; then
+    SUPPORT_DIR="$prefix_candidate/lib/noders"
+    return
+  fi
+
+  if [[ -f "$DEFAULT_PREFIX/lib/noders/install.sh" && -f "$DEFAULT_PREFIX/lib/noders/lib/install-common.sh" ]]; then
+    SUPPORT_DIR="$DEFAULT_PREFIX/lib/noders"
+    return
+  fi
+
+  SUPPORT_DIR="$SCRIPT_DIR"
+}
+
+load_install_env() {
+  local env_path
+  env_path="$SUPPORT_DIR/install.env"
+  if [[ -f "$env_path" ]]; then
+    # shellcheck source=/dev/null
+    source "$env_path"
+  fi
+
+  if [[ -z "$PREFIX" ]]; then
+    if [[ "$SUPPORT_DIR" == */lib/noders ]]; then
+      PREFIX="$(CDPATH= cd -- "$SUPPORT_DIR/../.." && pwd)"
+    else
+      PREFIX="$DEFAULT_PREFIX"
+    fi
+  fi
+  CONFIG_DIR="${CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
+  STATE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR}"
+  LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
+  RUN_DIR="${RUN_DIR:-$DEFAULT_RUN_DIR}"
+  SERVICE_NAME="${SERVICE_NAME:-noders}"
+  LEGACY_SERVICE_NAME="${LEGACY_SERVICE_NAME:-noders-anytls}"
+}
+
+print_discovered_units() {
+  if [[ ${#DISCOVERED_UNITS[@]} -eq 0 ]]; then
+    echo "No NodeRS services were discovered."
+    return
+  fi
+
+  echo "Discovered NodeRS services (${SERVICE_MANAGER}):"
+  local unit
+  for unit in "${DISCOVERED_UNITS[@]}"; do
+    echo "  - $unit"
+  done
+}
+
+discover_systemd_units() {
+  local unit_path unit_name found=1
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  shopt -s nullglob
+  for unit_path in \
+    /etc/systemd/system/${SERVICE_NAME}.service \
+    /etc/systemd/system/${SERVICE_NAME}-*.service \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service; do
+    [[ -f "$unit_path" ]] || continue
+    unit_name="$(basename "$unit_path" .service)"
+    append_unique_unit "$unit_name"
+    found=0
+  done
+  shopt -u nullglob
+  return "$found"
+}
+
+discover_openrc_units() {
+  local service_path unit_name found=1
+  if ! command -v rc-service >/dev/null 2>&1; then
+    return 1
+  fi
+
+  shopt -s nullglob
+  for service_path in \
+    /etc/init.d/${SERVICE_NAME} \
+    /etc/init.d/${SERVICE_NAME}-* \
+    /etc/init.d/${LEGACY_SERVICE_NAME} \
+    /etc/init.d/${LEGACY_SERVICE_NAME}-*; do
+    [[ -f "$service_path" ]] || continue
+    unit_name="$(basename "$service_path")"
+    append_unique_unit "$unit_name"
+    found=0
+  done
+  shopt -u nullglob
+  return "$found"
+}
+
+discover_units() {
+  DISCOVERED_UNITS=()
+  if discover_systemd_units; then
+    SERVICE_MANAGER="systemd"
+    return
+  fi
+  if discover_openrc_units; then
+    SERVICE_MANAGER="openrc"
+    return
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    SERVICE_MANAGER="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    SERVICE_MANAGER="openrc"
+  else
+    SERVICE_MANAGER="none"
+  fi
+}
+
+selector_matches_unit() {
+  local selector unit
+  selector="$1"
+  unit="$2"
+
+  [[ "$selector" == "$unit" ]] \
+    || [[ "$unit" == "${SERVICE_NAME}-${selector}" ]] \
+    || [[ "$unit" == "${LEGACY_SERVICE_NAME}-${selector}" ]] \
+    || [[ "$unit" == "${SERVICE_NAME}-${selector}-"* ]] \
+    || [[ "$unit" == "${LEGACY_SERVICE_NAME}-${selector}-"* ]]
+}
+
+resolve_targets() {
+  local selector unit matched
+  discover_units
+  RESOLVED_UNITS=()
+
+  if [[ "$SERVICE_MANAGER" == "none" ]]; then
+    echo "No supported service manager was detected on this host." >&2
+    exit 1
+  fi
+  if [[ ${#DISCOVERED_UNITS[@]} -eq 0 ]]; then
+    echo "No NodeRS services were discovered." >&2
+    exit 1
+  fi
+
+  if [[ $# -eq 0 || ( $# -eq 1 && "$1" == "all" ) ]]; then
+    RESOLVED_UNITS=("${DISCOVERED_UNITS[@]}")
+    return
+  fi
+
+  for selector in "$@"; do
+    matched=1
+    for unit in "${DISCOVERED_UNITS[@]}"; do
+      if selector_matches_unit "$selector" "$unit"; then
+        append_resolved_unit "$unit"
+        matched=0
+      fi
+    done
+    if [[ "$matched" -ne 0 ]]; then
+      echo "No NodeRS service matched selector: $selector" >&2
+      print_discovered_units >&2
+      exit 1
+    fi
+  done
+}
+
+run_allow_interrupt() {
+  local status
+  set +e
+  "$@"
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 && "$status" -ne 130 ]]; then
+    return "$status"
+  fi
+  return 0
+}
+
+require_helper_script() {
+  local helper
+  helper="$1"
+  if [[ ! -f "$helper" ]]; then
+    echo "Required helper script not found: $helper" >&2
+    echo "Please reinstall NodeRS so the support files are refreshed." >&2
+    exit 1
+  fi
+}
+
+preferred_install_helper() {
+  discover_units
+  if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+    printf '%s\n' "$SUPPORT_DIR/install-openrc.sh"
+  else
+    printf '%s\n' "$SUPPORT_DIR/install.sh"
+  fi
+}
+
+run_update() {
+  local helper
+  helper="$SUPPORT_DIR/upgrade.sh"
+  require_helper_script "$helper"
+  bash "$helper" --prefix "$PREFIX" --config-dir "$CONFIG_DIR" "$@"
+}
+
+run_uninstall() {
+  local helper
+  helper="$(preferred_install_helper)"
+  require_helper_script "$helper"
+  bash "$helper" --prefix "$PREFIX" --config-dir "$CONFIG_DIR" --state-dir "$STATE_DIR" --uninstall "$@"
+}
+
+perform_service_action() {
+  local action unit
+  action="$1"
+  shift
+  resolve_targets "$@"
+
+  case "$SERVICE_MANAGER" in
+    systemd)
+      systemctl "$action" "${RESOLVED_UNITS[@]}"
+      ;;
+    openrc)
+      for unit in "${RESOLVED_UNITS[@]}"; do
+        rc-service "$unit" "$action"
+      done
+      ;;
+    *)
+      echo "No supported service manager was detected on this host." >&2
+      exit 1
+      ;;
+  esac
+}
+
+show_logs() {
+  local follow lines unit log_path
+  follow=0
+  lines=100
+  local -a selectors=()
+  local -a log_files=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow)
+        follow=1
+        shift
+        ;;
+      -n|--lines)
+        if [[ $# -lt 2 ]]; then
+          echo "Missing value for $1" >&2
+          exit 1
+        fi
+        lines="$2"
+        shift 2
+        ;;
+      *)
+        selectors+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ ! "$lines" =~ ^[0-9]+$ ]]; then
+    echo "Log line count must be a non-negative integer: $lines" >&2
+    exit 1
+  fi
+
+  resolve_targets "${selectors[@]}"
+
+  case "$SERVICE_MANAGER" in
+    systemd)
+      if ! command -v journalctl >/dev/null 2>&1; then
+        echo "journalctl is required to view systemd logs." >&2
+        exit 1
+      fi
+      local -a journal_cmd=(journalctl --no-pager -n "$lines")
+      if [[ "$follow" -eq 1 ]]; then
+        journal_cmd+=(-f)
+      fi
+      for unit in "${RESOLVED_UNITS[@]}"; do
+        journal_cmd+=(-u "$unit")
+      done
+      run_allow_interrupt "${journal_cmd[@]}"
+      ;;
+    openrc)
+      for unit in "${RESOLVED_UNITS[@]}"; do
+        log_path="${LOG_DIR%/}/${unit}.log"
+        if [[ -f "$log_path" ]]; then
+          log_files+=("$log_path")
+        fi
+      done
+      if [[ ${#log_files[@]} -eq 0 ]]; then
+        echo "No OpenRC log files were found under $LOG_DIR." >&2
+        exit 1
+      fi
+      local -a tail_cmd=(tail -n "$lines")
+      if [[ "$follow" -eq 1 ]]; then
+        tail_cmd+=(-f)
+      fi
+      tail_cmd+=("${log_files[@]}")
+      run_allow_interrupt "${tail_cmd[@]}"
+      ;;
+    *)
+      echo "No supported service manager was detected on this host." >&2
+      exit 1
+      ;;
+  esac
+}
+
+pause_if_interactive() {
+  if [[ -t 0 && -t 1 ]]; then
+    read -r -p "按回车继续..." _ || true
+  fi
+}
+
+prompt_selectors() {
+  local response
+  local -n output_ref=$1
+  output_ref=()
+
+  read -r -p "目标服务（留空=全部，可填服务名 / machine_id / 实例后缀）: " response
+  if [[ -z "$response" ]]; then
+    return
+  fi
+  read -r -a output_ref <<<"$response"
+}
+
+interactive_update() {
+  local version no_restart
+  local -a args=()
+
+  read -r -p "升级到哪个版本标签（留空=latest）: " version
+  if [[ -n "$version" ]]; then
+    args+=(--version "$version")
+  fi
+  read -r -p "升级后不重启服务？[y/N]: " no_restart
+  if [[ "$no_restart" =~ ^[Yy]$ ]]; then
+    args+=(--no-restart)
+  fi
+  run_update "${args[@]}"
+}
+
+interactive_uninstall() {
+  local choice machine_id confirm
+  echo "1) 卸载全部"
+  echo "2) 按 machine_id 卸载"
+  echo "0) 返回"
+  read -r -p "请选择 [0-2]: " choice
+
+  case "$choice" in
+    1)
+      read -r -p "确认卸载全部 NodeRS 实例？输入 YES 继续: " confirm
+      if [[ "$confirm" != "YES" ]]; then
+        echo "已取消。"
+        return 0
+      fi
+      run_uninstall --all
+      ;;
+    2)
+      read -r -p "请输入 machine_id: " machine_id
+      if [[ -z "$machine_id" ]]; then
+        echo "machine_id 不能为空。" >&2
+        return 1
+      fi
+      run_uninstall --machine-id "$machine_id"
+      ;;
+    0)
+      return 0
+      ;;
+    *)
+      echo "无效选择。" >&2
+      return 1
+      ;;
+  esac
+}
+
+interactive_service_action() {
+  local action
+  local -a selectors=()
+  action="$1"
+  prompt_selectors selectors
+  perform_service_action "$action" "${selectors[@]}"
+}
+
+interactive_logs() {
+  local lines follow
+  local -a selectors=()
+  local -a args=()
+
+  prompt_selectors selectors
+  read -r -p "显示最近多少行日志（默认 100）: " lines
+  if [[ -n "$lines" ]]; then
+    args+=(--lines "$lines")
+  fi
+  read -r -p "持续追踪日志？[y/N]: " follow
+  if [[ "$follow" =~ ^[Yy]$ ]]; then
+    args+=(--follow)
+  fi
+  show_logs "${args[@]}" "${selectors[@]}"
+}
+
+interactive_menu() {
+  local choice
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    action_usage >&2
+    exit 1
+  fi
+
+  while true; do
+    echo
+    echo "NodeRS 管理菜单"
+    echo "================"
+    discover_units
+    print_discovered_units
+    echo
+    echo "1) 更新"
+    echo "2) 卸载"
+    echo "3) 启动"
+    echo "4) 停止"
+    echo "5) 重启"
+    echo "6) 查看日志"
+    echo "0) 退出"
+    read -r -p "请选择 [0-6]: " choice
+
+    case "$choice" in
+      1)
+        interactive_update
+        return
+        ;;
+      2)
+        interactive_uninstall
+        return
+        ;;
+      3)
+        interactive_service_action start
+        pause_if_interactive
+        ;;
+      4)
+        interactive_service_action stop
+        pause_if_interactive
+        ;;
+      5)
+        interactive_service_action restart
+        pause_if_interactive
+        ;;
+      6)
+        interactive_logs
+        pause_if_interactive
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "无效选择。" >&2
+        ;;
+    esac
+  done
+}
+
+main() {
+  discover_support_dir
+  load_install_env
+
+  if [[ $# -eq 0 ]]; then
+    interactive_menu
+    return
+  fi
+
+  case "$1" in
+    help|-h|--help)
+      action_usage
+      ;;
+    update)
+      shift
+      run_update "$@"
+      ;;
+    uninstall)
+      shift
+      run_uninstall "$@"
+      ;;
+    start)
+      shift
+      perform_service_action start "$@"
+      ;;
+    stop)
+      shift
+      perform_service_action stop "$@"
+      ;;
+    restart)
+      shift
+      perform_service_action restart "$@"
+      ;;
+    log|logs)
+      shift
+      show_logs "$@"
+      ;;
+    *)
+      echo "Unknown noders command: $1" >&2
+      action_usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
+EOF
+  chmod 0755 "$target"
+}
+
+install_management_support() {
+  local staging_dir support_dir
+  staging_dir="$1"
+  support_dir="$(support_root_dir)"
+
+  install -d "$PREFIX/bin" "$support_dir" "$support_dir/lib"
+  write_management_script "$PREFIX/bin/noders"
+  install -m 0755 "$staging_dir/install.sh" "$support_dir/install.sh"
+  install -m 0755 "$staging_dir/install-openrc.sh" "$support_dir/install-openrc.sh"
+  install -m 0755 "$staging_dir/upgrade.sh" "$support_dir/upgrade.sh"
+  install -m 0644 "$staging_dir/lib/install-common.sh" "$support_dir/lib/install-common.sh"
+  write_manager_install_env "$support_dir/install.env"
+}
+
+remove_management_support() {
+  rm -f "$PREFIX/bin/noders"
+  rm -rf "$(support_root_dir)"
+}
+
 render_openrc_service_file() {
   local target instance_id config_path service_user service_group pid_path log_path
   target="$1"

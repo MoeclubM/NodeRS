@@ -1,7 +1,6 @@
 use anyhow::{Context, bail};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::net::UdpSocket;
@@ -19,7 +18,6 @@ pub const LEGACY_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
 const AF_IPV4: u8 = 0x00;
 const AF_IPV6: u8 = 0x01;
 const AF_FQDN: u8 = 0x02;
-const UDP_SOCKET_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UotVersion {
@@ -98,7 +96,7 @@ pub async fn prepare(
     request: UotRequest,
     routing: &RoutingTable,
 ) -> anyhow::Result<PreparedUotRelay> {
-    let socket = Arc::new(bind_udp_socket().await?);
+    let socket = Arc::new(transport::bind_udp_socket().await?);
     let mode = if request.is_connect {
         let destination = request
             .destination
@@ -109,6 +107,7 @@ pub async fn prepare(
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("no UDP addresses resolved for {destination}"))?;
+        let target = transport::normalize_udp_target(&socket, target);
         socket
             .connect(target)
             .await
@@ -194,6 +193,7 @@ async fn relay_client_to_udp(
                 let target =
                     resolve_udp_target(&packet.destination, &routing, &mut destination_cache)
                         .await?;
+                let target = transport::normalize_udp_target(&context.socket, target);
                 tokio::select! {
                     _ = context.control.cancelled() => return Ok(()),
                     sent = context.socket.send_to(&packet.payload, target) => sent.with_context(|| format!("send UDP payload to {target}"))?,
@@ -236,7 +236,7 @@ async fn relay_udp_to_client(
         };
         let encoded = encode_server_packet(
             &context.mode,
-            &SocksAddr::Ip(source),
+            &SocksAddr::Ip(transport::normalize_udp_source(source)),
             &buffer[..payload_len],
         )?;
         tokio::select! {
@@ -431,39 +431,6 @@ fn address_wire_len(destination: &SocksAddr) -> usize {
         SocksAddr::Ip(_) => 1 + 16 + 2,
         SocksAddr::Domain(host, _) => 1 + 1 + host.len() + 2,
     }
-}
-
-async fn bind_udp_socket() -> anyhow::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
-        .context("create IPv6 UDP socket")?;
-    socket.set_reuse_address(true).ok();
-    socket.set_only_v6(false).ok();
-    socket.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
-    socket.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
-    if socket
-        .bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())
-        .is_ok()
-    {
-        socket
-            .set_nonblocking(true)
-            .context("set IPv6 UDP socket nonblocking")?;
-        let std_socket: std::net::UdpSocket = socket.into();
-        return UdpSocket::from_std(std_socket).context("adopt IPv6 UDP socket");
-    }
-
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("create IPv4 UDP socket")?;
-    socket.set_reuse_address(true).ok();
-    socket.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
-    socket.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE).ok();
-    socket
-        .bind(&SocketAddr::from(([0, 0, 0, 0], 0)).into())
-        .context("bind IPv4 UDP socket")?;
-    socket
-        .set_nonblocking(true)
-        .context("set IPv4 UDP socket nonblocking")?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    UdpSocket::from_std(std_socket).context("adopt IPv4 UDP socket")
 }
 
 fn flatten_join(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {

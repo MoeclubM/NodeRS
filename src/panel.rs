@@ -3,6 +3,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::config::PanelConfig;
@@ -11,6 +12,8 @@ const DEFAULT_PANEL_TIMEOUT_SECONDS: u64 = 15;
 const DEFAULT_ACME_DIRECTORY_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";
 const DEFAULT_ACME_CHALLENGE_LISTEN: &str = "0.0.0.0:80";
 const DEFAULT_ACME_RENEW_BEFORE_DAYS: u64 = 30;
+const DEFAULT_DNS_PROPAGATION_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_DNS_PROPAGATION_INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchState<T> {
@@ -32,7 +35,7 @@ pub struct NodePanelClient {
     node_id: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeConfigResponse {
     pub protocol: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
@@ -44,8 +47,105 @@ pub struct NodeConfigResponse {
     pub network_settings: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub server_name: String,
+    #[serde(default)]
+    pub tls: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub tls_settings: NodeTlsSettings,
+    #[serde(default)]
+    pub multiplex: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub host: String,
+    #[serde(
+        default,
+        alias = "security",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub cipher: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub plugin: String,
+    #[serde(
+        default,
+        alias = "pluginOpts",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub plugin_opts: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub server_key: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub flow: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub decryption: String,
+    #[serde(default)]
+    pub version: Option<Value>,
+    #[serde(default, alias = "upMbps")]
+    pub up_mbps: Option<Value>,
+    #[serde(default, alias = "downMbps")]
+    pub down_mbps: Option<Value>,
+    #[serde(default)]
+    pub obfs: Option<Value>,
+    #[serde(
+        default,
+        alias = "obfs-password",
+        alias = "obfsPassword",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub obfs_password: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub congestion_control: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub auth_timeout: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub zero_rtt_handshake: bool,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub heartbeat: String,
+    #[serde(default)]
+    pub transport: Option<Value>,
+    #[serde(
+        default,
+        alias = "trafficPattern",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub traffic_pattern: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub packet_encoding: String,
+    #[serde(
+        default,
+        alias = "globalPadding",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub global_padding: bool,
+    #[serde(
+        default,
+        alias = "authenticatedLength",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub authenticated_length: bool,
+    #[serde(default)]
+    pub fallbacks: Option<Value>,
+    #[serde(default)]
+    pub fallback: Option<Value>,
+    #[serde(default)]
+    pub fallback_for_alpn: Option<Value>,
+    #[serde(
+        default,
+        alias = "ignoreClientBandwidth",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub ignore_client_bandwidth: bool,
+    #[serde(default)]
+    pub masquerade: Option<Value>,
+    #[serde(
+        default,
+        alias = "udpRelayMode",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub udp_relay_mode: String,
+    #[serde(
+        default,
+        alias = "udpOverStream",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub udp_over_stream: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub padding_scheme: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
@@ -105,14 +205,28 @@ pub struct CertConfig {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub cert_mode: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "certificate_path",
+        alias = "fullchain_path",
+        alias = "fullchain",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub cert_path: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "private_key_path",
+        alias = "privkey_path",
+        alias = "privkey",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub key_path: String,
     #[serde(
         default,
         alias = "cert",
         alias = "certificate",
+        alias = "cert_content",
+        alias = "certificate_pem",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub cert_pem: String,
@@ -120,6 +234,8 @@ pub struct CertConfig {
         default,
         alias = "key",
         alias = "private_key",
+        alias = "key_content",
+        alias = "private_key_pem",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub key_pem: String,
@@ -149,6 +265,8 @@ pub struct CertConfig {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub account_key_path: String,
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 impl CertConfig {
@@ -202,6 +320,346 @@ impl CertConfig {
 
     pub fn account_key_path(&self) -> &str {
         self.account_key_path.trim()
+    }
+
+    pub fn resolved_cert_path(&self) -> Option<String> {
+        first_non_empty([
+            Some(self.cert_path.trim()),
+            self.extra_string(&[
+                &["certificate_path"],
+                &["fullchain_path"],
+                &["fullchain"],
+                &["files", "cert_path"],
+                &["files", "certificate_path"],
+            ])
+            .as_deref(),
+        ])
+        .map(ToString::to_string)
+    }
+
+    pub fn resolved_key_path(&self) -> Option<String> {
+        first_non_empty([
+            Some(self.key_path.trim()),
+            self.extra_string(&[
+                &["private_key_path"],
+                &["privkey_path"],
+                &["privkey"],
+                &["files", "key_path"],
+                &["files", "private_key_path"],
+            ])
+            .as_deref(),
+        ])
+        .map(ToString::to_string)
+    }
+
+    pub fn resolved_cert_pem(&self) -> Option<String> {
+        first_non_empty([
+            Some(self.cert_pem()),
+            self.extra_string(&[
+                &["cert_content"],
+                &["certificate_pem"],
+                &["inline", "cert"],
+                &["inline", "certificate"],
+                &["content", "cert"],
+            ])
+            .as_deref(),
+        ])
+        .map(ToString::to_string)
+    }
+
+    pub fn resolved_key_pem(&self) -> Option<String> {
+        first_non_empty([
+            Some(self.key_pem()),
+            self.extra_string(&[
+                &["key_content"],
+                &["private_key_pem"],
+                &["inline", "key"],
+                &["inline", "private_key"],
+                &["content", "key"],
+            ])
+            .as_deref(),
+        ])
+        .map(ToString::to_string)
+    }
+
+    pub fn domains(&self) -> Vec<String> {
+        let mut domains = split_cert_domains(self.domain()).collect::<Vec<_>>();
+        if domains.is_empty() {
+            domains = self.extra_strings(&[
+                &["domains"],
+                &["domain_list"],
+                &["dns_domains"],
+                &["acme", "domains"],
+                &["certificate", "domains"],
+            ]);
+        }
+        if domains.is_empty()
+            && let Some(domain) = self.extra_string(&[
+                &["server_name"],
+                &["hostname"],
+                &["host"],
+                &["dns", "domain"],
+            ])
+        {
+            domains.extend(split_cert_domains(&domain));
+        }
+
+        let mut seen = HashSet::new();
+        domains
+            .into_iter()
+            .map(|domain| domain.trim().trim_end_matches('.').to_string())
+            .filter(|domain| !domain.is_empty())
+            .filter(|domain| seen.insert(domain.to_ascii_lowercase()))
+            .collect()
+    }
+
+    pub fn dns_provider(&self) -> Option<String> {
+        self.extra_string(&[
+            &["provider"],
+            &["dns_provider"],
+            &["acme_dns_provider"],
+            &["dns", "provider"],
+            &["acme", "dns_provider"],
+        ])
+    }
+
+    pub fn dns_zone_name(&self) -> Option<String> {
+        self.extra_string(&[
+            &["zone"],
+            &["zone_name"],
+            &["root_domain"],
+            &["domain_name"],
+            &["dns_zone"],
+            &["dns", "zone"],
+            &["dns", "zone_name"],
+            &["provider", "zone"],
+        ])
+    }
+
+    pub fn dns_zone_id(&self) -> Option<String> {
+        self.extra_string(&[
+            &["zone_id"],
+            &["dns_zone_id"],
+            &["cloudflare_zone_id"],
+            &["provider", "zone_id"],
+            &["dns", "zone_id"],
+        ])
+    }
+
+    pub fn dns_ttl(&self) -> Option<u64> {
+        self.extra_u64(&[
+            &["ttl"],
+            &["dns_ttl"],
+            &["record_ttl"],
+            &["dns", "ttl"],
+            &["provider", "ttl"],
+        ])
+    }
+
+    pub fn dns_propagation_timeout_secs(&self) -> u64 {
+        self.extra_u64(&[
+            &["propagation_timeout"],
+            &["dns_propagation_timeout"],
+            &["propagation_timeout_secs"],
+            &["dns", "propagation_timeout"],
+            &["provider", "propagation_timeout"],
+        ])
+        .unwrap_or(DEFAULT_DNS_PROPAGATION_TIMEOUT_SECS)
+    }
+
+    pub fn dns_propagation_interval_secs(&self) -> u64 {
+        self.extra_u64(&[
+            &["propagation_interval"],
+            &["dns_propagation_interval"],
+            &["propagation_interval_secs"],
+            &["dns", "propagation_interval"],
+            &["provider", "propagation_interval"],
+        ])
+        .unwrap_or(DEFAULT_DNS_PROPAGATION_INTERVAL_SECS)
+        .max(1)
+    }
+
+    pub fn acme_challenge(&self) -> Option<String> {
+        self.extra_string(&[
+            &["challenge"],
+            &["challenge_type"],
+            &["acme_challenge"],
+            &["acme_challenge_type"],
+            &["acme", "challenge"],
+            &["acme", "challenge_type"],
+        ])
+    }
+
+    pub fn cloudflare_api_token(&self) -> Option<String> {
+        self.extra_string(&[
+            &["token"],
+            &["api_token"],
+            &["dns_api_token"],
+            &["cloudflare_api_token"],
+            &["cloudflare", "token"],
+            &["cloudflare", "api_token"],
+            &["dns", "token"],
+            &["dns", "api_token"],
+            &["provider", "token"],
+            &["provider", "api_token"],
+            &["env", "CF_DNS_API_TOKEN"],
+            &["env", "CF_API_TOKEN"],
+            &["env", "CLOUDFLARE_API_TOKEN"],
+        ])
+    }
+
+    pub fn cloudflare_api_key(&self) -> Option<String> {
+        self.extra_string(&[
+            &["api_key"],
+            &["dns_api_key"],
+            &["cloudflare_api_key"],
+            &["cloudflare", "api_key"],
+            &["dns", "api_key"],
+            &["provider", "api_key"],
+            &["env", "CF_API_KEY"],
+            &["env", "CLOUDFLARE_API_KEY"],
+        ])
+    }
+
+    pub fn cloudflare_api_email(&self) -> Option<String> {
+        self.extra_string(&[
+            &["api_email"],
+            &["cloudflare_email"],
+            &["cloudflare", "email"],
+            &["dns", "email"],
+            &["provider", "email"],
+            &["env", "CF_API_EMAIL"],
+            &["env", "CLOUDFLARE_API_EMAIL"],
+        ])
+    }
+
+    pub fn alidns_access_key_id(&self) -> Option<String> {
+        self.extra_string(&[
+            &["access_key_id"],
+            &["alidns_access_key_id"],
+            &["aliyun_access_key_id"],
+            &["ali_access_key_id"],
+            &["alidns", "access_key_id"],
+            &["aliyun", "access_key_id"],
+            &["dns", "access_key_id"],
+            &["provider", "access_key_id"],
+            &["env", "ALICLOUD_ACCESS_KEY_ID"],
+            &["env", "ALIDNS_ACCESS_KEY_ID"],
+            &["env", "ALIYUN_ACCESS_KEY_ID"],
+        ])
+    }
+
+    pub fn alidns_access_key_secret(&self) -> Option<String> {
+        self.extra_string(&[
+            &["access_key_secret"],
+            &["alidns_access_key_secret"],
+            &["aliyun_access_key_secret"],
+            &["ali_access_key_secret"],
+            &["alidns", "access_key_secret"],
+            &["aliyun", "access_key_secret"],
+            &["dns", "access_key_secret"],
+            &["provider", "access_key_secret"],
+            &["env", "ALICLOUD_ACCESS_KEY_SECRET"],
+            &["env", "ALIDNS_ACCESS_KEY_SECRET"],
+            &["env", "ALIYUN_ACCESS_KEY_SECRET"],
+        ])
+    }
+
+    pub fn extra_string(&self, aliases: &[&[&str]]) -> Option<String> {
+        lookup_extra_alias(&self.extra, aliases).and_then(value_to_trimmed_string)
+    }
+
+    pub fn extra_strings(&self, aliases: &[&[&str]]) -> Vec<String> {
+        lookup_extra_alias(&self.extra, aliases)
+            .map(value_to_strings)
+            .unwrap_or_default()
+    }
+
+    pub fn extra_u64(&self, aliases: &[&[&str]]) -> Option<u64> {
+        lookup_extra_alias(&self.extra, aliases).and_then(|value| value_to_u64(Some(value)))
+    }
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn split_cert_domains(raw: &str) -> impl Iterator<Item = String> + '_ {
+    raw.split([',', '\n', '\r', ' '])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+}
+
+fn lookup_extra_alias<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    aliases: &[&[&str]],
+) -> Option<&'a Value> {
+    aliases
+        .iter()
+        .find_map(|path| lookup_extra_path(object, path))
+}
+
+fn lookup_extra_path<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    path: &[&str],
+) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let value = lookup_extra_key(object, first)?;
+    if rest.is_empty() {
+        Some(value)
+    } else {
+        value
+            .as_object()
+            .and_then(|next| lookup_extra_path(next, rest))
+    }
+}
+
+fn lookup_extra_key<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a Value> {
+    object.iter().find_map(|(candidate, value)| {
+        if normalize_extra_key(candidate) == normalize_extra_key(key) {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_extra_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn value_to_trimmed_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values.iter().filter_map(value_to_trimmed_string).collect(),
+        Value::String(text) => split_cert_domains(text).collect(),
+        other => value_to_trimmed_string(other).into_iter().collect(),
     }
 }
 
@@ -283,10 +741,21 @@ pub struct UsersResponse {
     pub users: Vec<PanelUser>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct PanelUser {
     pub id: i64,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub uuid: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub password: String,
+    #[serde(
+        default,
+        alias = "alterId",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub alter_id: i64,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub speed_limit: i64,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub device_limit: i64,
 }
@@ -661,37 +1130,99 @@ mod tests {
 
     #[test]
     fn accepts_nulls_in_node_config_response() {
-        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
-            "protocol": "anytls",
-            "listen_ip": "0.0.0.0",
-            "server_port": 443,
-            "network": null,
-            "networkSettings": null,
-            "server_name": "node.example.com",
-            "tls_settings": {
+        let config: NodeConfigResponse = serde_json::from_str(
+            r#"{
+                "protocol": "anytls",
+                "listen_ip": "0.0.0.0",
+                "server_port": 443,
+                "network": null,
+                "networkSettings": null,
                 "server_name": "node.example.com",
-                "allow_insecure": false,
-                "ech": null
-            },
-            "padding_scheme": null,
-            "routes": null,
-            "custom_outbounds": null,
-            "custom_routes": null,
-            "cert_config": {
-                "cert_mode": "file",
-                "cert_path": "/etc/ssl/private/fullchain.pem",
-                "key_path": "/etc/ssl/private/privkey.pem"
-            },
-            "base_config": {
-                "push_interval": 60,
-                "pull_interval": 60
-            }
-        }))
+                "tls": null,
+                "tls_settings": {
+                    "server_name": "node.example.com",
+                    "allow_insecure": false,
+                    "ech": null
+                },
+                "multiplex": null,
+                "host": null,
+                "cipher": null,
+                "plugin": null,
+                "plugin_opts": null,
+                "server_key": null,
+                "flow": null,
+                "decryption": null,
+                "version": null,
+                "up_mbps": null,
+                "down_mbps": null,
+                "obfs": null,
+                "obfs-password": null,
+                "congestion_control": null,
+                "auth_timeout": null,
+                "zero_rtt_handshake": null,
+                "heartbeat": null,
+                "transport": null,
+                "traffic_pattern": null,
+                "packet_encoding": null,
+                "global_padding": null,
+                "authenticated_length": null,
+                "fallbacks": null,
+                "fallback": null,
+                "fallback_for_alpn": null,
+                "ignoreClientBandwidth": null,
+                "masquerade": null,
+                "udpRelayMode": null,
+                "udpOverStream": null,
+                "padding_scheme": null,
+                "routes": null,
+                "custom_outbounds": null,
+                "custom_routes": null,
+                "cert_config": {
+                    "cert_mode": "file",
+                    "cert_path": "/etc/ssl/private/fullchain.pem",
+                    "key_path": "/etc/ssl/private/privkey.pem"
+                },
+                "base_config": {
+                    "push_interval": 60,
+                    "pull_interval": 60
+                }
+            }"#,
+        )
         .expect("parse config");
         assert_eq!(config.listen_ip, "0.0.0.0");
         assert_eq!(config.server_name, "node.example.com");
         assert_eq!(config.network, "");
         assert!(config.network_settings.is_none());
+        assert!(config.tls.is_none());
+        assert!(config.multiplex.is_none());
+        assert_eq!(config.host, "");
+        assert_eq!(config.cipher, "");
+        assert_eq!(config.plugin, "");
+        assert_eq!(config.plugin_opts, "");
+        assert_eq!(config.server_key, "");
+        assert_eq!(config.flow, "");
+        assert_eq!(config.decryption, "");
+        assert!(config.version.is_none());
+        assert!(config.up_mbps.is_none());
+        assert!(config.down_mbps.is_none());
+        assert!(config.obfs.is_none());
+        assert_eq!(config.obfs_password, "");
+        assert_eq!(config.congestion_control, "");
+        assert_eq!(config.auth_timeout, "");
+        assert!(!config.zero_rtt_handshake);
+        assert_eq!(config.heartbeat, "");
+        assert!(config.transport.is_none());
+        assert_eq!(config.traffic_pattern, "");
+        assert_eq!(config.packet_encoding, "");
+        assert!(!config.global_padding);
+        assert!(!config.authenticated_length);
+        assert!(config.fallbacks.is_none());
+        assert!(config.fallback.is_none());
+        assert!(config.fallback_for_alpn.is_none());
+        assert!(!config.ignore_client_bandwidth);
+        assert!(config.masquerade.is_none());
+        assert_eq!(config.udp_relay_mode, "");
+        assert!(!config.udp_over_stream);
         assert!(config.padding_scheme.is_empty());
         assert!(config.routes.is_empty());
         assert!(config.custom_outbounds.is_empty());
@@ -815,6 +1346,125 @@ mod tests {
     }
 
     #[test]
+    fn cert_config_preserves_extra_dns_fields_and_domains_aliases() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "mode": "dns",
+                "domains": ["example.com", "*.example.com", "example.com"],
+                "provider": "cloudflare",
+                "zone_id": "zone-123",
+                "env": {
+                    "CF_DNS_API_TOKEN": "token-abc"
+                },
+                "propagation_timeout": 240,
+                "propagation_interval": 7
+            }
+        }))
+        .expect("parse config");
+
+        let cert = config.cert_config.expect("cert config");
+        assert_eq!(cert.cert_mode(), "dns");
+        assert_eq!(
+            cert.domains(),
+            vec!["example.com".to_string(), "*.example.com".to_string()]
+        );
+        assert_eq!(cert.dns_provider().as_deref(), Some("cloudflare"));
+        assert_eq!(cert.dns_zone_id().as_deref(), Some("zone-123"));
+        assert_eq!(
+            cert.extra_string(&[&["env", "CF_DNS_API_TOKEN"]])
+                .as_deref(),
+            Some("token-abc")
+        );
+        assert_eq!(cert.dns_propagation_timeout_secs(), 240);
+        assert_eq!(cert.dns_propagation_interval_secs(), 7);
+    }
+
+    #[test]
+    fn cert_config_resolves_dns_provider_credentials_and_challenge_aliases() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "acme",
+                "challenge_type": "dns-01",
+                "provider": "cloudflare",
+                "env": {
+                    "CF_DNS_API_TOKEN": "token-abc",
+                    "ALICLOUD_ACCESS_KEY_ID": "ali-id",
+                    "ALICLOUD_ACCESS_KEY_SECRET": "ali-secret"
+                },
+                "cloudflare_api_key": "cf-key",
+                "cloudflare_email": "dns@example.com"
+            }
+        }))
+        .expect("parse config");
+
+        let cert = config.cert_config.expect("cert config");
+        assert_eq!(cert.acme_challenge().as_deref(), Some("dns-01"));
+        assert_eq!(cert.cloudflare_api_token().as_deref(), Some("token-abc"));
+        assert_eq!(cert.cloudflare_api_key().as_deref(), Some("cf-key"));
+        assert_eq!(
+            cert.cloudflare_api_email().as_deref(),
+            Some("dns@example.com")
+        );
+        assert_eq!(cert.alidns_access_key_id().as_deref(), Some("ali-id"));
+        assert_eq!(
+            cert.alidns_access_key_secret().as_deref(),
+            Some("ali-secret")
+        );
+    }
+
+    #[test]
+    fn cert_config_resolves_extended_cert_material_aliases() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "dns",
+                "certificate_path": "/etc/ssl/fullchain.pem",
+                "private_key_path": "/etc/ssl/privkey.pem",
+                "cert_content": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+                "key_content": "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----"
+            }
+        }))
+        .expect("parse config");
+
+        let cert = config.cert_config.expect("cert config");
+        assert_eq!(
+            cert.resolved_cert_path().as_deref(),
+            Some("/etc/ssl/fullchain.pem")
+        );
+        assert_eq!(
+            cert.resolved_key_path().as_deref(),
+            Some("/etc/ssl/privkey.pem")
+        );
+        assert!(
+            cert.resolved_cert_pem()
+                .expect("cert pem")
+                .contains("BEGIN CERTIFICATE")
+        );
+        assert!(
+            cert.resolved_key_pem()
+                .expect("key pem")
+                .contains("BEGIN PRIVATE KEY")
+        );
+    }
+
+    #[test]
     fn accepts_nulls_in_route_and_user_defaults() {
         let route: RouteConfig = serde_json::from_value(serde_json::json!({
             "id": 9,
@@ -828,11 +1478,169 @@ mod tests {
 
         let user: PanelUser = serde_json::from_value(serde_json::json!({
             "id": 1,
-            "uuid": "test-user",
+            "uuid": null,
+            "password": null,
+            "alterId": null,
+            "speed_limit": null,
             "device_limit": null
         }))
         .expect("parse user");
+        assert_eq!(user.uuid, "");
+        assert_eq!(user.password, "");
+        assert_eq!(user.alter_id, 0);
+        assert_eq!(user.speed_limit, 0);
         assert_eq!(user.device_limit, 0);
+    }
+
+    #[test]
+    fn accepts_vmess_field_aliases() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vmess",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "security": "aes-128-gcm",
+            "globalPadding": true,
+            "authenticatedLength": true,
+            "padding_scheme": [],
+            "routes": []
+        }))
+        .expect("parse config");
+
+        assert_eq!(config.cipher, "aes-128-gcm");
+        assert!(config.global_padding);
+        assert!(config.authenticated_length);
+
+        let user: PanelUser = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "uuid": "00000000-0000-0000-0000-000000000001",
+            "alterId": 0
+        }))
+        .expect("parse user");
+        assert_eq!(user.alter_id, 0);
+    }
+
+    #[test]
+    fn parses_protocol_extension_fields_and_aliases() {
+        let config: NodeConfigResponse = serde_json::from_str(
+            r#"{
+                "protocol": "tuic",
+                "listen_ip": "0.0.0.0",
+                "server_port": 443,
+                "network": "tcp",
+                "networkSettings": {
+                    "ws": false
+                },
+                "server_name": "node.example.com",
+                "tls": {
+                    "enabled": true
+                },
+                "tls_settings": {
+                    "server_name": "node.example.com",
+                    "allow_insecure": false
+                },
+                "multiplex": {
+                    "enabled": true
+                },
+                "host": "trojan.example.com",
+                "cipher": "2022-blake3-aes-128-gcm",
+                "pluginOpts": "obfs=http",
+                "plugin": "obfs-local",
+                "server_key": "secret",
+                "flow": "xtls-rprx-vision",
+                "decryption": "none",
+                "version": 2,
+                "upMbps": 100,
+                "downMbps": "200",
+                "obfs": {
+                    "type": "salamander"
+                },
+                "obfs-password": "cry_me_a_r1ver",
+                "congestion_control": "bbr",
+                "auth_timeout": "3s",
+                "zero_rtt_handshake": true,
+                "heartbeat": "10s",
+                "transport": {
+                    "type": "udp"
+                },
+                "trafficPattern": "h3",
+                "packet_encoding": "xudp",
+                "fallbacks": [{
+                    "dest": 80
+                }],
+                "fallback": {
+                    "server": "127.0.0.1",
+                    "server_port": 8080
+                },
+                "fallback_for_alpn": {
+                    "h2": {
+                        "server": "127.0.0.1",
+                        "server_port": 8443
+                    }
+                },
+                "ignoreClientBandwidth": true,
+                "masquerade": {
+                    "type": "proxy",
+                    "url": "https://example.com"
+                },
+                "udpRelayMode": "native",
+                "udpOverStream": true,
+                "padding_scheme": [],
+                "routes": []
+            }"#,
+        )
+        .expect("parse protocol extensions");
+
+        assert_eq!(config.protocol, "tuic");
+        assert_eq!(config.host, "trojan.example.com");
+        assert_eq!(config.cipher, "2022-blake3-aes-128-gcm");
+        assert_eq!(config.plugin, "obfs-local");
+        assert_eq!(config.plugin_opts, "obfs=http");
+        assert_eq!(config.server_key, "secret");
+        assert_eq!(config.flow, "xtls-rprx-vision");
+        assert_eq!(config.decryption, "none");
+        assert_eq!(config.version, Some(serde_json::json!(2)));
+        assert_eq!(config.up_mbps, Some(serde_json::json!(100)));
+        assert_eq!(config.down_mbps, Some(serde_json::json!("200")));
+        assert_eq!(
+            config.obfs,
+            Some(serde_json::json!({ "type": "salamander" }))
+        );
+        assert_eq!(config.obfs_password, "cry_me_a_r1ver");
+        assert_eq!(config.congestion_control, "bbr");
+        assert_eq!(config.auth_timeout, "3s");
+        assert!(config.zero_rtt_handshake);
+        assert_eq!(config.heartbeat, "10s");
+        assert_eq!(config.transport, Some(serde_json::json!({ "type": "udp" })));
+        assert_eq!(config.traffic_pattern, "h3");
+        assert_eq!(config.packet_encoding, "xudp");
+        assert_eq!(config.fallbacks, Some(serde_json::json!([{ "dest": 80 }])));
+        assert_eq!(
+            config.fallback,
+            Some(serde_json::json!({
+                "server": "127.0.0.1",
+                "server_port": 8080
+            }))
+        );
+        assert_eq!(
+            config.fallback_for_alpn,
+            Some(serde_json::json!({
+                "h2": {
+                    "server": "127.0.0.1",
+                    "server_port": 8443
+                }
+            }))
+        );
+        assert!(config.ignore_client_bandwidth);
+        assert_eq!(
+            config.masquerade,
+            Some(serde_json::json!({
+                "type": "proxy",
+                "url": "https://example.com"
+            }))
+        );
+        assert_eq!(config.udp_relay_mode, "native");
+        assert!(config.udp_over_stream);
     }
 
     #[test]

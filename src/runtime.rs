@@ -185,6 +185,23 @@ impl MachineRuntime {
             );
             return self.refresh_machine_nodes().await;
         };
+        let Some(remote_protocol) = ProtocolKind::parse(&config.protocol) else {
+            warn!(
+                node_id,
+                remote_protocol = %config.protocol,
+                "received sync.config for unsupported protocol; refreshing machine nodes"
+            );
+            return self.refresh_machine_nodes().await;
+        };
+        if node.protocol() != remote_protocol {
+            warn!(
+                node_id,
+                current_protocol = node.protocol().as_str(),
+                remote_protocol = remote_protocol.as_str(),
+                "received sync.config with protocol change; refreshing machine nodes"
+            );
+            return self.refresh_machine_nodes().await;
+        }
         node.apply_remote_config(&config).await
     }
 
@@ -200,8 +217,7 @@ impl MachineRuntime {
             );
             return self.refresh_machine_nodes().await;
         };
-        node.replace_users(&users);
-        Ok(())
+        node.replace_users(&users)
     }
 
     pub(crate) async fn refresh_node_users(&self, node_id: i64) -> anyhow::Result<()> {
@@ -249,22 +265,49 @@ impl MachineRuntime {
             .iter()
             .map(|(node, _)| node.id)
             .collect::<HashSet<_>>();
-        let removed = {
+        let desired_protocols = desired_nodes
+            .iter()
+            .map(|(node, protocol)| (node.id, *protocol))
+            .collect::<HashMap<_, _>>();
+        let (removed, restarted) = {
             let mut guard = self.nodes.write().expect("nodes lock poisoned");
             let current_ids = guard.keys().copied().collect::<Vec<_>>();
             let mut removed = Vec::new();
+            let mut restarted = Vec::new();
             for node_id in current_ids {
-                if !desired_ids.contains(&node_id)
+                if !desired_ids.contains(&node_id) {
+                    if let Some(node) = guard.remove(&node_id) {
+                        removed.push(node);
+                    }
+                    continue;
+                }
+
+                let should_restart = desired_protocols
+                    .get(&node_id)
+                    .zip(guard.get(&node_id))
+                    .is_some_and(|(desired_protocol, node)| node.protocol() != *desired_protocol);
+                if should_restart
                     && let Some(node) = guard.remove(&node_id)
+                    && let Some(protocol) = desired_protocols.get(&node_id)
                 {
-                    removed.push(node);
+                    restarted.push((node, *protocol));
                 }
             }
-            removed
+            (removed, restarted)
         };
 
         for node in removed {
             info!(node_id = node.node_id, "stopping node removed by panel");
+            node.shutdown().await;
+        }
+
+        for (node, protocol) in restarted {
+            info!(
+                node_id = node.node_id,
+                current_protocol = node.protocol().as_str(),
+                new_protocol = protocol.as_str(),
+                "restarting node after panel protocol change"
+            );
             node.shutdown().await;
         }
 
@@ -508,7 +551,7 @@ impl ManagedNode {
         };
 
         if let Some(users) = response {
-            self.replace_users(&users);
+            self.replace_users(&users)?;
         }
 
         Ok(())
@@ -554,13 +597,17 @@ impl ManagedNode {
             handle.abort();
         }
 
-        self.replace_users(&[]);
+        let _ = self.replace_users(&[]);
         self.accounting.set_external_alive_counts(&HashMap::new());
         self.controller.shutdown().await;
     }
 
-    fn replace_users(&self, users: &[PanelUser]) {
-        self.accounting.replace_users(users);
+    fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
+        self.controller.replace_users(users)
+    }
+
+    fn protocol(&self) -> ProtocolKind {
+        self.controller.kind()
     }
 
     fn set_external_alive_counts(&self, alive: &HashMap<String, i64>) {

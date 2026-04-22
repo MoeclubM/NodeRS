@@ -27,12 +27,7 @@ pub enum TlsMaterialSource {
     Acme {
         cert_path: PathBuf,
         key_path: PathBuf,
-        directory_url: String,
-        email: String,
-        domain: String,
-        challenge_listen: String,
-        renew_before_days: u64,
-        account_key_path: PathBuf,
+        config: acme::AcmeConfig,
     },
 }
 
@@ -172,27 +167,11 @@ async fn load_source_materials(source: &TlsMaterialSource) -> anyhow::Result<(Ve
         TlsMaterialSource::Acme {
             cert_path,
             key_path,
-            directory_url,
-            email,
-            domain,
-            challenge_listen,
-            renew_before_days,
-            account_key_path,
+            config,
         } => {
-            acme::ensure_certificate(
-                &acme::AcmeConfig {
-                    directory_url: directory_url.clone(),
-                    email: email.clone(),
-                    domain: domain.clone(),
-                    challenge_listen: challenge_listen.clone(),
-                    renew_before_days: *renew_before_days,
-                    account_key_path: account_key_path.clone(),
-                },
-                cert_path,
-                key_path,
-            )
-            .await
-            .context("ensure ACME certificate")?;
+            acme::ensure_certificate(config, cert_path, key_path)
+                .await
+                .context("ensure ACME certificate")?;
             let cert_pem = tokio::fs::read(cert_path)
                 .await
                 .with_context(|| format!("read ACME certificate PEM {}", cert_path.display()))?;

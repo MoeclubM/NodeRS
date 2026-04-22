@@ -15,6 +15,18 @@ pub struct UserEntry {
     pub device_limit: i64,
 }
 
+impl UserEntry {
+    pub fn from_panel_user(user: &PanelUser) -> Self {
+        let uuid = user.uuid.trim();
+        Self {
+            id: user.id,
+            uuid: uuid.to_string(),
+            password_sha256: sha256_bytes(uuid.as_bytes()),
+            device_limit: user.device_limit,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct UsageCounter {
     upload: AtomicU64,
@@ -143,12 +155,7 @@ impl Accounting {
         let mapped = users
             .iter()
             .map(|user| {
-                let entry = UserEntry {
-                    id: user.id,
-                    uuid: user.uuid.clone(),
-                    password_sha256: sha256_bytes(user.uuid.as_bytes()),
-                    device_limit: user.device_limit,
-                };
+                let entry = UserEntry::from_panel_user(user);
                 (entry.password_sha256, entry)
             })
             .collect::<HashMap<_, _>>();
@@ -385,7 +392,7 @@ mod tests {
         accounting.replace_users(&[PanelUser {
             id: 1,
             uuid: "abc".to_string(),
-            device_limit: 0,
+            ..Default::default()
         }]);
         let hash = sha256_bytes(b"abc");
         assert_eq!(accounting.find_user_by_hash(&hash).map(|it| it.id), Some(1));
@@ -398,6 +405,7 @@ mod tests {
             id: 1,
             uuid: "abc".to_string(),
             device_limit: 1,
+            ..Default::default()
         }]);
         let user = accounting
             .find_user_by_hash(&sha256_bytes(b"abc"))
@@ -418,7 +426,7 @@ mod tests {
         accounting.replace_users(&[PanelUser {
             id: 1,
             uuid: "abc".to_string(),
-            device_limit: 0,
+            ..Default::default()
         }]);
         let user = accounting
             .find_user_by_hash(&sha256_bytes(b"abc"))
@@ -429,6 +437,23 @@ mod tests {
         let control = lease.control();
         accounting.replace_users(&[]);
         assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn trims_uuid_before_hashing() {
+        let accounting = Accounting::new();
+        accounting.replace_users(&[PanelUser {
+            id: 7,
+            uuid: "  abc  ".to_string(),
+            ..Default::default()
+        }]);
+
+        assert_eq!(
+            accounting
+                .find_user_by_hash(&sha256_bytes(b"abc"))
+                .map(|entry| entry.id),
+            Some(7)
+        );
     }
 
     #[test]
