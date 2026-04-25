@@ -266,14 +266,14 @@ impl ServerController {
 
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
-        let should_reload = tls_materials
-            .as_ref()
-            .is_none_or(|current| !current.matches_source(&tls.source, tls.ech.as_ref()));
+        let should_reload = tls_materials.as_ref().is_none_or(|current| {
+            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+        });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref())
+        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
             .await
             .context("load Trojan TLS materials")?;
         *self
@@ -938,13 +938,19 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
         anyhow::bail!("Xboard network must be tcp for Trojan nodes");
     }
+    if remote.tls.is_some() && remote.tls_mode() != 1 {
+        anyhow::bail!(
+            "Xboard tls mode {} is not supported by NodeRS Trojan server yet",
+            remote.tls_mode()
+        );
+    }
     if remote.network_settings.is_some() {
         anyhow::bail!("Xboard networkSettings is not supported by NodeRS Trojan server yet");
     }
     if remote.transport.is_some() {
         anyhow::bail!("Xboard transport is not supported by NodeRS Trojan server yet");
     }
-    if remote.multiplex.is_some() {
+    if remote.multiplex_enabled() {
         anyhow::bail!("Xboard multiplex is not supported by NodeRS Trojan server yet");
     }
     if remote.fallbacks.is_some() {
@@ -1138,5 +1144,26 @@ mod tests {
 
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("transport");
         assert!(error.to_string().contains("transport"));
+    }
+
+    #[test]
+    fn accepts_disabled_multiplex_but_rejects_non_tls_mode() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            multiplex: Some(serde_json::json!({
+                "enabled": false,
+                "protocol": "yamux"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 443);
+
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
+        assert!(error.to_string().contains("tls mode"));
     }
 }

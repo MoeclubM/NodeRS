@@ -1,4 +1,5 @@
 pub mod anytls;
+pub mod mieru;
 pub mod shadowsocks;
 pub mod trojan;
 pub mod vless;
@@ -12,6 +13,7 @@ use crate::panel::{NodeConfigResponse, PanelUser};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolKind {
     Anytls,
+    Mieru,
     Shadowsocks,
     Trojan,
     Vless,
@@ -23,13 +25,15 @@ impl ProtocolKind {
         let name = name.trim();
         if name.eq_ignore_ascii_case("anytls") {
             Some(Self::Anytls)
-        } else if name.eq_ignore_ascii_case("shadowsocks") {
+        } else if name.eq_ignore_ascii_case("mieru") {
+            Some(Self::Mieru)
+        } else if name.eq_ignore_ascii_case("shadowsocks") || name.eq_ignore_ascii_case("ss") {
             Some(Self::Shadowsocks)
         } else if name.eq_ignore_ascii_case("trojan") {
             Some(Self::Trojan)
         } else if name.eq_ignore_ascii_case("vless") {
             Some(Self::Vless)
-        } else if name.eq_ignore_ascii_case("vmess") {
+        } else if name.eq_ignore_ascii_case("vmess") || name.eq_ignore_ascii_case("v2ray") {
             Some(Self::Vmess)
         } else {
             None
@@ -39,6 +43,7 @@ impl ProtocolKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Anytls => "anytls",
+            Self::Mieru => "mieru",
             Self::Shadowsocks => "shadowsocks",
             Self::Trojan => "trojan",
             Self::Vless => "vless",
@@ -47,8 +52,21 @@ impl ProtocolKind {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ProtocolKind;
+
+    #[test]
+    fn parses_common_protocol_aliases() {
+        assert_eq!(ProtocolKind::parse("mieru"), Some(ProtocolKind::Mieru));
+        assert_eq!(ProtocolKind::parse("ss"), Some(ProtocolKind::Shadowsocks));
+        assert_eq!(ProtocolKind::parse("v2ray"), Some(ProtocolKind::Vmess));
+    }
+}
+
 pub enum ProtocolController {
     Anytls(Arc<anytls::ServerController>),
+    Mieru(Arc<mieru::ServerController>),
     Shadowsocks(Arc<shadowsocks::ServerController>),
     Trojan(Arc<trojan::ServerController>),
     Vless(Arc<vless::ServerController>),
@@ -61,6 +79,7 @@ impl ProtocolController {
             ProtocolKind::Anytls => {
                 Self::Anytls(Arc::new(anytls::ServerController::new(accounting)))
             }
+            ProtocolKind::Mieru => Self::Mieru(Arc::new(mieru::ServerController::new(accounting))),
             ProtocolKind::Shadowsocks => {
                 Self::Shadowsocks(Arc::new(shadowsocks::ServerController::new(accounting)))
             }
@@ -75,6 +94,7 @@ impl ProtocolController {
     pub fn kind(&self) -> ProtocolKind {
         match self {
             Self::Anytls(_) => ProtocolKind::Anytls,
+            Self::Mieru(_) => ProtocolKind::Mieru,
             Self::Shadowsocks(_) => ProtocolKind::Shadowsocks,
             Self::Trojan(_) => ProtocolKind::Trojan,
             Self::Vless(_) => ProtocolKind::Vless,
@@ -86,6 +106,10 @@ impl ProtocolController {
         match self {
             Self::Anytls(server) => {
                 let effective = anytls::EffectiveNodeConfig::from_remote(remote)?;
+                server.apply_config(effective).await
+            }
+            Self::Mieru(server) => {
+                let effective = mieru::EffectiveNodeConfig::from_remote(remote)?;
                 server.apply_config(effective).await
             }
             Self::Shadowsocks(server) => {
@@ -110,6 +134,7 @@ impl ProtocolController {
     pub async fn refresh_runtime_assets(&self) -> anyhow::Result<()> {
         match self {
             Self::Anytls(server) => server.refresh_tls().await,
+            Self::Mieru(server) => server.refresh_runtime_assets().await,
             Self::Shadowsocks(server) => server.refresh_runtime_assets().await,
             Self::Trojan(server) => server.refresh_tls().await,
             Self::Vless(server) => server.refresh_tls().await,
@@ -120,6 +145,7 @@ impl ProtocolController {
     pub fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
         match self {
             Self::Anytls(server) => server.replace_users(users),
+            Self::Mieru(server) => server.replace_users(users),
             Self::Shadowsocks(server) => server.replace_users(users),
             Self::Trojan(server) => server.replace_users(users),
             Self::Vless(server) => server.replace_users(users),
@@ -130,6 +156,7 @@ impl ProtocolController {
     pub async fn shutdown(&self) {
         match self {
             Self::Anytls(server) => server.shutdown().await,
+            Self::Mieru(server) => server.shutdown().await,
             Self::Shadowsocks(server) => server.shutdown().await,
             Self::Trojan(server) => server.shutdown().await,
             Self::Vless(server) => server.shutdown().await,

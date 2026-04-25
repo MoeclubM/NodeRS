@@ -1,6 +1,6 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, VLESS, Trojan, and Shadowsocks protocol handlers, and the installed binary remains `noders-anytls` for compatibility.
+NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, VLESS, Trojan, VMess, and Shadowsocks protocol handlers, and the installed binary remains `noders-anytls` for compatibility.
 
 ## Overview
 
@@ -28,7 +28,7 @@ NodeRS currently runs in Xboard machine mode only.
 
 TLS is no longer read from the local config file.
 
-- AnyTLS, VLESS, and Trojan nodes receive TLS from Xboard `cert_config`
+- AnyTLS, VLESS, Trojan, and VMess nodes receive TLS from Xboard `cert_config`
 - `listen_ip`, `server_port`, `server_name`, `tls_settings`, and `routes` are taken from the panel response; `padding_scheme` is currently AnyTLS-specific
 - Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, and `dns`
 - File or path mode requires `cert_path` and `key_path`
@@ -49,7 +49,7 @@ TLS is no longer read from the local config file.
 - Supported `custom_outbounds` types: `direct`, `dns`, and `block`
 - Supported `custom_routes` actions: `outbound`, `reject`, and `block`
 - Supported `custom_routes` match fields: `network`, `protocol`, `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`, `ip_cidr`, `ip_is_private`, `port`, and `port_range`
-- Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`, for AnyTLS/VLESS/Trojan TLS listeners
+- Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`, for AnyTLS/VLESS/Trojan/VMess TLS listeners
 - `padding_scheme` is consumed by AnyTLS only; VLESS and Trojan ignore it because their wire formats do not use AnyTLS padding frames
 - Unsupported `custom_outbounds` types, unsupported `custom_routes` fields or actions, and malformed ECH settings fail explicitly during config sync; they are not ignored silently
 

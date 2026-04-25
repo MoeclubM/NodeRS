@@ -10,7 +10,8 @@ pub(crate) mod traffic;
 pub(crate) mod transport;
 mod uot;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
+use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -47,6 +48,18 @@ pub struct EffectiveNodeConfig {
 pub(crate) struct EffectiveTlsConfig {
     pub source: tls::TlsMaterialSource,
     pub ech: Option<tls::EchConfigSource>,
+    pub reality: Option<RealityConfig>,
+    pub alpn: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RealityConfig {
+    pub server_name: String,
+    pub server_port: u16,
+    pub allow_insecure: bool,
+    pub public_key: [u8; 32],
+    pub private_key: [u8; 32],
+    pub short_id: [u8; 8],
 }
 
 impl EffectiveNodeConfig {
@@ -94,6 +107,8 @@ impl EffectiveTlsConfig {
                         key_path: key_path.into(),
                     },
                     ech: effective_ech_config(remote)?,
+                    reality: effective_reality_config(remote)?,
+                    alpn: effective_alpn(remote),
                 })
             }
             "inline" | "pem" | "content" => {
@@ -113,6 +128,8 @@ impl EffectiveTlsConfig {
                         key_pem: key_pem.into_bytes(),
                     },
                     ech: effective_ech_config(remote)?,
+                    reality: effective_reality_config(remote)?,
+                    alpn: effective_alpn(remote),
                 })
             }
             "acme" | "letsencrypt" | "http" | "dns" => {
@@ -161,6 +178,8 @@ impl EffectiveTlsConfig {
                         },
                     },
                     ech: effective_ech_config(remote)?,
+                    reality: effective_reality_config(remote)?,
+                    alpn: effective_alpn(remote),
                 })
             }
             "none" | "self_signed" | "self-signed" => {
@@ -183,11 +202,23 @@ impl EffectiveTlsConfig {
                 Ok(Self {
                     source: tls::TlsMaterialSource::SelfSigned { subject_alt_names },
                     ech: effective_ech_config(remote)?,
+                    reality: effective_reality_config(remote)?,
+                    alpn: effective_alpn(remote),
                 })
             }
             _ => anyhow::bail!("unsupported Xboard cert_config.cert_mode {cert_mode}"),
         }
     }
+}
+
+fn effective_alpn(remote: &NodeConfigResponse) -> Vec<String> {
+    remote
+        .alpn
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn effective_acme_domains(remote: &NodeConfigResponse, cert_config: &CertConfig) -> Vec<String> {
@@ -371,6 +402,67 @@ fn effective_ech_config(
     anyhow::bail!("Xboard tls_settings.ech must include key or key_path")
 }
 
+fn effective_reality_config(remote: &NodeConfigResponse) -> anyhow::Result<Option<RealityConfig>> {
+    if remote.tls_mode() != 2 {
+        return Ok(None);
+    }
+
+    let settings = remote.effective_reality_settings();
+    let server_name = settings.server_name.trim();
+    ensure!(
+        !server_name.is_empty(),
+        "Xboard reality_settings.server_name is required for tls mode 2"
+    );
+    let public_key = settings.public_key.trim();
+    ensure!(
+        !public_key.is_empty(),
+        "Xboard reality_settings.public_key is required for tls mode 2"
+    );
+    let private_key = settings.private_key.trim();
+    ensure!(
+        !private_key.is_empty(),
+        "Xboard reality_settings.private_key is required for tls mode 2"
+    );
+
+    Ok(Some(RealityConfig {
+        server_name: server_name.to_string(),
+        server_port: if settings.server_port == 0 {
+            remote.server_port
+        } else {
+            settings.server_port
+        },
+        allow_insecure: settings.allow_insecure,
+        public_key: decode_reality_key(public_key)
+            .context("decode Xboard reality_settings.public_key")?,
+        private_key: decode_reality_key(private_key)
+            .context("decode Xboard reality_settings.private_key")?,
+        short_id: decode_reality_short_id(settings.short_id.trim())
+            .context("decode Xboard reality_settings.short_id")?,
+    }))
+}
+
+fn decode_reality_key(encoded: &str) -> anyhow::Result<[u8; 32]> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .with_context(|| format!("invalid base64url key {encoded}"))?;
+    ensure!(decoded.len() == 32, "REALITY key must decode to 32 bytes");
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded);
+    Ok(key)
+}
+
+fn decode_reality_short_id(hex: &str) -> anyhow::Result<[u8; 8]> {
+    ensure!(
+        hex.len() <= 16,
+        "REALITY short_id must be at most 16 hex characters"
+    );
+    let padded = format!("{:0>16}", hex);
+    let mut short_id = [0u8; 8];
+    hex::decode_to_slice(padded.as_bytes(), &mut short_id)
+        .with_context(|| format!("invalid REALITY short_id {hex}"))?;
+    Ok(short_id)
+}
+
 pub struct ServerController {
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
     tls_materials: AsyncMutex<Option<tls::LoadedTlsMaterials>>,
@@ -386,6 +478,8 @@ mod tests {
     use crate::panel::{
         CertConfig, NodeConfigResponse, NodeEchSettings, NodeTlsSettings, PanelUser,
     };
+
+    const REALITY_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -450,6 +544,7 @@ mod tests {
                     key: "-----BEGIN ECH KEYS-----\nAAAA\n-----END ECH KEYS-----".to_string(),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..base_remote()
         };
@@ -471,6 +566,7 @@ mod tests {
                     enabled: true,
                     ..Default::default()
                 },
+                ..Default::default()
             },
             ..base_remote()
         };
@@ -941,6 +1037,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tls_mode_two_until_reality_handshake_is_implemented() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
+        assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
     fn rejects_unsupported_network_settings() {
         let remote = NodeConfigResponse {
             network: "tcp".to_string(),
@@ -954,6 +1061,139 @@ mod tests {
 
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network settings");
         assert!(error.to_string().contains("networkSettings"));
+    }
+
+    #[test]
+    fn propagates_explicit_alpn_from_panel_config() {
+        let remote = NodeConfigResponse {
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            ..base_remote()
+        };
+
+        let effective = EffectiveNodeConfig::from_remote(&remote).expect("effective config");
+        assert_eq!(
+            effective.tls.alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_reality_config_from_tls_mode_two() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "reality.example.com",
+                "server_port": 8443,
+                "allow_insecure": true,
+                "public_key": REALITY_KEY_B64,
+                "private_key": REALITY_KEY_B64,
+                "short_id": "a1b2"
+            },
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "file",
+                "cert_path": "/etc/ssl/private/fullchain.pem",
+                "key_path": "/etc/ssl/private/privkey.pem"
+            }
+        }))
+        .expect("parse remote");
+
+        let reality = effective_reality_config(&remote)
+            .expect("reality config")
+            .expect("reality config present");
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.server_port, 8443);
+        assert!(reality.allow_insecure);
+        assert_eq!(reality.public_key, [0u8; 32]);
+        assert_eq!(reality.private_key, [0u8; 32]);
+        assert_eq!(reality.short_id, [0, 0, 0, 0, 0, 0, 0xa1, 0xb2]);
+    }
+
+    #[test]
+    fn reality_config_defaults_port_and_accepts_camel_case_fields() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 2443,
+            "server_name": "node.example.com",
+            "tls": 2,
+            "realitySettings": {
+                "server_name": "reality.example.com",
+                "publicKey": REALITY_KEY_B64,
+                "privateKey": REALITY_KEY_B64,
+                "shortId": ""
+            },
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "file",
+                "cert_path": "/etc/ssl/private/fullchain.pem",
+                "key_path": "/etc/ssl/private/privkey.pem"
+            }
+        }))
+        .expect("parse remote");
+
+        let reality = effective_reality_config(&remote)
+            .expect("reality config")
+            .expect("reality config present");
+        assert_eq!(reality.server_port, 2443);
+        assert_eq!(reality.short_id, [0u8; 8]);
+    }
+
+    #[test]
+    fn rejects_invalid_reality_settings() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "reality.example.com",
+                "public_key": REALITY_KEY_B64,
+                "private_key": REALITY_KEY_B64,
+                "short_id": "not-hex"
+            },
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "file",
+                "cert_path": "/etc/ssl/private/fullchain.pem",
+                "key_path": "/etc/ssl/private/privkey.pem"
+            }
+        }))
+        .expect("parse remote");
+
+        let error = effective_reality_config(&remote).expect_err("invalid short id");
+        assert!(error.to_string().contains("short_id"));
+
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "server_name": "node.example.com",
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "reality.example.com",
+                "public_key": REALITY_KEY_B64
+            },
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "file",
+                "cert_path": "/etc/ssl/private/fullchain.pem",
+                "key_path": "/etc/ssl/private/privkey.pem"
+            }
+        }))
+        .expect("parse remote");
+
+        let error = effective_reality_config(&remote).expect_err("missing private key");
+        assert!(error.to_string().contains("private_key"));
     }
 
     #[test]
@@ -1098,14 +1338,14 @@ impl ServerController {
 
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
-        let should_reload = tls_materials
-            .as_ref()
-            .is_none_or(|current| !current.matches_source(&tls.source, tls.ech.as_ref()));
+        let should_reload = tls_materials.as_ref().is_none_or(|current| {
+            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+        });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref())
+        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
             .await
             .context("load TLS materials")?;
         *self.tls_config.write().expect("tls config lock poisoned") = Some(reloaded.acceptor());
@@ -1316,6 +1556,12 @@ pub(crate) fn effective_listen_ip(remote: &NodeConfigResponse) -> String {
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
         anyhow::bail!("Xboard network must be tcp for AnyTLS nodes");
+    }
+    if remote.tls.is_some() && !matches!(remote.tls_mode(), 0 | 1) {
+        anyhow::bail!(
+            "Xboard tls mode {} is not supported by NodeRS-AnyTLS AnyTLS server yet",
+            remote.tls_mode()
+        );
     }
     if remote.network_settings.is_some() {
         anyhow::bail!("Xboard networkSettings is not supported by NodeRS-AnyTLS AnyTLS server");

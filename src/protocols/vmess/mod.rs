@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail, ensure};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -22,11 +23,12 @@ use self::crypto::{
     decode_auth_id, encode_response_header, parse_uuid,
 };
 use super::anytls::{
-    bind_listeners, configure_tcp_stream, effective_listen_ip, routing, traffic::TrafficRecorder,
-    transport,
+    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing, tls,
+    traffic::TrafficRecorder, transport,
 };
 
 const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_ID_SKEW: Duration = Duration::from_secs(120);
 const COPY_BUFFER_LEN: usize = 64 * 1024;
 
@@ -34,6 +36,7 @@ const COPY_BUFFER_LEN: usize = 64 * 1024;
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
+    pub tls: Option<EffectiveTlsConfig>,
     pub security: SecurityType,
     pub global_padding: bool,
     pub authenticated_length: bool,
@@ -53,6 +56,9 @@ impl EffectiveNodeConfig {
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
+            tls: (remote.tls_mode() == 1)
+                .then(|| EffectiveTlsConfig::from_remote(remote))
+                .transpose()?,
             security,
             global_padding: remote.global_padding,
             authenticated_length: remote.authenticated_length,
@@ -200,6 +206,8 @@ impl UserValidator {
 }
 
 pub struct ServerController {
+    tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
+    tls_materials: AsyncMutex<Option<tls::LoadedTlsMaterials>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
     runtime: Arc<RwLock<Option<EffectiveNodeConfig>>>,
@@ -215,6 +223,8 @@ struct RunningServer {
 impl ServerController {
     pub fn new(accounting: Arc<Accounting>) -> Self {
         Self {
+            tls_config: Arc::new(RwLock::new(None)),
+            tls_materials: AsyncMutex::new(None),
             accounting,
             users: Arc::new(RwLock::new(UserValidator::default())),
             runtime: Arc::new(RwLock::new(None)),
@@ -230,6 +240,7 @@ impl ServerController {
     }
 
     pub async fn apply_config(&self, config: EffectiveNodeConfig) -> anyhow::Result<()> {
+        self.update_tls_config(config.tls.as_ref()).await?;
         *self.runtime.write().expect("vmess runtime lock poisoned") = Some(config.clone());
 
         let old = {
@@ -255,17 +266,19 @@ impl ServerController {
             .filter_map(|listener| listener.local_addr().ok())
             .map(|addr| addr.to_string())
             .collect::<Vec<_>>();
+        let tls_config = self.tls_config.clone();
         let accounting = self.accounting.clone();
         let users = self.users.clone();
         let runtime = self.runtime.clone();
         info!(listen = ?bind_addrs, "VMess listeners started");
         let mut handles = Vec::new();
         for listener in listeners {
+            let tls_config = tls_config.clone();
             let accounting = accounting.clone();
             let users = users.clone();
             let runtime = runtime.clone();
             handles.push(tokio::spawn(async move {
-                accept_loop(listener, accounting, users, runtime).await;
+                accept_loop(listener, tls_config, accounting, users, runtime).await;
             }));
         }
 
@@ -279,6 +292,17 @@ impl ServerController {
     }
 
     pub async fn refresh_runtime_assets(&self) -> anyhow::Result<()> {
+        let mut tls_materials = self.tls_materials.lock().await;
+        let Some(tls_materials) = tls_materials.as_mut() else {
+            return Ok(());
+        };
+        if let Some(reloaded) = tls::reload_if_changed(tls_materials).await? {
+            *self
+                .tls_config
+                .write()
+                .expect("vmess tls config lock poisoned") = Some(reloaded);
+            info!("VMess TLS materials reloaded from disk");
+        }
         Ok(())
     }
 
@@ -294,10 +318,40 @@ impl ServerController {
             info!(port = old.server_port, "VMess listeners stopped");
         }
     }
+
+    async fn update_tls_config(&self, tls: Option<&EffectiveTlsConfig>) -> anyhow::Result<()> {
+        let mut tls_materials = self.tls_materials.lock().await;
+        let Some(tls) = tls else {
+            *self
+                .tls_config
+                .write()
+                .expect("vmess tls config lock poisoned") = None;
+            *tls_materials = None;
+            return Ok(());
+        };
+
+        let should_reload = tls_materials.as_ref().is_none_or(|current| {
+            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+        });
+        if !should_reload {
+            return Ok(());
+        }
+
+        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
+            .await
+            .context("load VMess TLS materials")?;
+        *self
+            .tls_config
+            .write()
+            .expect("vmess tls config lock poisoned") = Some(reloaded.acceptor());
+        *tls_materials = Some(reloaded);
+        Ok(())
+    }
 }
 
 async fn accept_loop(
     listener: TcpListener,
+    tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
     runtime: Arc<RwLock<Option<EffectiveNodeConfig>>>,
@@ -318,6 +372,7 @@ async fn accept_loop(
         let accounting = accounting.clone();
         let users = users.clone();
         let runtime = runtime.clone();
+        let tls_config = tls_config.clone();
         tokio::spawn(async move {
             let runtime = match runtime.read().expect("vmess runtime lock poisoned").clone() {
                 Some(runtime) => runtime,
@@ -326,20 +381,43 @@ async fn accept_loop(
                     return;
                 }
             };
-            if let Err(error) = serve_connection(stream, source, accounting, users, runtime).await {
+            let acceptor = tls_config
+                .read()
+                .expect("vmess tls config lock poisoned")
+                .clone();
+            let result = if let Some(acceptor) = acceptor {
+                match timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    tokio_boring::accept(acceptor.as_ref(), stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        serve_connection(stream, source, accounting, users, runtime).await
+                    }
+                    Ok(Err(error)) => Err(error).context("VMess TLS handshake failed"),
+                    Err(_) => Err(anyhow!("VMess TLS handshake timed out")),
+                }
+            } else {
+                serve_connection(stream, source, accounting, users, runtime).await
+            };
+            if let Err(error) = result {
                 warn!(%error, %source, "VMess session terminated with error");
             }
         });
     }
 }
 
-async fn serve_connection(
-    mut stream: TcpStream,
+async fn serve_connection<S>(
+    mut stream: S,
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
     runtime: EffectiveNodeConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut auth_id = [0u8; 16];
     timeout(REQUEST_HEADER_TIMEOUT, stream.read_exact(&mut auth_id))
         .await
@@ -380,14 +458,17 @@ async fn serve_connection(
     }
 }
 
-async fn serve_connect(
-    stream: TcpStream,
+async fn serve_connect<S>(
+    stream: S,
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
     request: Request,
     routing: routing::RoutingTable,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let remote = transport::connect_tcp_destination(&request.destination, &routing)
         .await
         .with_context(|| format!("connect VMess destination {}", request.destination))?;
@@ -443,14 +524,17 @@ async fn serve_connect(
     }
 }
 
-async fn serve_udp(
-    stream: TcpStream,
+async fn serve_udp<S>(
+    stream: S,
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
     request: Request,
     routing: routing::RoutingTable,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let target = transport::resolve_destination(&request.destination, &routing, "udp")
         .await?
         .into_iter()
@@ -515,12 +599,15 @@ async fn serve_udp(
     }
 }
 
-async fn relay_client_to_tcp(
-    mut reader: BodyReader<ReadHalf<TcpStream>>,
+async fn relay_client_to_tcp<R>(
+    mut reader: BodyReader<R>,
     mut writer: WriteHalf<TcpStream>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buffer = vec![0u8; COPY_BUFFER_LEN];
     loop {
         let read = tokio::select! {
@@ -539,12 +626,15 @@ async fn relay_client_to_tcp(
     }
 }
 
-async fn relay_tcp_to_client(
+async fn relay_tcp_to_client<W>(
     mut reader: ReadHalf<TcpStream>,
-    mut writer: BodyWriter<WriteHalf<TcpStream>>,
+    mut writer: BodyWriter<W>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut buffer = vec![0u8; COPY_BUFFER_LEN];
     loop {
         let read = tokio::select! {
@@ -563,12 +653,15 @@ async fn relay_tcp_to_client(
     }
 }
 
-async fn relay_client_to_udp(
-    mut reader: BodyReader<ReadHalf<TcpStream>>,
+async fn relay_client_to_udp<R>(
+    mut reader: BodyReader<R>,
     socket: Arc<UdpSocket>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         let frame = tokio::select! {
             _ = control.cancelled() => return Ok(()),
@@ -591,12 +684,15 @@ async fn relay_client_to_udp(
     }
 }
 
-async fn relay_udp_to_client(
-    mut writer: BodyWriter<WriteHalf<TcpStream>>,
+async fn relay_udp_to_client<W>(
+    mut writer: BodyWriter<W>,
     socket: Arc<UdpSocket>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut buffer = vec![0u8; u16::MAX as usize];
     loop {
         let payload_len = tokio::select! {
@@ -633,14 +729,17 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if remote.transport.is_some() {
         bail!("Xboard transport is not supported by NodeRS VMess server yet");
     }
-    if remote.multiplex.is_some() {
+    if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS VMess server yet");
     }
-    if remote.tls.is_some()
-        || !remote.tls_settings.server_name.trim().is_empty()
-        || remote.tls_settings.ech.is_enabled()
-    {
-        bail!("Xboard outer TLS is not supported by NodeRS VMess server yet");
+    if !matches!(remote.tls_mode(), 0 | 1) {
+        bail!(
+            "Xboard tls mode {} is not supported by NodeRS VMess server yet",
+            remote.tls_mode()
+        );
+    }
+    if remote.tls_mode() == 0 && remote.tls_settings.is_configured() {
+        bail!("Xboard tls_settings requires tls mode 1 for VMess nodes");
     }
     if !remote.packet_encoding.trim().is_empty() {
         bail!("Xboard packet_encoding is not supported by NodeRS VMess server yet");
@@ -657,6 +756,7 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panel::CertConfig;
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -692,13 +792,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_outer_tls() {
+    fn rejects_unsupported_tls_mode() {
         let remote = NodeConfigResponse {
-            tls: Some(serde_json::json!({ "enabled": true })),
+            tls: Some(serde_json::json!(2)),
             ..base_remote()
         };
         let error = EffectiveNodeConfig::from_remote(&remote).unwrap_err();
-        assert!(error.to_string().contains("outer TLS"));
+        assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
+    fn accepts_outer_tls_mode_one() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            tls_settings: crate::panel::NodeTlsSettings {
+                server_name: "node.example.com".to_string(),
+                ..Default::default()
+            },
+            cert_config: Some(CertConfig {
+                cert_mode: "file".to_string(),
+                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
+                key_path: "/etc/ssl/private/privkey.pem".to_string(),
+                ..Default::default()
+            }),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(config.tls.is_some());
+    }
+
+    #[test]
+    fn accepts_explicit_tls_zero_and_disabled_multiplex() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(0)),
+            multiplex: Some(serde_json::json!({
+                "enabled": false,
+                "protocol": "yamux"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 10086);
     }
 
     #[test]

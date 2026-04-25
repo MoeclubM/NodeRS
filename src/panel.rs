@@ -51,6 +51,12 @@ pub struct NodeConfigResponse {
     pub tls: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub tls_settings: NodeTlsSettings,
+    #[serde(
+        default,
+        alias = "realitySettings",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub reality_settings: NodeRealitySettings,
     #[serde(default)]
     pub multiplex: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
@@ -106,6 +112,13 @@ pub struct NodeConfigResponse {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub traffic_pattern: String,
+    #[serde(
+        default,
+        alias = "alpnProtocols",
+        alias = "alpn_protocols",
+        deserialize_with = "deserialize_string_list_on_null"
+    )]
+    pub alpn: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub packet_encoding: String,
     #[serde(
@@ -160,6 +173,32 @@ pub struct NodeConfigResponse {
     pub base_config: Option<BaseConfig>,
 }
 
+impl NodeConfigResponse {
+    pub fn tls_mode(&self) -> i64 {
+        value_to_i64(self.tls.as_ref()).unwrap_or_else(|| {
+            if json_value_enabled(self.tls.as_ref()) {
+                1
+            } else {
+                0
+            }
+        })
+    }
+
+    pub fn multiplex_enabled(&self) -> bool {
+        json_value_enabled(self.multiplex.as_ref())
+    }
+
+    pub fn effective_reality_settings(&self) -> NodeRealitySettings {
+        if self.reality_settings.is_configured() {
+            self.reality_settings.clone()
+        } else if self.tls_mode() == 2 {
+            self.tls_settings.reality_settings()
+        } else {
+            NodeRealitySettings::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeTlsSettings {
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
@@ -168,6 +207,62 @@ pub struct NodeTlsSettings {
     pub allow_insecure: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub ech: NodeEchSettings,
+    #[serde(
+        default,
+        alias = "serverPort",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub server_port: u16,
+    #[serde(
+        default,
+        alias = "publicKey",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub public_key: String,
+    #[serde(
+        default,
+        alias = "privateKey",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub private_key: String,
+    #[serde(
+        default,
+        alias = "shortId",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub short_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct NodeRealitySettings {
+    #[serde(default)]
+    pub allow_insecure: bool,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub server_name: String,
+    #[serde(
+        default,
+        alias = "serverPort",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub server_port: u16,
+    #[serde(
+        default,
+        alias = "publicKey",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub public_key: String,
+    #[serde(
+        default,
+        alias = "privateKey",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub private_key: String,
+    #[serde(
+        default,
+        alias = "shortId",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub short_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -194,6 +289,34 @@ impl NodeEchSettings {
             || !self.key.trim().is_empty()
             || !self.key_path.trim().is_empty()
             || !self.config_path.trim().is_empty()
+    }
+}
+
+impl NodeTlsSettings {
+    pub fn is_configured(&self) -> bool {
+        !self.server_name.trim().is_empty() || self.allow_insecure || self.ech.is_enabled()
+    }
+
+    pub fn reality_settings(&self) -> NodeRealitySettings {
+        NodeRealitySettings {
+            allow_insecure: self.allow_insecure,
+            server_name: self.server_name.clone(),
+            server_port: self.server_port,
+            public_key: self.public_key.clone(),
+            private_key: self.private_key.clone(),
+            short_id: self.short_id.clone(),
+        }
+    }
+}
+
+impl NodeRealitySettings {
+    pub fn is_configured(&self) -> bool {
+        self.allow_insecure
+            || !self.server_name.trim().is_empty()
+            || self.server_port != 0
+            || !self.public_key.trim().is_empty()
+            || !self.private_key.trim().is_empty()
+            || !self.short_id.trim().is_empty()
     }
 }
 
@@ -792,11 +915,15 @@ fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Opt
         .find(|value| !value.is_empty())
 }
 
-fn split_cert_domains(raw: &str) -> impl Iterator<Item = String> + '_ {
+fn split_list_values(raw: &str) -> impl Iterator<Item = String> + '_ {
     raw.split([',', '\n', '\r', ' '])
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
+}
+
+fn split_cert_domains(raw: &str) -> impl Iterator<Item = String> + '_ {
+    split_list_values(raw)
 }
 
 fn lookup_extra_string_path(
@@ -951,6 +1078,15 @@ fn value_to_strings(value: &Value) -> Vec<String> {
     match value {
         Value::Array(values) => values.iter().filter_map(value_to_trimmed_string).collect(),
         Value::String(text) => split_cert_domains(text).collect(),
+        other => value_to_trimmed_string(other).into_iter().collect(),
+    }
+}
+
+fn value_to_split_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values.iter().flat_map(value_to_split_strings).collect(),
+        Value::String(text) => split_list_values(text).collect(),
+        Value::Null => Vec::new(),
         other => value_to_trimmed_string(other).into_iter().collect(),
     }
 }
@@ -1334,12 +1470,57 @@ fn value_to_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     }
 }
 
+fn value_to_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Bool(value) => Some(i64::from(*value)),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        serde_json::Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_value_enabled(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(number)) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        Some(serde_json::Value::String(text)) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            !matches!(
+                normalized.as_str(),
+                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
+            )
+        }
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(object)) => object
+            .get("enabled")
+            .map(|value| json_value_enabled(Some(value)))
+            .unwrap_or(!object.is_empty()),
+    }
+}
+
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de> + Default,
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_string_list_on_null<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(value) => value_to_split_strings(&value),
+        None => Vec::new(),
+    })
 }
 
 fn classify_send_error(error: reqwest::Error) -> TrafficReportError {
@@ -1455,6 +1636,7 @@ mod tests {
                 "heartbeat": null,
                 "transport": null,
                 "traffic_pattern": null,
+                "alpn": null,
                 "packet_encoding": null,
                 "global_padding": null,
                 "authenticated_length": null,
@@ -1505,6 +1687,7 @@ mod tests {
         assert_eq!(config.heartbeat, "");
         assert!(config.transport.is_none());
         assert_eq!(config.traffic_pattern, "");
+        assert!(config.alpn.is_empty());
         assert_eq!(config.packet_encoding, "");
         assert!(!config.global_padding);
         assert!(!config.authenticated_length);
@@ -1924,6 +2107,7 @@ mod tests {
                     "type": "udp"
                 },
                 "trafficPattern": "h3",
+                "alpn": ["h2", "http/1.1"],
                 "packet_encoding": "xudp",
                 "fallbacks": [{
                     "dest": 80
@@ -1973,6 +2157,7 @@ mod tests {
         assert_eq!(config.heartbeat, "10s");
         assert_eq!(config.transport, Some(serde_json::json!({ "type": "udp" })));
         assert_eq!(config.traffic_pattern, "h3");
+        assert_eq!(config.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
         assert_eq!(config.packet_encoding, "xudp");
         assert_eq!(config.fallbacks, Some(serde_json::json!([{ "dest": 80 }])));
         assert_eq!(
@@ -2001,6 +2186,112 @@ mod tests {
         );
         assert_eq!(config.udp_relay_mode, "native");
         assert!(config.udp_over_stream);
+    }
+
+    #[test]
+    fn interprets_tls_mode_and_disabled_multiplex_objects() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vmess",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "tls": 0,
+            "multiplex": {
+                "enabled": false,
+                "protocol": "yamux"
+            },
+            "tls_settings": {
+                "server_name": null,
+                "allow_insecure": false
+            }
+        }))
+        .expect("parse config");
+
+        assert_eq!(config.tls_mode(), 0);
+        assert!(!config.multiplex_enabled());
+        assert!(!config.tls_settings.is_configured());
+
+        let enabled: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "tls": {
+                "enabled": true
+            },
+            "multiplex": true
+        }))
+        .expect("parse enabled config");
+
+        assert_eq!(enabled.tls_mode(), 1);
+        assert!(enabled.multiplex_enabled());
+    }
+
+    #[test]
+    fn parses_alpn_from_string_lists() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "alpn": "h2, http/1.1\nh3"
+        }))
+        .expect("parse alpn list");
+
+        assert_eq!(
+            config.alpn,
+            vec!["h2".to_string(), "http/1.1".to_string(), "h3".to_string()]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_tls_settings_for_reality_mode() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "reality.example.com",
+                "allow_insecure": true,
+                "server_port": 8443,
+                "public_key": "pub",
+                "private_key": "priv",
+                "short_id": "abcd"
+            }
+        }))
+        .expect("parse reality config");
+
+        let reality = config.effective_reality_settings();
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.server_port, 8443);
+        assert_eq!(reality.public_key, "pub");
+        assert_eq!(reality.private_key, "priv");
+        assert_eq!(reality.short_id, "abcd");
+        assert!(reality.allow_insecure);
+        assert!(config.tls_settings.is_configured());
+        assert!(!config.reality_settings.is_configured());
+    }
+
+    #[test]
+    fn prefers_explicit_reality_settings_when_present() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "tls.example.com",
+                "public_key": "tls-pub"
+            },
+            "reality_settings": {
+                "server_name": "reality.example.com",
+                "server_port": 7443,
+                "public_key": "reality-pub",
+                "short_id": "beef"
+            }
+        }))
+        .expect("parse explicit reality config");
+
+        let reality = config.effective_reality_settings();
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.server_port, 7443);
+        assert_eq!(reality.public_key, "reality-pub");
+        assert_eq!(reality.short_id, "beef");
     }
 
     #[test]
