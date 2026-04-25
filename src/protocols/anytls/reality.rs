@@ -247,6 +247,9 @@ fn parse_peer_public_key(key_share: &[u8]) -> anyhow::Result<&[u8]> {
         if group == 29 && data.len() == 32 {
             return Ok(data);
         }
+        if group == 0x6399 && data.len() >= 32 {
+            hybrid_public_key = Some(&data[..32]);
+        }
         if group == 0x11ec && data.len() >= 32 {
             hybrid_public_key = Some(&data[data.len() - 32..]);
         }
@@ -306,6 +309,31 @@ mod tests {
 
         let public_key = parse_peer_public_key(&key_share).expect("public key");
         assert_eq!(public_key, [5u8; 32].as_slice());
+    }
+
+    #[test]
+    fn extracts_x25519_from_hybrid_key_shares() {
+        let mut kyber_key_share = Vec::new();
+        kyber_key_share.extend_from_slice(&40u16.to_be_bytes());
+        kyber_key_share.extend_from_slice(&0x6399u16.to_be_bytes());
+        kyber_key_share.extend_from_slice(&36u16.to_be_bytes());
+        kyber_key_share.extend_from_slice(&[6u8; 32]);
+        kyber_key_share.extend_from_slice(&[7u8; 4]);
+        assert_eq!(
+            parse_peer_public_key(&kyber_key_share).expect("kyber x25519 key"),
+            [6u8; 32].as_slice()
+        );
+
+        let mut mlkem_key_share = Vec::new();
+        mlkem_key_share.extend_from_slice(&40u16.to_be_bytes());
+        mlkem_key_share.extend_from_slice(&0x11ecu16.to_be_bytes());
+        mlkem_key_share.extend_from_slice(&36u16.to_be_bytes());
+        mlkem_key_share.extend_from_slice(&[8u8; 4]);
+        mlkem_key_share.extend_from_slice(&[9u8; 32]);
+        assert_eq!(
+            parse_peer_public_key(&mlkem_key_share).expect("mlkem x25519 key"),
+            [9u8; 32].as_slice()
+        );
     }
 
     #[test]
