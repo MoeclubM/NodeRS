@@ -3062,23 +3062,34 @@ mod tests {
             .await
             .expect("write download request");
 
-        let mut upload_client = upload_client;
-        upload_client
+        let (mut upload_reader, mut upload_writer) = split(upload_client);
+        upload_writer
             .write_all(
-                b"POST /xhttp/session-keepalive HTTP/1.1\r\nHost: example.com\r\nReferer: https://ref.example/?x_padding=XX\r\nContent-Length: 5\r\n\r\nhello",
+                b"POST /xhttp/session-keepalive HTTP/1.1\r\nHost: example.com\r\nReferer: https://ref.example/?x_padding=XX\r\nContent-Length: 5\r\n\r\nhe",
             )
             .await
             .expect("write upload request");
-        upload_client
+        let upload_response_task = tokio::spawn(async move {
+            let mut upload_response = Vec::new();
+            upload_reader
+                .read_to_end(&mut upload_response)
+                .await
+                .expect("read upload response");
+            upload_response
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        upload_writer
+            .write_all(b"llo")
+            .await
+            .expect("finish upload request");
+        upload_writer
             .shutdown()
             .await
             .expect("shutdown upload client");
 
-        let mut upload_response = Vec::new();
-        upload_client
-            .read_to_end(&mut upload_response)
+        let upload_response = upload_response_task
             .await
-            .expect("read upload response");
+            .expect("join upload response task");
         upload_task.await.expect("join upload task");
         download_task.await.expect("join download task");
 
