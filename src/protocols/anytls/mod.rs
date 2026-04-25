@@ -1,6 +1,7 @@
 mod activity;
 pub(crate) mod dns;
 mod padding;
+mod reality;
 pub(crate) mod routing;
 pub(crate) mod rules;
 mod session;
@@ -1037,14 +1038,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tls_mode_two_until_reality_handshake_is_implemented() {
+    fn rejects_reality_tls_mode_without_reality_settings() {
         let remote = NodeConfigResponse {
             tls: Some(serde_json::json!(2)),
             ..base_remote()
         };
 
-        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
-        assert!(error.to_string().contains("tls mode"));
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("reality settings");
+        assert!(error.to_string().contains("reality_settings.server_name"));
     }
 
     #[test]
@@ -1338,16 +1339,22 @@ impl ServerController {
 
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
+        let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
+            server_name: reality.server_name.clone(),
+            private_key: reality.private_key,
+            short_id: reality.short_id,
+        });
         let should_reload = tls_materials.as_ref().is_none_or(|current| {
-            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+            !current.matches_source(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
         });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
-            .await
-            .context("load TLS materials")?;
+        let reloaded =
+            tls::load_tls_materials(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
+                .await
+                .context("load TLS materials")?;
         *self.tls_config.write().expect("tls config lock poisoned") = Some(reloaded.acceptor());
         *tls_materials = Some(reloaded);
         Ok(())
@@ -1557,7 +1564,7 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
         anyhow::bail!("Xboard network must be tcp for AnyTLS nodes");
     }
-    if remote.tls.is_some() && !matches!(remote.tls_mode(), 0 | 1) {
+    if remote.tls.is_some() && !matches!(remote.tls_mode(), 0 | 1 | 2) {
         anyhow::bail!(
             "Xboard tls mode {} is not supported by NodeRS-AnyTLS AnyTLS server yet",
             remote.tls_mode()

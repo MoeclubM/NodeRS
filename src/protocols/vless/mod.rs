@@ -310,16 +310,22 @@ impl ServerController {
 
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
+        let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
+            server_name: reality.server_name.clone(),
+            private_key: reality.private_key,
+            short_id: reality.short_id,
+        });
         let should_reload = tls_materials.as_ref().is_none_or(|current| {
-            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+            !current.matches_source(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
         });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
-            .await
-            .context("load VLESS TLS materials")?;
+        let reloaded =
+            tls::load_tls_materials(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
+                .await
+                .context("load VLESS TLS materials")?;
         *self
             .tls_config
             .write()
@@ -1058,7 +1064,7 @@ fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEn
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     parse_transport_mode(remote)?;
     parse_packet_encoding(remote)?;
-    if remote.tls.is_some() && remote.tls_mode() != 1 {
+    if remote.tls.is_some() && !matches!(remote.tls_mode(), 1 | 2) {
         bail!(
             "Xboard tls mode {} is not supported by NodeRS VLESS server yet",
             remote.tls_mode()
@@ -1147,7 +1153,9 @@ fn validate_request_addons(request: &codec::Request) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::CertConfig;
+    use crate::panel::{CertConfig, NodeRealitySettings};
+
+    const REALITY_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -1274,11 +1282,31 @@ mod tests {
         assert_eq!(config.server_port, 443);
 
         let remote = NodeConfigResponse {
-            tls: Some(serde_json::json!(2)),
+            tls: Some(serde_json::json!(3)),
             ..base_remote()
         };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
         assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
+    fn accepts_reality_tls_mode() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            reality_settings: NodeRealitySettings {
+                server_name: "reality.example.com".to_string(),
+                public_key: REALITY_KEY_B64.to_string(),
+                private_key: REALITY_KEY_B64.to_string(),
+                short_id: "a1b2".to_string(),
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("reality config");
+        let reality = config.tls.reality.expect("reality config");
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.short_id, [0, 0, 0, 0, 0, 0, 0xa1, 0xb2]);
     }
 
     #[test]
