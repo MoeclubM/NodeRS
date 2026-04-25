@@ -69,7 +69,7 @@ impl EffectiveNodeConfig {
 }
 
 fn default_xhttp_alpn() -> Vec<String> {
-    vec!["h2".to_string(), "http/1.1".to_string()]
+    vec!["http/1.1".to_string(), "h2".to_string()]
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1324,7 +1324,7 @@ mod tests {
         assert!(matches!(config.transport, TransportMode::Xhttp(_)));
         assert_eq!(
             config.tls.alpn,
-            vec!["h2".to_string(), "http/1.1".to_string()]
+            vec!["http/1.1".to_string(), "h2".to_string()]
         );
     }
 
