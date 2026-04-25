@@ -820,8 +820,9 @@ mod tests {
         coalesce_download_reads_without_deferred_wait, pump_copy, write_chunk_batch_for_test,
     };
     use super::{
-        forward_buffered_inbound_payload, forward_inbound_payload_to_channel,
-        prefetch_remote_download_with_grace, read_exact_payload,
+        SessionState, StreamState, close_peer_stream, forward_buffered_inbound_payload,
+        forward_inbound_payload_to_channel, prefetch_remote_download_with_grace,
+        read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use std::collections::VecDeque as TestVecDeque;

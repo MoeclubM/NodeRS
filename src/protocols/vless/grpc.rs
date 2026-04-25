@@ -203,7 +203,7 @@ async fn respond_error(
     status: u16,
     grpc_message: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut builder = http::Response::builder()
+    let builder = http::Response::builder()
         .status(status)
         .header("content-type", "application/grpc")
         .header("trailer", "grpc-status, grpc-message");
