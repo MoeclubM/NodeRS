@@ -8,18 +8,18 @@ PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
 OPENRC_DIR="/etc/init.d"
-RUN_DIR="/run/noders-anytls"
-LOG_DIR="/var/log/noders-anytls"
+RUN_DIR="/run/noders"
+LOG_DIR="/var/log/noders"
 SERVICE_NAME="noders"
-LEGACY_SERVICE_NAME="noders-anytls"
+LEGACY_SERVICE_NAME="${SERVICE_NAME}-anytls"
 VERSION="latest"
 NO_RESTART=0
 TMP_ROOT=""
 BACKUP_BINARY=""
 RESTART_STATE="pending"
 SERVICE_MANAGER="none"
-OPENRC_SERVICE_USER="noders-anytls"
-OPENRC_SERVICE_GROUP="noders-anytls"
+OPENRC_SERVICE_USER="noders"
+OPENRC_SERVICE_GROUP="noders"
 declare -a DISCOVERED_UNITS=()
 declare -a ACTIVE_UNITS=()
 declare -a RESTART_TARGET_UNITS=()
@@ -190,7 +190,7 @@ parse_args() {
 }
 
 release_layout_present() {
-  [[ -f "$SCRIPT_DIR/noders-anytls" ]]
+  [[ -f "$SCRIPT_DIR/noders" ]]
 }
 
 resolve_release_tag() {
@@ -217,7 +217,7 @@ bootstrap_release() {
   local tag asset_suffix package_name archive_path package_root
   tag="$(resolve_release_tag)"
   asset_suffix="$(detect_asset_suffix)"
-  package_name="noders-anytls-${tag}-${asset_suffix}"
+  package_name="noders-${tag}-${asset_suffix}"
   TMP_ROOT="$(mktemp -d)"
   archive_path="$TMP_ROOT/${package_name}.tar.gz"
 
@@ -234,8 +234,8 @@ bootstrap_release() {
 }
 
 ensure_existing_installation() {
-  [[ -x "$PREFIX/bin/noders-anytls" ]] || {
-    echo "Existing installation not found at $PREFIX/bin/noders-anytls" >&2
+  [[ -x "$(runtime_binary_path)" || -x "$PREFIX/bin/${SERVICE_NAME}-anytls" ]] || {
+    echo "Existing installation not found at $(runtime_binary_path)" >&2
     echo "Use scripts/install.sh for first-time installation." >&2
     exit 1
   }
@@ -338,18 +338,22 @@ discover_restart_targets() {
 backup_current_binary() {
   need_cmd mktemp
   TMP_ROOT="${TMP_ROOT:-$(mktemp -d)}"
-  BACKUP_BINARY="$TMP_ROOT/noders-anytls.previous"
-  cp "$PREFIX/bin/noders-anytls" "$BACKUP_BINARY"
+  BACKUP_BINARY="$TMP_ROOT/noders.previous"
+  if [[ -x "$(runtime_binary_path)" ]]; then
+    cp "$(runtime_binary_path)" "$BACKUP_BINARY"
+  else
+    cp "$PREFIX/bin/${SERVICE_NAME}-anytls" "$BACKUP_BINARY"
+  fi
 }
 
 restore_previous_binary() {
   [[ -n "$BACKUP_BINARY" && -f "$BACKUP_BINARY" ]] || return 0
-  install -m 0755 "$BACKUP_BINARY" "$PREFIX/bin/noders-anytls"
+  install -m 0755 "$BACKUP_BINARY" "$(runtime_binary_path)"
 }
 
 discover_openrc_service_account() {
-  OPENRC_SERVICE_USER="noders-anytls"
-  OPENRC_SERVICE_GROUP="noders-anytls"
+  OPENRC_SERVICE_USER="noders"
+  OPENRC_SERVICE_GROUP="noders"
 
   local unit_path command_user
   shopt -s nullglob
@@ -362,7 +366,7 @@ discover_openrc_service_account() {
     command_user="$(sed -n 's/^command_user="\([^"]*\)"$/\1/p' "$unit_path" | head -n1)"
     if [[ -n "$command_user" ]]; then
       IFS=':' read -r OPENRC_SERVICE_USER OPENRC_SERVICE_GROUP <<<"$command_user"
-      [[ -n "$OPENRC_SERVICE_USER" ]] || OPENRC_SERVICE_USER="noders-anytls"
+      [[ -n "$OPENRC_SERVICE_USER" ]] || OPENRC_SERVICE_USER="noders"
       [[ -n "$OPENRC_SERVICE_GROUP" ]] || OPENRC_SERVICE_GROUP="$OPENRC_SERVICE_USER"
       break
     fi
@@ -380,6 +384,48 @@ repair_openrc_permissions() {
   for path in "$STATE_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"; do
     [[ -e "$path" ]] || continue
     chown -R "$OPENRC_SERVICE_USER":"$OPENRC_SERVICE_GROUP" "$path"
+  done
+}
+
+refresh_systemd_unit_files() {
+  [[ "$SERVICE_MANAGER" == "systemd" ]] || return 0
+  [[ "$(id -u)" -eq 0 ]] || return 0
+
+  local unit_name instance_id unit_path config_path shell_path
+  shell_path="/usr/sbin/nologin"
+  if [[ ! -x "$shell_path" ]]; then
+    shell_path="/sbin/nologin"
+  fi
+
+  for unit_name in "${DISCOVERED_UNITS[@]}"; do
+    [[ "$unit_name" == "${SERVICE_NAME}-"* ]] || continue
+    instance_id="${unit_name#${SERVICE_NAME}-}"
+    [[ -n "$instance_id" ]] || continue
+    unit_path="/etc/systemd/system/${unit_name}.service"
+    config_path="$(node_config_path "$instance_id")"
+    [[ -f "$config_path" ]] || continue
+    cat > "$unit_path" <<EOF
+[Unit]
+Description=NodeRS service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${OPENRC_SERVICE_USER}
+Group=${OPENRC_SERVICE_GROUP}
+WorkingDirectory=${STATE_DIR}
+ExecStart=$(runtime_binary_path) ${config_path}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
   done
 }
 
@@ -406,8 +452,9 @@ install_from_bundle() {
   staging_dir="$1"
 
   install -d "$PREFIX/bin"
-  install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
   install_management_support "$staging_dir"
+  install -m 0755 "$staging_dir/noders" "$(runtime_binary_path)"
+  rm -f "$PREFIX/bin/${SERVICE_NAME}-anytls"
 }
 
 restart_active_units() {
@@ -483,7 +530,7 @@ print_summary() {
   local unit_name
   cat <<EOF
 Upgraded NodeRS
-  Binary: $PREFIX/bin/noders-anytls
+  Binary: $(runtime_binary_path)
   Manager: $PREFIX/bin/noders
   Config: $CONFIG_DIR
 EOF
@@ -526,6 +573,7 @@ main() {
 
   ensure_existing_installation
   discover_units
+  refresh_systemd_unit_files
   repair_openrc_permissions
   refresh_openrc_unit_scripts
   discover_active_units

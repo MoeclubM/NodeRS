@@ -40,7 +40,7 @@ fi
 TMP_ROOT="$(mktemp -d)"
 UNIT_DIR="/etc/systemd/system"
 SERVICE_NAME="noders-ci-test"
-LEGACY_SERVICE_NAME="noders-anytls-ci-test"
+LEGACY_SERVICE_NAME="noders-ci-test"
 VALID_UNIT="${SERVICE_NAME}-3-820183675"
 INVALID_UNIT="${SERVICE_NAME}-3"$'\003'"-820183675"
 

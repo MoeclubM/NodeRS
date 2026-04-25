@@ -1566,12 +1566,12 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     }
     if remote.tls.is_some() && !matches!(remote.tls_mode(), 0 | 1 | 2) {
         anyhow::bail!(
-            "Xboard tls mode {} is not supported by NodeRS-AnyTLS AnyTLS server yet",
+            "Xboard tls mode {} is not supported by the NodeRS AnyTLS server yet",
             remote.tls_mode()
         );
     }
     if remote.network_settings.is_some() {
-        anyhow::bail!("Xboard networkSettings is not supported by NodeRS-AnyTLS AnyTLS server");
+        anyhow::bail!("Xboard networkSettings is not supported by the NodeRS AnyTLS server");
     }
     Ok(())
 }

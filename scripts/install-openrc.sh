@@ -8,12 +8,12 @@ PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
 SERVICE_NAME="noders"
-LEGACY_SERVICE_NAME="noders-anytls"
-SERVICE_USER="noders-anytls"
-SERVICE_GROUP="noders-anytls"
+LEGACY_SERVICE_NAME="${SERVICE_NAME}-anytls"
+SERVICE_USER="noders"
+SERVICE_GROUP="noders"
 OPENRC_DIR="/etc/init.d"
-RUN_DIR="/run/noders-anytls"
-LOG_DIR="/var/log/noders-anytls"
+RUN_DIR="/run/noders"
+LOG_DIR="/var/log/noders"
 VERSION="latest"
 NO_SERVICE=0
 UNINSTALL=0
@@ -173,7 +173,7 @@ detect_asset_suffix() {
 }
 
 release_layout_present() {
-  [[ -f "$SCRIPT_DIR/noders-anytls" ]] &&
+  [[ -f "$SCRIPT_DIR/noders" ]] &&
   [[ -f "$SCRIPT_DIR/config.example.toml" ]] &&
   [[ -f "$COMMON_LIB_PATH" ]]
 }
@@ -200,7 +200,7 @@ bootstrap_release() {
   local tag asset_suffix package_name archive_path package_root bundle_script
   tag="$(resolve_release_tag)"
   asset_suffix="$(detect_asset_suffix)"
-  package_name="noders-anytls-${tag}-${asset_suffix}"
+  package_name="noders-${tag}-${asset_suffix}"
   TMP_ROOT="$(mktemp -d)"
   archive_path="$TMP_ROOT/${package_name}.tar.gz"
 
@@ -245,7 +245,7 @@ load_common_or_bootstrap() {
 }
 
 ensure_directories() {
-  install -d "$PREFIX/bin" "$CONFIG_DIR" "$STATE_DIR" "$CONFIG_DIR/machines" "$LOG_DIR" "$RUN_DIR"
+  install -d "$PREFIX/bin" "$(support_root_dir)" "$CONFIG_DIR" "$STATE_DIR" "$CONFIG_DIR/machines" "$LOG_DIR" "$RUN_DIR"
 }
 
 node_service_path() {
@@ -423,7 +423,7 @@ remove_all_nodes() {
     stop_disable_unit "$unit_name"
   done
 
-  rm -f "$PREFIX/bin/noders-anytls"
+  rm -f "$(runtime_binary_path)" "$PREFIX/bin/${SERVICE_NAME}-anytls"
   remove_management_support
   rm -rf "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$RUN_DIR"
   remove_service_account
@@ -467,7 +467,7 @@ print_summary() {
   local service_unit log_path
   cat <<EOF
 Installed NodeRS (OpenRC)
-  Binary: $PREFIX/bin/noders-anytls
+  Binary: $(runtime_binary_path)
   Manager: $PREFIX/bin/noders
   State:  $STATE_DIR
   Logs:   $LOG_DIR
@@ -488,8 +488,8 @@ install_from_bundle() {
   staging_dir="$1"
 
   ensure_directories
-  install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
   install_management_support "$staging_dir"
+  install -m 0755 "$staging_dir/noders" "$(runtime_binary_path)"
   write_xboard_configs "$staging_dir"
   install_service
   print_summary

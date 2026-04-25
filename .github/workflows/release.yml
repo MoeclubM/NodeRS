@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  BIN_NAME: noders-anytls
+  BIN_NAME: noders
 
 jobs:
   build-gnu:

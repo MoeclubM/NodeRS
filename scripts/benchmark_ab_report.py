@@ -1036,20 +1036,20 @@ def build_current_variant(
         "--target",
         target,
         "--bin",
-        "noders-anytls",
+        "noders",
         "--bin",
         "bench_anytls",
     ]
     run_checked(command, env=env)
-    return binary_path(target_dir, target, "noders-anytls"), binary_path(target_dir, target, "bench_anytls")
+    return binary_path(target_dir, target, "noders"), binary_path(target_dir, target, "bench_anytls")
 
 
 def release_asset_name_for_target(ref: str, target: str) -> str | None:
     target_asset_names = {
-        "x86_64-unknown-linux-musl": f"noders-anytls-{ref}-linux-amd64-musl.tar.gz",
-        "x86_64-unknown-linux-gnu": f"noders-anytls-{ref}-linux-amd64.tar.gz",
-        "aarch64-unknown-linux-musl": f"noders-anytls-{ref}-linux-arm64-musl.tar.gz",
-        "aarch64-unknown-linux-gnu": f"noders-anytls-{ref}-linux-arm64.tar.gz",
+        "x86_64-unknown-linux-musl": f"noders-{ref}-linux-amd64-musl.tar.gz",
+        "x86_64-unknown-linux-gnu": f"noders-{ref}-linux-amd64.tar.gz",
+        "aarch64-unknown-linux-musl": f"noders-{ref}-linux-arm64-musl.tar.gz",
+        "aarch64-unknown-linux-gnu": f"noders-{ref}-linux-arm64.tar.gz",
     }
     return target_asset_names.get(target)
 
@@ -1070,7 +1070,7 @@ def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str) -> 
     release_root = output_dir / "release-binaries"
     release_root.mkdir(parents=True, exist_ok=True)
     extract_root = release_root / ref.replace("/", "_")
-    binary_path_local = extract_root / asset_name[: -len(".tar.gz")] / "noders-anytls"
+    binary_path_local = extract_root / asset_name[: -len(".tar.gz")] / "noders"
     if binary_path_local.exists():
         return binary_path_local
 
@@ -1109,19 +1109,19 @@ def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Pat
                 "--target",
                 target,
                 "--bin",
-                "noders-anytls",
+                "noders",
             ],
             cwd=worktree_path,
             env=env,
         )
     finally:
         run_checked(["git", "worktree", "remove", "--force", str(worktree_path)])
-    return binary_path(target_dir, target, "noders-anytls")
+    return binary_path(target_dir, target, "noders")
 
 
 def github_json(url: str) -> dict:
     headers = {
-        "User-Agent": "NodeRS-AnyTLS-benchmark",
+        "User-Agent": "NodeRS-benchmark",
         "Accept": "application/vnd.github+json",
     }
     github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")

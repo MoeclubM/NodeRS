@@ -299,6 +299,10 @@ support_root_dir() {
   printf '%s\n' "${PREFIX%/}/lib/noders"
 }
 
+runtime_binary_path() {
+  printf '%s\n' "$(support_root_dir)/noders"
+}
+
 write_manager_install_env() {
   local target
   target="$1"
@@ -328,8 +332,8 @@ set -euo pipefail
 DEFAULT_PREFIX="/usr/local"
 DEFAULT_CONFIG_DIR="/etc/noders/anytls"
 DEFAULT_STATE_DIR="/var/lib/noders/anytls"
-DEFAULT_LOG_DIR="/var/log/noders-anytls"
-DEFAULT_RUN_DIR="/run/noders-anytls"
+DEFAULT_LOG_DIR="/var/log/noders"
+DEFAULT_RUN_DIR="/run/noders"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SUPPORT_DIR=""
@@ -339,7 +343,7 @@ STATE_DIR=""
 LOG_DIR=""
 RUN_DIR=""
 SERVICE_NAME="noders"
-LEGACY_SERVICE_NAME="noders-anytls"
+LEGACY_SERVICE_NAME="${SERVICE_NAME}-anytls"
 SERVICE_MANAGER="none"
 
 declare -a DISCOVERED_UNITS=()
@@ -458,7 +462,7 @@ load_install_env() {
   LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
   RUN_DIR="${RUN_DIR:-$DEFAULT_RUN_DIR}"
   SERVICE_NAME="${SERVICE_NAME:-noders}"
-  LEGACY_SERVICE_NAME="${LEGACY_SERVICE_NAME:-noders-anytls}"
+  LEGACY_SERVICE_NAME="${LEGACY_SERVICE_NAME:-${SERVICE_NAME}-anytls}"
 }
 
 print_discovered_units() {
@@ -960,7 +964,7 @@ render_openrc_service_file() {
 
 name="${SERVICE_NAME}-${instance_id}"
 description="NodeRS service for instance ${instance_id}"
-command="${PREFIX}/bin/noders-anytls"
+command="$(runtime_binary_path)"
 command_args="${config_path}"
 command_user="${service_user}:${service_group}"
 directory="${STATE_DIR}"
