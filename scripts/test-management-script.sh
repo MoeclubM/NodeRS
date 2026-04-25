@@ -380,9 +380,10 @@ exit 2'
 
   assert_contains "[enable][noders-${instance_id}]" "$fake_systemctl_log" "migration did not enable the new hashed systemd unit"
   assert_contains "[restart][noders-${instance_id}]" "$fake_systemctl_log" "migration did not restart the new hashed systemd unit"
-  assert_contains "[disable][--now][noders-${machine_id}]" "$fake_systemctl_log" "migration did not disable the plain legacy systemd unit"
-  assert_contains "[disable][--now][noders-anytls-${machine_id}]" "$fake_systemctl_log" "migration did not attempt to disable the legacy plain anytls unit"
-  assert_contains "[disable][--now][noders-anytls-${instance_id}]" "$fake_systemctl_log" "migration did not disable the legacy hashed anytls unit"
+  assert_contains "[disable][--now]" "$fake_systemctl_log" "migration did not pass --now when disabling legacy systemd units"
+  assert_contains "[disable][noders-${machine_id}]" "$fake_systemctl_log" "migration did not disable the plain legacy systemd unit"
+  assert_contains "[disable][noders-anytls-${machine_id}]" "$fake_systemctl_log" "migration did not attempt to disable the legacy plain anytls unit"
+  assert_contains "[disable][noders-anytls-${instance_id}]" "$fake_systemctl_log" "migration did not disable the legacy hashed anytls unit"
   if [[ ! -s "$fake_systemctl_log" ]]; then
     echo "migration did not exercise the fake systemctl path" >&2
     exit 1
