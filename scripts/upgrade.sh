@@ -246,6 +246,40 @@ ensure_existing_installation() {
   }
 }
 
+legacy_layout_detected() {
+  local config_path unit_path
+
+  if [[ -x "$PREFIX/bin/${SERVICE_NAME}-anytls" && ! -x "$(runtime_binary_path)" ]]; then
+    return 0
+  fi
+
+  if [[ -d "${CONFIG_DIR%/}/machines" ]]; then
+    shopt -s nullglob
+    for config_path in "${CONFIG_DIR%/}/machines/"*.toml; do
+      [[ -f "$config_path" ]] || continue
+      if [[ "$(basename "$config_path")" =~ ^[0-9]+\.toml$ ]]; then
+        shopt -u nullglob
+        return 0
+      fi
+    done
+    shopt -u nullglob
+  fi
+
+  shopt -s nullglob
+  for unit_path in \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}" \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-"*; do
+    [[ -e "$unit_path" ]] || continue
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+
+  return 1
+}
+
 discover_units() {
   DISCOVERED_UNITS=()
 
@@ -572,6 +606,11 @@ main() {
   fi
 
   ensure_existing_installation
+  if legacy_layout_detected; then
+    echo "Legacy noders-anytls install layout detected." >&2
+    echo "Run ${PREFIX%/}/lib/noders/migrate-legacy-install.sh instead of upgrade.sh." >&2
+    exit 1
+  fi
   discover_units
   refresh_systemd_unit_files
   repair_openrc_permissions
