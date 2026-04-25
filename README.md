@@ -1,6 +1,6 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, VLESS, Trojan, VMess, and Shadowsocks protocol handlers, and the installed binary remains `noders-anytls` for compatibility.
+NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, VLESS, Trojan, VMess, and Shadowsocks protocol handlers.
 
 ## Overview
 
@@ -86,7 +86,7 @@ Multiple APIs may reuse the same `machine_id` on one host. NodeRS derives a stab
 ## Runtime Paths
 
 - Project name in documentation: `NodeRS`
-- Binary: `/usr/local/bin/noders-anytls`
+- Binary: `/usr/local/lib/noders/noders`
 - Manager command: `/usr/local/bin/noders`
 - Config root: `/etc/noders/anytls`
 - Machine config: `/etc/noders/anytls/machines/<machine_id>-<api_hash>.toml`
@@ -135,8 +135,8 @@ systemctl enable noders-1-123456789
 ```bash
 rc-service noders-1-123456789 status
 rc-service noders-1-123456789 restart
-tail -n 100 /var/log/noders-anytls/noders-1-123456789.log
-tail -f /var/log/noders-anytls/noders-1-123456789.log
+tail -n 100 /var/log/noders/noders-1-123456789.log
+tail -f /var/log/noders/noders-1-123456789.log
 ```
 
 ## Upgrade
@@ -145,7 +145,7 @@ tail -f /var/log/noders-anytls/noders-1-123456789.log
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-If an existing host still uses old `noders-anytls-<machine_id>` or `noders-<machine_id>` units, uninstall and reinstall to switch to the new `noders-<machine_id>-<api_hash>` instance names.
+If an existing host still uses old `noders-<machine_id>` units, uninstall and reinstall to switch to the new `noders-<machine_id>-<api_hash>` instance names.
 
 ## Uninstall
 

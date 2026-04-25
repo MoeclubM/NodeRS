@@ -29,7 +29,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     runtime.initialize().await?;
     runtime.spawn_background_tasks();
 
-    info!("NodeRS-AnyTLS is running; press Ctrl+C to stop");
+    info!("NodeRS is running; press Ctrl+C to stop");
     tokio::signal::ctrl_c().await.context("wait for Ctrl+C")?;
     runtime.shutdown_all().await;
     Ok(())

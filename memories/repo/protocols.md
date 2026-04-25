@@ -1,0 +1,4 @@
+- VMess KDF must match Xray's recursive HMAC-SHA256 chain from `proxy/vmess/aead/kdf.go`; verified vector for key `Demo Key for Auth ID Test` with path `Demo Path for Auth ID Test` / `Demo Path 2` / `Demo Path 3` is `04330362c2d751437ba06447fa626f8315e72aeafc836be44f9a95fdf0a7feca`.
+- VMess `GenerateChacha20Poly1305Key` matches Xray `proxy/vmess/encoding/auth.go`: MD5(input) || MD5(first16); verified `0123456789abcdef` => `4032af8d61035123906e58e067140cc567304ba676a616064c4340059e1b6370`.
+- VMess AuthID uses AES-128-ECB on exactly one block with padding disabled; using high-level padded ECB helpers breaks roundtrip with `BAD_DECRYPT`.
+- XBoard `cert_config.env` may arrive either as a JSON object or as a multiline `KEY=VALUE` text block; `CertConfig::extra_string()` must resolve nested env aliases from both forms for DNS provider credentials.

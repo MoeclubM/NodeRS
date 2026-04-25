@@ -109,7 +109,7 @@ pub async fn ensure_certificate(
     }
 
     let client = Client::builder()
-        .user_agent(format!("NodeRS-AnyTLS/{} ACME", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("NodeRS/{} ACME", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build ACME HTTP client")?;
     let directory = fetch_directory(&client, &config.directory_url).await?;

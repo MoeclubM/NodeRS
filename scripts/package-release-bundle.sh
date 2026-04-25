@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN_NAME="${BIN_NAME:-noders-anytls}"
+BIN_NAME="${BIN_NAME:-noders}"
 RELEASE_TAG=""
 TARGET=""
 ASSET_SUFFIX=""
@@ -52,7 +52,7 @@ cp scripts/install.sh "$package_dir/install.sh"
 cp scripts/install-openrc.sh "$package_dir/install-openrc.sh"
 cp scripts/lib/install-common.sh "$package_dir/lib/install-common.sh"
 cp scripts/upgrade.sh "$package_dir/upgrade.sh"
-cp packaging/systemd/noders-anytls.service "$package_dir/packaging/systemd/noders-anytls.service"
+cp packaging/systemd/noders.service "$package_dir/packaging/systemd/noders.service"
 chmod +x "$package_dir/install.sh" "$package_dir/install-openrc.sh" "$package_dir/upgrade.sh" "$package_dir/${BIN_NAME}"
 tar -C dist -czf "${package_dir}.tar.gz" "$(basename "$package_dir")"
 sha256sum "${package_dir}.tar.gz" > "${package_dir}.tar.gz.sha256"

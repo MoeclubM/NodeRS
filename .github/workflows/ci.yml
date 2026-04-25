@@ -63,7 +63,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Build release binaries
-        run: cargo build --locked --release --bin noders-anytls --bin bench_anytls
+        run: cargo build --locked --release --bin noders --bin bench_anytls
 
       - name: Run perf smoke benchmark
         run: |

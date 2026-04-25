@@ -334,24 +334,11 @@ impl Session {
     }
 
     async fn handle_fin(&self, stream_id: u32) {
-        let inbound = {
-            let mut streams = self.state.streams.write().expect("streams lock poisoned");
-            streams
-                .get_mut(&stream_id)
-                .and_then(|stream| stream.inbound.take())
-        };
-        if let Some(inbound) = inbound {
-            let _ = inbound.send_fin().await;
-        }
+        close_peer_stream(&self.state, stream_id);
     }
 
     async fn drop_stream(&self, stream_id: u32) {
-        let stream = self
-            .state
-            .streams
-            .write()
-            .expect("streams lock poisoned")
-            .remove(&stream_id);
+        let stream = take_stream(&self.state, stream_id);
         if let Some(stream) = stream {
             stream.task.abort();
             let _ = self.write_frame(CMD_FIN, stream_id, &[]).await;
@@ -573,6 +560,21 @@ async fn forward_buffered_inbound_payload(
 
 fn should_retry_whole_payload_after_backpressure(available_budget: usize) -> bool {
     available_budget >= WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET
+}
+
+fn take_stream(state: &SessionState, stream_id: u32) -> Option<StreamState> {
+    state
+        .streams
+        .write()
+        .expect("streams lock poisoned")
+        .remove(&stream_id)
+}
+
+fn close_peer_stream(state: &SessionState, stream_id: u32) {
+    // sing-anytls treats peer FIN as a full stream close instead of a half-close.
+    if let Some(stream) = take_stream(state, stream_id) {
+        stream.task.abort();
+    }
 }
 
 async fn handle_stream(
@@ -1624,6 +1626,33 @@ mod tests {
                 .try_send_data(PayloadBuffer::new(vec![4; 2]))
                 .is_err(),
             "the unread tail of the partially consumed chunk must stay reserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_fin_removes_stream_from_state() {
+        let state = Arc::new(SessionState::default());
+        let task = tokio::spawn(async move { std::future::pending::<()>().await });
+        state
+            .streams
+            .write()
+            .expect("streams lock poisoned")
+            .insert(
+                7,
+                StreamState {
+                    inbound: None,
+                    task,
+                },
+            );
+
+        close_peer_stream(&state, 7);
+
+        assert!(
+            !state
+                .streams
+                .read()
+                .expect("streams lock poisoned")
+                .contains_key(&7)
         );
     }
 

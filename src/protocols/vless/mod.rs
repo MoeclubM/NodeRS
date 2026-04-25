@@ -1,9 +1,10 @@
 mod codec;
+mod grpc;
 mod http1;
 mod httpupgrade;
+mod mux;
 mod ws;
 mod xhttp;
-mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use serde::Deserialize;
@@ -48,6 +49,9 @@ impl EffectiveNodeConfig {
         validate_remote_support(remote)?;
         let transport = parse_transport_mode(remote)?;
         let mut tls = EffectiveTlsConfig::from_remote(remote)?;
+        if matches!(transport, TransportMode::Grpc(_)) && tls.alpn.is_empty() {
+            tls.alpn = default_grpc_alpn();
+        }
         if matches!(transport, TransportMode::Xhttp(_)) && tls.alpn.is_empty() {
             tls.alpn = default_xhttp_alpn();
         }
@@ -75,6 +79,7 @@ fn default_xhttp_alpn() -> Vec<String> {
 #[derive(Debug, Clone, PartialEq)]
 enum TransportMode {
     Tcp,
+    Grpc(grpc::GrpcConfig),
     Ws(ws::WsConfig),
     HttpUpgrade(httpupgrade::HttpUpgradeConfig),
     Xhttp(xhttp::XhttpConfig),
@@ -103,27 +108,57 @@ struct FallbackTarget {
 
 impl FallbackConfig {
     fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
+        let mut config = Self::default();
+
+        if let Some(value) = remote.fallbacks.as_ref() {
+            config.merge_xboard_fallbacks(value)?;
+        }
+
         let default = match remote.fallback.as_ref() {
             Some(value) => Some(parse_fallback_target(value).context("decode VLESS fallback")?),
             None => None,
         };
+        if let Some(default) = default {
+            config.default = Some(default);
+        }
 
         let by_alpn = match remote.fallback_for_alpn.as_ref() {
             Some(value) => parse_fallback_map(value).context("decode VLESS fallback_for_alpn")?,
             None => HashMap::new(),
         };
+        config.by_alpn.extend(by_alpn);
 
-        Ok(Self { default, by_alpn })
+        Ok(config)
     }
 
     fn select<'a>(&'a self, alpn: Option<&[u8]>) -> Option<&'a FallbackTarget> {
-        if !self.by_alpn.is_empty() {
-            return alpn
-                .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| self.by_alpn.get(value));
-        }
-        self.default.as_ref()
+        alpn.and_then(|value| std::str::from_utf8(value).ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+            .and_then(|value| self.by_alpn.get(value))
+            .or(self.default.as_ref())
     }
+
+    fn merge_xboard_fallbacks(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
+        let entries = value
+            .as_array()
+            .ok_or_else(|| anyhow!("Xboard VLESS fallbacks must be an array"))?;
+        for entry in entries {
+            let entry = parse_xboard_fallback_entry(entry)?;
+            if let Some(alpn) = entry.alpn {
+                self.by_alpn.insert(alpn.to_ascii_lowercase(), entry.target);
+            } else {
+                self.default = Some(entry.target);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFallbackEntry {
+    alpn: Option<String>,
+    target: FallbackTarget,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -418,6 +453,18 @@ async fn accept_loop(
                     )
                     .await
                 }
+                TransportMode::Grpc(config) => {
+                    serve_grpc_connection(
+                        tls_stream,
+                        source,
+                        accounting,
+                        users,
+                        packet_encoding,
+                        routing,
+                        config,
+                    )
+                    .await
+                }
                 TransportMode::Ws(config) => {
                     serve_ws_connection(
                         tls_stream,
@@ -490,7 +537,13 @@ async fn serve_connection(
             }
             return Err(error);
         }
-        Err(_) => return Err(anyhow!("VLESS request header timed out")),
+        Err(_) => {
+            if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
+                proxy_fallback(stream, target, consumed).await?;
+                return Ok(());
+            }
+            return Err(anyhow!("VLESS request header timed out"));
+        }
     };
     if let Err(error) = validate_request_addons(&request) {
         if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
@@ -511,6 +564,61 @@ async fn serve_connection(
         }
     };
 
+    let lease = accounting.open_session(&user, source)?;
+    serve_authenticated_connection(
+        stream,
+        accounting,
+        lease,
+        user,
+        request,
+        packet_encoding,
+        routing,
+    )
+    .await
+}
+
+async fn serve_grpc_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+    config: grpc::GrpcConfig,
+) -> anyhow::Result<()> {
+    let on_stream: Arc<dyn Fn(grpc::GrpcStream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let routing = routing.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                serve_grpc_stream(stream, source, accounting, users, packet_encoding, routing).await
+            {
+                warn!(%error, %source, "VLESS gRPC session terminated with error");
+            }
+        });
+    });
+    grpc::serve_h2(stream, config, on_stream).await
+}
+
+async fn serve_grpc_stream(
+    mut stream: grpc::GrpcStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()> {
+    let request = timeout(
+        REQUEST_HEADER_TIMEOUT,
+        codec::read_request(&mut stream, &mut Vec::new()),
+    )
+    .await
+    .map_err(|_| anyhow!("VLESS request header timed out"))??;
+    validate_request_addons(&request)?;
+    let user = users
+        .get(&request.user)
+        .ok_or_else(|| anyhow!("unknown VLESS user"))?;
     let lease = accounting.open_session(&user, source)?;
     serve_authenticated_connection(
         stream,
@@ -726,7 +834,7 @@ async fn serve_authenticated_connection<S>(
     lease: SessionLease,
     user: UserEntry,
     request: codec::Request,
-    packet_encoding: PacketEncoding,
+    _packet_encoding: PacketEncoding,
     routing: routing::RoutingTable,
 ) -> anyhow::Result<()>
 where
@@ -757,10 +865,6 @@ where
         }
         Command::Mux => {
             ensure!(
-                packet_encoding == PacketEncoding::Xudp,
-                "VLESS mux is only supported for packet_encoding xudp"
-            );
-            ensure!(
                 request.destination
                     == SocksAddr::Domain(
                         codec::XUDP_MUX_DESTINATION.to_string(),
@@ -769,7 +873,7 @@ where
                 "unsupported VLESS mux destination {}",
                 request.destination
             );
-            serve_xudp(stream, accounting, lease, user, routing).await
+            serve_mux(stream, accounting, lease, user, routing).await
         }
     }
 }
@@ -867,7 +971,7 @@ where
     }
 }
 
-async fn serve_xudp<S>(
+async fn serve_mux<S>(
     mut stream: S,
     accounting: Arc<Accounting>,
     lease: SessionLease,
@@ -878,7 +982,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     codec::write_response_header(&mut stream).await?;
-    xudp::relay(
+    mux::relay(
         stream,
         routing,
         lease.control(),
@@ -1026,9 +1130,14 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
     if network.is_empty() || network.eq_ignore_ascii_case("tcp") {
         ensure!(
             remote.network_settings.is_none(),
-            "Xboard networkSettings is only supported for VLESS ws/httpupgrade/xhttp nodes"
+            "Xboard networkSettings is only supported for VLESS grpc/ws/httpupgrade/xhttp nodes"
         );
         return Ok(TransportMode::Tcp);
+    }
+    if network.eq_ignore_ascii_case("grpc") {
+        return Ok(TransportMode::Grpc(
+            grpc::GrpcConfig::from_network_settings(remote.network_settings.as_ref())?,
+        ));
     }
     if network.eq_ignore_ascii_case("ws") {
         return Ok(TransportMode::Ws(ws::WsConfig::from_network_settings(
@@ -1047,7 +1156,7 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
             xhttp::XhttpConfig::from_network_settings(remote.network_settings.as_ref())?,
         ));
     }
-    bail!("Xboard network must be tcp, ws, httpupgrade or xhttp for VLESS nodes");
+    bail!("Xboard network must be tcp, grpc, ws, httpupgrade or xhttp for VLESS nodes");
 }
 
 fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEncoding> {
@@ -1070,23 +1179,33 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             remote.tls_mode()
         );
     }
-    if remote.transport.is_some() {
-        bail!("Xboard transport is not supported by NodeRS VLESS server yet");
-    }
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
     }
-    if remote.fallbacks.is_some() {
-        bail!("Xboard fallbacks is not supported by NodeRS VLESS server yet");
+    if let Some(transport) = remote.transport.as_ref() {
+        validate_transport_field(transport)?;
     }
     let decryption = remote.decryption.trim();
     if !decryption.is_empty() && !decryption.eq_ignore_ascii_case("none") {
         bail!("Xboard decryption must be none for VLESS nodes");
     }
-    if !remote.flow.trim().is_empty() {
-        bail!("Xboard flow is not supported by NodeRS VLESS server yet");
-    }
+    validate_flow_value(remote.flow.trim(), "Xboard flow")?;
     Ok(())
+}
+
+fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(object) = value.as_object() else {
+        bail!("Xboard transport must be an object when provided");
+    };
+    let transport_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if transport_type.is_empty() || transport_type.eq_ignore_ascii_case("tcp") {
+        return Ok(());
+    }
+    bail!("Xboard transport is not supported by NodeRS VLESS server yet");
 }
 
 fn parse_fallback_map(
@@ -1122,6 +1241,123 @@ fn parse_fallback_target(value: &serde_json::Value) -> anyhow::Result<FallbackTa
     Ok(target)
 }
 
+fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<ParsedFallbackEntry> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Xboard VLESS fallback entry must be an object"))?;
+
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    ensure!(
+        name.is_empty(),
+        "Xboard VLESS fallback name is not supported yet"
+    );
+
+    let path = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    ensure!(
+        path.is_empty(),
+        "Xboard VLESS fallback path is not supported yet"
+    );
+
+    let xver = object
+        .get("xver")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    ensure!(xver == 0, "Xboard VLESS fallback xver is not supported yet");
+
+    let fallback_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    ensure!(
+        fallback_type.is_empty() || fallback_type.eq_ignore_ascii_case("tcp"),
+        "Xboard VLESS fallback type is not supported yet"
+    );
+
+    let dest = object
+        .get("dest")
+        .ok_or_else(|| anyhow!("Xboard VLESS fallback entry requires dest"))?;
+    let target = parse_xboard_fallback_dest(dest)?;
+
+    let alpn = object
+        .get("alpn")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    Ok(ParsedFallbackEntry { alpn, target })
+}
+
+fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<FallbackTarget> {
+    match value {
+        serde_json::Value::Number(number) => {
+            let port = number
+                .as_u64()
+                .ok_or_else(|| anyhow!("Xboard VLESS fallback dest must be a TCP port"))?;
+            let server_port =
+                u16::try_from(port).context("Xboard VLESS fallback port does not fit u16")?;
+            ensure!(
+                server_port > 0,
+                "Xboard VLESS fallback port must be non-zero"
+            );
+            Ok(FallbackTarget {
+                server: "127.0.0.1".to_string(),
+                server_port,
+            })
+        }
+        serde_json::Value::String(text) => {
+            let compact = text.trim();
+            ensure!(
+                !compact.is_empty() && !compact.starts_with('/') && !compact.starts_with('@'),
+                "Xboard VLESS fallback dest must be tcp host:port or port"
+            );
+            if compact.chars().all(|ch| ch.is_ascii_digit()) {
+                let server_port = compact
+                    .parse::<u16>()
+                    .context("parse Xboard VLESS fallback port")?;
+                ensure!(
+                    server_port > 0,
+                    "Xboard VLESS fallback port must be non-zero"
+                );
+                return Ok(FallbackTarget {
+                    server: "127.0.0.1".to_string(),
+                    server_port,
+                });
+            }
+
+            let (server, port) = compact
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow!("Xboard VLESS fallback dest must be tcp host:port"))?;
+            ensure!(
+                !server.trim().is_empty(),
+                "Xboard VLESS fallback host is required"
+            );
+            let server_port = port
+                .trim()
+                .parse::<u16>()
+                .context("parse Xboard VLESS fallback port")?;
+            ensure!(
+                server_port > 0,
+                "Xboard VLESS fallback port must be non-zero"
+            );
+            Ok(FallbackTarget {
+                server: server.trim().to_string(),
+                server_port,
+            })
+        }
+        _ => bail!("Xboard VLESS fallback dest must be a string or number"),
+    }
+}
+
 fn parse_uuid(value: &str) -> anyhow::Result<[u8; 16]> {
     let compact = value
         .trim()
@@ -1143,11 +1379,19 @@ fn validate_request_addons(request: &codec::Request) -> anyhow::Result<()> {
         request.addons.seed.is_empty(),
         "VLESS addons seed is not supported by NodeRS VLESS server yet"
     );
-    ensure!(
-        request.addons.flow.trim().is_empty(),
-        "VLESS addons flow is not supported by NodeRS VLESS server yet"
-    );
+    validate_flow_value(request.addons.flow.trim(), "VLESS addons flow")?;
     Ok(())
+}
+
+fn validate_flow_value(value: &str, field: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    bail!("{field} is not supported by NodeRS VLESS server yet")
+}
+
+fn default_grpc_alpn() -> Vec<String> {
+    vec!["h2".to_string()]
 }
 
 #[cfg(test)]
@@ -1199,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_selection_prefers_alpn_map_over_default() {
+    fn fallback_selection_uses_default_when_alpn_does_not_match() {
         let config = FallbackConfig {
             default: Some(FallbackTarget {
                 server: "127.0.0.1".to_string(),
@@ -1218,7 +1462,12 @@ mod tests {
             config.select(Some(b"h2")).map(|target| target.server_port),
             Some(443)
         );
-        assert!(config.select(Some(b"http/1.1")).is_none());
+        assert_eq!(
+            config
+                .select(Some(b"http/1.1"))
+                .map(|target| target.server_port),
+            Some(80)
+        );
     }
 
     #[test]
@@ -1329,6 +1578,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_grpc_network_settings() {
+        let remote = NodeConfigResponse {
+            network: "grpc".to_string(),
+            network_settings: Some(serde_json::json!({
+                "serviceName": "TunService"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Grpc(_)));
+        assert_eq!(config.tls.alpn, vec!["h2".to_string()]);
+    }
+
+    #[test]
     fn preserves_explicit_alpn_for_xhttp() {
         let remote = NodeConfigResponse {
             network: "xhttp".to_string(),
@@ -1346,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_runtime_vless_addons_until_flow_support_lands() {
+    fn still_rejects_runtime_vless_flow_addons() {
         let request = codec::Request {
             user: [0u8; 16],
             addons: codec::Addons {
@@ -1369,6 +1632,42 @@ mod tests {
         };
         let error = validate_request_addons(&request).expect_err("seed should be rejected");
         assert!(error.to_string().contains("addons seed"));
+    }
+
+    #[test]
+    fn parses_xboard_fallbacks_subset() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": 80 },
+                { "alpn": "h2", "dest": "127.0.0.1:8443" }
+            ])),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        assert_eq!(
+            config.select(Some(b"h2")).map(|target| target.server_port),
+            Some(8443)
+        );
+        assert_eq!(
+            config
+                .select(Some(b"http/1.1"))
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn rejects_xboard_fallbacks_with_unsupported_path() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "path": "/ws", "dest": 80 }
+            ])),
+            ..base_remote()
+        };
+
+        let error = FallbackConfig::from_remote(&remote).expect_err("unsupported fallback path");
+        assert!(error.to_string().contains("fallback path"));
     }
 
     #[test]

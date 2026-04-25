@@ -388,7 +388,7 @@ def github_json(url: str) -> dict:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "NodeRS-AnyTLS-real-host-bench",
+            "User-Agent": "NodeRS-real-host-bench",
             "Accept": "application/vnd.github+json",
         },
     )
@@ -400,7 +400,7 @@ def download_file(url: str, dest: pathlib.Path) -> pathlib.Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         return dest
-    request = urllib.request.Request(url, headers={"User-Agent": "NodeRS-AnyTLS-real-host-bench"})
+    request = urllib.request.Request(url, headers={"User-Agent": "NodeRS-real-host-bench"})
     with urllib.request.urlopen(request, timeout=60) as response:
         dest.write_bytes(response.read())
     return dest
@@ -454,10 +454,10 @@ def create_tag_source_archive(tag: str, out_path: pathlib.Path) -> pathlib.Path:
 
 
 def ensure_local_assets(*, sing_version: str) -> dict:
-    current_source_archive = create_current_source_archive(ASSETS / "noders-anytls-current-source.tar.gz")
+    current_source_archive = create_current_source_archive(ASSETS / "noders-current-source.tar.gz")
     baseline_source_archive = create_tag_source_archive(
         RELEASE_BASELINE_TAG,
-        ASSETS / f"noders-anytls-{RELEASE_BASELINE_TAG}-source.tar.gz",
+        ASSETS / f"noders-{RELEASE_BASELINE_TAG}-source.tar.gz",
     )
 
     requested = sing_version
@@ -1605,17 +1605,17 @@ tar -xzf {shlex.quote(server_root)}/run/current-source.tar.gz -C {shlex.quote(se
 tar -xzf {shlex.quote(server_root)}/run/baseline-source.tar.gz -C {shlex.quote(server_root)}/build/baseline
 
 cd {shlex.quote(server_root)}/build/current
-cargo build --release --locked --bin noders-anytls --bin bench_anytls
-cp target/release/noders-anytls {shlex.quote(server_root)}/bin/noders-anytls-current
+cargo build --release --locked --bin noders --bin bench_anytls
+cp target/release/noders {shlex.quote(server_root)}/bin/noders-current
 cp target/release/bench_anytls {shlex.quote(server_root)}/bin/bench_anytls
 
 cd {shlex.quote(server_root)}/build/baseline
-cargo build --release --locked --bin noders-anytls --bin bench_anytls
-cp target/release/noders-anytls {shlex.quote(server_root)}/bin/noders-anytls-baseline
+cargo build --release --locked --bin noders --bin bench_anytls
+cp target/release/noders {shlex.quote(server_root)}/bin/noders-baseline
 
 chmod +x \
-  {shlex.quote(server_root)}/bin/noders-anytls-current \
-  {shlex.quote(server_root)}/bin/noders-anytls-baseline \
+  {shlex.quote(server_root)}/bin/noders-current \
+  {shlex.quote(server_root)}/bin/noders-baseline \
   {shlex.quote(server_root)}/bin/bench_anytls
 """
     pid_path = f"{server_root}/run/build-binaries.pid"
@@ -1765,8 +1765,8 @@ chmod 600 {shlex.quote(server_root)}/config/tls.key
 
     start_bg(server_ssh, root=server_root, name="panel-current", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_current']} --server-port {PORTS['current']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_current"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="panel-baseline", cmd=f"python3 {server_root}/bin/mock_panel.py --listen 127.0.0.1:{PORTS['panel_baseline']} --server-port {PORTS['baseline']} --server-name {shlex.quote(server_name)} --users {shlex.quote(','.join(USERS))}", ready_host="127.0.0.1", ready_port=PORTS["panel_baseline"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="noders-current", cmd=f"{server_root}/bin/noders-anytls-current {server_root}/config/current.toml", ready_host="127.0.0.1", ready_port=PORTS["current"], ready_label="server")
-    start_bg(server_ssh, root=server_root, name="noders-baseline", cmd=f"{server_root}/bin/noders-anytls-baseline {server_root}/config/baseline.toml", ready_host="127.0.0.1", ready_port=PORTS["baseline"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="noders-current", cmd=f"{server_root}/bin/noders-current {server_root}/config/current.toml", ready_host="127.0.0.1", ready_port=PORTS["current"], ready_label="server")
+    start_bg(server_ssh, root=server_root, name="noders-baseline", cmd=f"{server_root}/bin/noders-baseline {server_root}/config/baseline.toml", ready_host="127.0.0.1", ready_port=PORTS["baseline"], ready_label="server")
     start_bg(server_ssh, root=server_root, name="sing-box", cmd=f"{server_root}/bin/sing-box run -c {server_root}/config/sing-box.json", ready_host="127.0.0.1", ready_port=PORTS["sing"], ready_label="server")
 
 

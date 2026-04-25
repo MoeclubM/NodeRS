@@ -265,7 +265,7 @@ def run_client(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a local Linux perf smoke benchmark for CI.")
-    parser.add_argument("--binary-dir", required=True, help="Directory containing noders-anytls and bench_anytls.")
+    parser.add_argument("--binary-dir", required=True, help="Directory containing noders and bench_anytls.")
     parser.add_argument("--output-dir", required=True, help="Directory for logs and JSON results.")
     parser.add_argument("--seconds", type=int, default=4)
     parser.add_argument("--parallel", type=int, default=4)
@@ -285,7 +285,7 @@ def main() -> int:
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    node_bin = resolve_binary(binary_dir, "noders-anytls")
+    node_bin = resolve_binary(binary_dir, "noders")
     bench_bin = resolve_binary(binary_dir, "bench_anytls")
     if not node_bin.exists() or not bench_bin.exists():
         raise FileNotFoundError(f"benchmark binaries missing under {binary_dir}")
@@ -318,8 +318,8 @@ def main() -> int:
             panel.start()
             node_proc = start_process(
                 [str(node_bin), str(config_path)],
-                output_dir / "noders-anytls.stdout.log",
-                output_dir / "noders-anytls.stderr.log",
+                output_dir / "noders.stdout.log",
+                output_dir / "noders.stderr.log",
             )
             processes.append(node_proc)
             wait_tcp("127.0.0.1", server_port)

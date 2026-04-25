@@ -1264,7 +1264,7 @@ async fn send_auth_preface(writer: &SharedWriter, user: &str) -> anyhow::Result<
 async fn send_settings(writer: &SharedWriter) -> anyhow::Result<()> {
     let lines = DEFAULT_PADDING_SCHEME.join("\n");
     let padding_md5 = hex::encode(Md5::digest(lines.as_bytes()));
-    let settings = format!("v=2\nclient=noders-anytls-bench/0.1\npadding-md5={padding_md5}");
+    let settings = format!("v=2\nclient=noders-bench/0.1\npadding-md5={padding_md5}");
     write_frame(writer, CMD_SETTINGS, 0, settings.as_bytes()).await
 }
 

@@ -8,8 +8,8 @@ PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
 SERVICE_NAME="noders"
-LEGACY_SERVICE_NAME="noders-anytls"
-SERVICE_USER="noders-anytls"
+LEGACY_SERVICE_NAME="${SERVICE_NAME}-anytls"
+SERVICE_USER="noders"
 VERSION="latest"
 NO_SERVICE=0
 UNINSTALL=0
@@ -171,9 +171,9 @@ detect_asset_suffix() {
 }
 
 release_layout_present() {
-  [[ -f "$SCRIPT_DIR/noders-anytls" ]] &&
+  [[ -f "$SCRIPT_DIR/noders" ]] &&
   [[ -f "$SCRIPT_DIR/config.example.toml" ]] &&
-  [[ -f "$SCRIPT_DIR/packaging/systemd/noders-anytls.service" ]] &&
+  [[ -f "$SCRIPT_DIR/packaging/systemd/noders.service" ]] &&
   [[ -f "$COMMON_LIB_PATH" ]]
 }
 
@@ -222,7 +222,7 @@ bootstrap_release() {
   local tag asset_suffix package_name archive_path package_root bundle_script
   tag="$(resolve_release_tag)"
   asset_suffix="$(detect_asset_suffix)"
-  package_name="noders-anytls-${tag}-${asset_suffix}"
+  package_name="noders-${tag}-${asset_suffix}"
   TMP_ROOT="$(mktemp -d)"
   archive_path="$TMP_ROOT/${package_name}.tar.gz"
 
@@ -271,7 +271,7 @@ load_common_or_bootstrap() {
 }
 
 ensure_directories() {
-  install -d "$PREFIX/bin" "$CONFIG_DIR" "$STATE_DIR" "$CONFIG_DIR/machines"
+  install -d "$PREFIX/bin" "$(support_root_dir)" "$CONFIG_DIR" "$STATE_DIR" "$CONFIG_DIR/machines"
 }
 
 render_service_file() {
@@ -279,7 +279,7 @@ render_service_file() {
   staging_dir="$1"
   target="$2"
   config_path="$3"
-  template="$staging_dir/packaging/systemd/noders-anytls.service"
+  template="$staging_dir/packaging/systemd/noders.service"
   [[ -f "$template" ]] || {
     echo "Missing service template at $template" >&2
     exit 1
@@ -289,7 +289,7 @@ render_service_file() {
     shell_path="/sbin/nologin"
   fi
   sed \
-    -e "s#__BINARY__#$PREFIX/bin/noders-anytls#g" \
+    -e "s#__BINARY__#$(runtime_binary_path)#g" \
     -e "s#__CONFIG__#$config_path#g" \
     -e "s#__STATE_DIR__#$STATE_DIR#g" \
     -e "s#__USER__#$SERVICE_USER#g" \
@@ -404,7 +404,7 @@ remove_all_nodes() {
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
-  rm -f "$PREFIX/bin/noders-anytls"
+  rm -f "$(runtime_binary_path)" "$PREFIX/bin/${SERVICE_NAME}-anytls"
   remove_management_support
   rm -rf "$CONFIG_DIR" "$STATE_DIR"
   if id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -453,7 +453,7 @@ print_summary() {
   local service_unit
   cat <<EOF
 Installed NodeRS
-  Binary: $PREFIX/bin/noders-anytls
+  Binary: $(runtime_binary_path)
   Manager: $PREFIX/bin/noders
   State:  $STATE_DIR
 EOF
@@ -471,8 +471,8 @@ install_from_bundle() {
   staging_dir="$1"
 
   ensure_directories
-  install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
   install_management_support "$staging_dir"
+  install -m 0755 "$staging_dir/noders" "$(runtime_binary_path)"
   write_xboard_configs "$staging_dir"
   install_service "$staging_dir"
   print_summary
