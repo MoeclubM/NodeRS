@@ -1,7 +1,10 @@
 use anyhow::{Context as _, anyhow, bail, ensure};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
@@ -30,6 +33,8 @@ const ATYP_IPV6: u8 = 0x03;
 
 const STREAM_CHUNK_LEN: usize = 8 * 1024;
 
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 type Sessions = Arc<Mutex<HashMap<u16, Arc<SessionEntry>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,7 @@ struct Frame {
 }
 
 struct SessionEntry {
+    generation: u64,
     kind: SessionKind,
     abort: AbortHandle,
 }
@@ -288,6 +294,7 @@ async fn open_tcp_session<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let generation = next_session_generation();
     let remote = transport::connect_tcp_destination(&destination, routing)
         .await
         .with_context(|| format!("connect VLESS mux TCP destination {destination}"))?;
@@ -310,14 +317,16 @@ where
             )
             .await
             .is_err();
-            let _ = take_session(&sessions, session_id);
-            if !control.is_cancelled() {
+            let finished_current =
+                take_session_if_generation_matches(&sessions, session_id, generation).is_some();
+            if finished_current && !control.is_cancelled() {
                 let _ = write_end_frame(&writer, session_id, has_error, &control).await;
             }
         }
     });
 
     Ok(Arc::new(SessionEntry {
+        generation,
         kind: SessionKind::Tcp {
             writer: remote_writer,
         },
@@ -336,6 +345,7 @@ async fn open_udp_session<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let generation = next_session_generation();
     let socket = Arc::new(transport::bind_udp_socket().await?);
     let session = UdpSession {
         socket: socket.clone(),
@@ -359,14 +369,16 @@ where
             )
             .await
             .is_err();
-            let _ = take_session(&sessions, session_id);
-            if !control.is_cancelled() {
+            let finished_current =
+                take_session_if_generation_matches(&sessions, session_id, generation).is_some();
+            if finished_current && !control.is_cancelled() {
                 let _ = write_end_frame(&writer, session_id, has_error, &control).await;
             }
         }
     });
 
     Ok(Arc::new(SessionEntry {
+        generation,
         kind: SessionKind::Udp(session),
         abort: task.abort_handle(),
     }))
@@ -833,6 +845,23 @@ fn take_session(sessions: &Sessions, session_id: u16) -> Option<Arc<SessionEntry
         .remove(&session_id)
 }
 
+fn take_session_if_generation_matches(
+    sessions: &Sessions,
+    session_id: u16,
+    generation: u64,
+) -> Option<Arc<SessionEntry>> {
+    let mut sessions = sessions.lock().expect("vless mux session map poisoned");
+    let current = sessions.get(&session_id)?;
+    if current.generation != generation {
+        return None;
+    }
+    sessions.remove(&session_id)
+}
+
+fn next_session_generation() -> u64 {
+    NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 async fn read_length_or_eof<R>(reader: &mut R, context: &str) -> anyhow::Result<Option<u16>>
 where
     R: AsyncRead + Unpin,
@@ -861,6 +890,25 @@ where
 mod tests {
     use super::*;
     use crate::accounting::Accounting;
+
+    async fn test_udp_session_entry(generation: u64) -> Arc<SessionEntry> {
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("bind UDP socket"),
+        );
+        let destination = SocksAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 53)));
+        let task = tokio::spawn(async {});
+        Arc::new(SessionEntry {
+            generation,
+            kind: SessionKind::Udp(UdpSession {
+                socket,
+                default_destination: destination,
+                destination_cache: Arc::new(Mutex::new(HashMap::new())),
+            }),
+            abort: task.abort_handle(),
+        })
+    }
 
     fn tcp_target(addr: SocketAddr) -> FrameTarget {
         FrameTarget {
@@ -933,6 +981,41 @@ mod tests {
             encoded.as_slice(),
             b"\0\x0c\0\x03\x02\x01\x02\0\x35\x01\x01\x02\x03\x04\0\x02ok"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_does_not_remove_reused_session_id() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let old_session = test_udp_session_entry(11).await;
+        let new_session = test_udp_session_entry(12).await;
+
+        insert_session(&sessions, 7, old_session);
+        insert_session(&sessions, 7, new_session.clone());
+
+        assert!(take_session_if_generation_matches(&sessions, 7, 11).is_none());
+        let current = get_session(&sessions, 7).expect("current session");
+        assert_eq!(current.generation, 12);
+
+        let removed = take_session_if_generation_matches(&sessions, 7, 12)
+            .expect("matching generation removed current session");
+        assert_eq!(removed.generation, 12);
+        assert!(get_session(&sessions, 7).is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_reports_not_current() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let old_session = test_udp_session_entry(21).await;
+        let new_session = test_udp_session_entry(22).await;
+
+        insert_session(&sessions, 9, old_session);
+        insert_session(&sessions, 9, new_session.clone());
+
+        let finished_current = take_session_if_generation_matches(&sessions, 9, 21).is_some();
+        assert!(!finished_current);
+
+        let current = get_session(&sessions, 9).expect("current session");
+        assert_eq!(current.generation, 22);
     }
 
     #[tokio::test]
