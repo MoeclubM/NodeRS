@@ -31,6 +31,9 @@ jobs:
       - name: Enforce pure Rust protocol implementation
         run: bash scripts/verify-pure-rust.sh
 
+      - name: Run management script tests
+        run: sudo -E bash scripts/test-management-script.sh
+
       - name: Run formatter check
         run: cargo fmt --check
 

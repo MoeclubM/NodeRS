@@ -97,6 +97,7 @@ pub struct FallbackConfig {
 struct FallbackTarget {
     #[serde(default)]
     server: String,
+    #[serde(deserialize_with = "crate::panel::deserialize_u16_from_number_or_string")]
     server_port: u16,
 }
 
@@ -1210,6 +1211,17 @@ mod tests {
             Some(443)
         );
         assert!(config.select(Some(b"http/1.1")).is_none());
+    }
+
+    #[test]
+    fn parses_fallback_string_port() {
+        let target = parse_fallback_target(&serde_json::json!({
+            "server": "127.0.0.1",
+            "server_port": "8080"
+        }))
+        .expect("parse fallback");
+
+        assert_eq!(target.server_port, 8080);
     }
 
     #[test]

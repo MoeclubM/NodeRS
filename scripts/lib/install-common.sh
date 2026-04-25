@@ -176,13 +176,31 @@ parse_args() {
 }
 
 validate_args() {
-  if [[ -n "$PANEL_API" || -n "$PANEL_KEY" || -n "$PANEL_MACHINE_ID" ]]; then
+  if [[ -n "$PANEL_API" || -n "$PANEL_KEY" ]]; then
     if [[ -z "$PANEL_API" || -z "$PANEL_KEY" || -z "$PANEL_MACHINE_ID" ]]; then
       echo "--api, --key and --machine-id must be provided together." >&2
       exit 1
     fi
     XBOARD_SPECS+=("$PANEL_API|$PANEL_KEY|$PANEL_MACHINE_ID")
+  elif [[ "$UNINSTALL" -eq 0 && -n "$PANEL_MACHINE_ID" ]]; then
+    echo "--api, --key and --machine-id must be provided together." >&2
+    exit 1
   fi
+
+  local spec spec_machine_id target_machine_id
+  for spec in "${XBOARD_SPECS[@]}"; do
+    IFS='|' read -r _ _ spec_machine_id <<<"$spec"
+    if [[ ! "$spec_machine_id" =~ ^[0-9]+$ ]]; then
+      printf 'machine_id must be a decimal integer: %q\n' "$spec_machine_id" >&2
+      exit 1
+    fi
+  done
+  for target_machine_id in "${TARGET_MACHINE_IDS[@]}"; do
+    if [[ ! "$target_machine_id" =~ ^[0-9]+$ ]]; then
+      printf 'machine_id must be a decimal integer: %q\n' "$target_machine_id" >&2
+      exit 1
+    fi
+  done
 
   if [[ "$UNINSTALL" -eq 1 ]]; then
     return
@@ -208,6 +226,34 @@ machine_instance_id() {
   machine_id="$2"
   panel_hash="$(printf '%s' "$panel_api" | cksum | awk '{print $1}')"
   printf '%s-%s\n' "$machine_id" "$panel_hash"
+}
+
+valid_managed_service_unit_name() {
+  local candidate
+  candidate="$1"
+  case "$candidate" in
+    "$SERVICE_NAME"|"$SERVICE_NAME"-*|"$LEGACY_SERVICE_NAME"|"$LEGACY_SERVICE_NAME"-*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [[ "$candidate" =~ ^[A-Za-z0-9_.:@-]+$ ]]
+}
+
+append_unique_service_unit() {
+  local candidate existing
+  candidate="$1"
+  if ! valid_managed_service_unit_name "$candidate"; then
+    printf 'Skipping invalid NodeRS service unit name: %q\n' "$candidate" >&2
+    return 0
+  fi
+  for existing in "${DISCOVERED_UNITS[@]}"; do
+    if [[ "$existing" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  DISCOVERED_UNITS+=("$candidate")
 }
 
 render_config_file() {
@@ -341,7 +387,18 @@ USAGE
 append_unique_unit() {
   local candidate existing
   candidate="$1"
-  for existing in "${DISCOVERED_UNITS[@]:-}"; do
+  case "$candidate" in
+    "$SERVICE_NAME"|"$SERVICE_NAME"-*|"$LEGACY_SERVICE_NAME"|"$LEGACY_SERVICE_NAME"-*)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  if [[ ! "$candidate" =~ ^[A-Za-z0-9_.:@-]+$ ]]; then
+    printf 'Skipping invalid NodeRS service unit name: %q\n' "$candidate" >&2
+    return 0
+  fi
+  for existing in "${DISCOVERED_UNITS[@]}"; do
     if [[ "$existing" == "$candidate" ]]; then
       return 0
     fi
