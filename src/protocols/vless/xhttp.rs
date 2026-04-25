@@ -204,7 +204,6 @@ impl Placement {
             other => Err(anyhow!("unsupported XHTTP {field} {other}")),
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
