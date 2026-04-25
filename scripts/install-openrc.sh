@@ -318,6 +318,7 @@ install_service() {
     stop_disable_unit "${SERVICE_NAME}-${machine_id}"
     if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
       stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+      stop_disable_unit "${LEGACY_SERVICE_NAME}-${instance_id}"
     fi
     render_service_file "$service_path" "$instance_id" "$config_path" "$service_user" "$service_group"
     INSTALLED_SERVICES+=("$service_unit")
@@ -372,6 +373,7 @@ remove_single_node() {
     stop_disable_unit "${SERVICE_NAME}-${machine_id}"
     if [[ "$LEGACY_SERVICE_NAME" != "$SERVICE_NAME" ]]; then
       stop_disable_unit "${LEGACY_SERVICE_NAME}-${machine_id}"
+      stop_disable_unit "${LEGACY_SERVICE_NAME}-${instance_id}"
     fi
     rm -f "$(legacy_node_config_path "$machine_id")"
   fi
@@ -490,6 +492,7 @@ install_from_bundle() {
   ensure_directories
   install_management_support "$staging_dir"
   install -m 0755 "$staging_dir/noders" "$(runtime_binary_path)"
+  rm -f "$PREFIX/bin/${SERVICE_NAME}-anytls"
   write_xboard_configs "$staging_dir"
   install_service
   print_summary

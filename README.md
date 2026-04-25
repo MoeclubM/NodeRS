@@ -145,7 +145,26 @@ tail -f /var/log/noders/noders-1-123456789.log
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-If an existing host still uses old `noders-<machine_id>` units, uninstall and reinstall to switch to the new `noders-<machine_id>-<api_hash>` instance names.
+`upgrade.sh` only supports hosts that already run the current `noders` runtime layout.
+
+### Migrate Legacy `noders-anytls` Installs
+
+If the host still uses the old `noders-anytls` binary or service layout, run the dedicated migration helper instead of `upgrade.sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/migrate-legacy-install.sh | bash -s --
+```
+
+The migration helper reads the existing machine configs under `/etc/noders/anytls/machines`, reinstalls the current `noders` runtime, and cleans up legacy artifacts such as:
+
+- `/usr/local/bin/noders-anytls`
+- `noders-anytls-<...>` service names
+- plain `noders-<machine_id>` units left from pre-hash installs
+- OpenRC `noders-anytls` user/group and `/run/noders-anytls` / `/var/log/noders-anytls` paths
+
+It also creates a backup under `/etc/noders/anytls/migration-backups/` before removing legacy config or service files.
+
+If an existing host already uses `noders` but still has old plain `noders-<machine_id>` units, reinstall or migrate once so the host switches to the hashed `noders-<machine_id>-<api_hash>` instance names.
 
 ## Uninstall
 
