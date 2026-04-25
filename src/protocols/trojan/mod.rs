@@ -267,13 +267,13 @@ impl ServerController {
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
         let should_reload = tls_materials.as_ref().is_none_or(|current| {
-            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+            !current.matches_source(&tls.source, tls.ech.as_ref(), None, &tls.alpn)
         });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
+        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), None, &tls.alpn)
             .await
             .context("load Trojan TLS materials")?;
         *self

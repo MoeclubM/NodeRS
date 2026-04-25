@@ -2,7 +2,7 @@ use anyhow::{Context, ensure};
 use base64::Engine as _;
 use boring::hpke::HpkeKey;
 use boring::pkey::PKey;
-use boring::ssl::{AlpnError, SslAcceptor, SslEchKeys, SslMethod};
+use boring::ssl::{AlpnError, SelectCertError, SslAcceptor, SslEchKeys, SslMethod};
 use boring::x509::X509;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use sha2::{Digest, Sha256};
@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::acme;
+
+pub use super::reality::RealityTlsConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TlsMaterialSource {
@@ -47,6 +49,7 @@ pub enum EchConfigSource {
 pub struct LoadedTlsMaterials {
     source: TlsMaterialSource,
     ech_source: Option<EchConfigSource>,
+    reality: Option<RealityTlsConfig>,
     alpn_protocols: Vec<String>,
     cert_digest: [u8; 32],
     key_digest: [u8; 32],
@@ -64,10 +67,12 @@ impl LoadedTlsMaterials {
         &self,
         source: &TlsMaterialSource,
         ech_source: Option<&EchConfigSource>,
+        reality: Option<&RealityTlsConfig>,
         alpn_protocols: &[String],
     ) -> bool {
         self.source == *source
             && self.ech_source.as_ref() == ech_source
+            && self.reality.as_ref() == reality
             && self.alpn_protocols == alpn_protocols
     }
 }
@@ -75,10 +80,12 @@ impl LoadedTlsMaterials {
 pub async fn load_tls_materials(
     source: &TlsMaterialSource,
     ech_source: Option<&EchConfigSource>,
+    reality: Option<&RealityTlsConfig>,
     alpn_protocols: &[String],
 ) -> anyhow::Result<LoadedTlsMaterials> {
     let source = source.clone();
     let ech_source = ech_source.cloned();
+    let reality = reality.cloned();
     let alpn_protocols = alpn_protocols.to_vec();
     let (cert_pem, key_pem) = load_source_materials(&source).await?;
     let ech_materials = match ech_source.as_ref() {
@@ -89,12 +96,14 @@ pub async fn load_tls_materials(
         cert_pem.clone(),
         key_pem.clone(),
         ech_materials.as_ref(),
+        reality.as_ref(),
         &alpn_protocols,
     )
     .await?;
     Ok(LoadedTlsMaterials {
         source,
         ech_source,
+        reality,
         alpn_protocols,
         cert_digest: digest(&cert_pem),
         key_digest: digest(&key_pem),
@@ -140,6 +149,7 @@ pub async fn reload_if_changed(
         cert_pem,
         key_pem,
         ech_materials.as_ref(),
+        materials.reality.as_ref(),
         &materials.alpn_protocols,
     )
     .await?;
@@ -230,9 +240,11 @@ async fn build_acceptor(
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
     ech_materials: Option<&(Vec<u8>, Option<Vec<u8>>)>,
+    reality: Option<&RealityTlsConfig>,
     alpn_protocols: &[String],
 ) -> anyhow::Result<Arc<SslAcceptor>> {
     let ech_materials = ech_materials.cloned();
+    let reality = reality.cloned();
     let alpn_wire = encode_alpn_protocols(alpn_protocols)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<SslAcceptor>> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
@@ -261,6 +273,19 @@ async fn build_acceptor(
             let ech_keys =
                 build_ech_keys(ech_key, ech_config.as_deref()).context("build ECH keys")?;
             builder.set_ech_keys(&ech_keys).context("set ECH keys")?;
+        }
+
+        if let Some(reality) = reality {
+            let cert_state = Arc::new(
+                super::reality::build_certificate_state().context("build REALITY certificate")?,
+            );
+            builder.set_select_certificate_callback(move |mut client_hello| {
+                super::reality::configure_certificate(&mut client_hello, &reality, &cert_state)
+                    .map_err(|error| {
+                        tracing::warn!(%error, "REALITY ClientHello rejected");
+                        SelectCertError::ERROR
+                    })
+            });
         }
 
         if !alpn_wire.is_empty() {
@@ -581,6 +606,7 @@ mod tests {
                 subject_alt_names: vec!["node.example.com".to_string()],
             },
             None,
+            None,
             &[],
         )
         .await
@@ -605,6 +631,7 @@ mod tests {
                 key: ech_key,
                 config: None,
             }),
+            None,
             &[],
         )
         .await
@@ -624,6 +651,7 @@ mod tests {
                 key: ech_key,
                 config: Some(ech_config),
             }),
+            None,
             &[],
         )
         .await
