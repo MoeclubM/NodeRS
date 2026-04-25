@@ -3024,9 +3024,11 @@ mod tests {
         })))
         .expect("parse config");
 
+        let download_config = config.clone();
+        let upload_config = config.clone();
         let (download_client, download_server) = duplex(16384);
         let download_task = tokio::spawn(async move {
-            let AcceptResult::Stream(mut stream) = accept(download_server, &config)
+            let AcceptResult::Stream(mut stream) = accept(download_server, &download_config)
                 .await
                 .expect("accept download")
             else {
@@ -3041,16 +3043,6 @@ mod tests {
             stream.shutdown().await.expect("shutdown response");
         });
 
-        let upload_config = XhttpConfig::from_network_settings(Some(&serde_json::json!({
-            "path": "/xhttp",
-            "host": "example.com",
-            "mode": "stream-up",
-            "extra": {
-                "xPaddingBytes": 2,
-                "scStreamUpServerSecs": 1
-            }
-        })))
-        .expect("parse upload config");
         let (upload_client, upload_server) = duplex(16384);
         let upload_task = tokio::spawn(async move {
             let result = accept(upload_server, &upload_config)
