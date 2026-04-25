@@ -261,7 +261,7 @@ discover_units() {
       /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service; do
       [[ -f "$unit_path" ]] || continue
       unit_name="$(basename "$unit_path" .service)"
-      DISCOVERED_UNITS+=("$unit_name")
+      append_unique_service_unit "$unit_name"
     done
     shopt -u nullglob
     return
@@ -279,7 +279,7 @@ discover_units() {
       /etc/init.d/${LEGACY_SERVICE_NAME}-*; do
       [[ -f "$service_path" ]] || continue
       unit_name="$(basename "$service_path")"
-      DISCOVERED_UNITS+=("$unit_name")
+      append_unique_service_unit "$unit_name"
     done
     shopt -u nullglob
   fi

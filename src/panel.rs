@@ -40,6 +40,7 @@ pub struct NodeConfigResponse {
     pub protocol: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub listen_ip: String,
+    #[serde(deserialize_with = "deserialize_u16_from_number_or_string")]
     pub server_port: u16,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub network: String,
@@ -210,7 +211,7 @@ pub struct NodeTlsSettings {
     #[serde(
         default,
         alias = "serverPort",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_default_u16_from_number_or_string"
     )]
     pub server_port: u16,
     #[serde(
@@ -242,7 +243,7 @@ pub struct NodeRealitySettings {
     #[serde(
         default,
         alias = "serverPort",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_default_u16_from_number_or_string"
     )]
     pub server_port: u16,
     #[serde(
@@ -1470,6 +1471,16 @@ fn value_to_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     }
 }
 
+fn value_to_u16(value: &serde_json::Value) -> Option<u16> {
+    match value {
+        serde_json::Value::Number(number) => {
+            number.as_u64().and_then(|value| u16::try_from(value).ok())
+        }
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn value_to_i64(value: Option<&serde_json::Value>) -> Option<i64> {
     match value? {
         serde_json::Value::Bool(value) => Some(i64::from(*value)),
@@ -1511,6 +1522,34 @@ where
     T: Deserialize<'de> + Default,
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+pub(crate) fn deserialize_u16_from_number_or_string<'de, D>(
+    deserializer: D,
+) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value_to_u16(&value).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "expected u16 number or decimal string, got {value}"
+        ))
+    })
+}
+
+fn deserialize_default_u16_from_number_or_string<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(value) => value_to_u16(&value).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "expected u16 number or decimal string, got {value}"
+            ))
+        }),
+        None => Ok(0),
+    }
 }
 
 fn deserialize_string_list_on_null<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -1710,6 +1749,26 @@ mod tests {
                 .cert_mode(),
             "file"
         );
+    }
+
+    #[test]
+    fn accepts_string_ports_in_node_config_response() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "listen_ip": "0.0.0.0",
+            "server_port": "443",
+            "tls_settings": {
+                "serverPort": "8443"
+            },
+            "reality_settings": {
+                "server_port": "7443"
+            }
+        }))
+        .expect("parse config");
+
+        assert_eq!(config.server_port, 443);
+        assert_eq!(config.tls_settings.server_port, 8443);
+        assert_eq!(config.reality_settings.server_port, 7443);
     }
 
     #[test]
