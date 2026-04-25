@@ -1,8 +1,8 @@
+mod aead2022;
 mod crypto;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
@@ -12,13 +12,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 
-use crate::accounting::{Accounting, SessionControl, SessionLease};
+use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser};
 
-use self::crypto::{
-    AcceptedTcpReader, DecodedUdpPacket, Method, UserCredential, decode_udp_packet,
-    encode_udp_packet,
-};
+use self::crypto::{Method, UserCredential, decode_udp_packet, encode_udp_packet};
 use super::anytls::{
     bind_listeners, bind_udp_sockets, configure_tcp_stream, effective_listen_ip, routing,
     socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
@@ -33,6 +30,7 @@ pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
     pub method: Method,
+    pub server_key: String,
     pub networks: EnabledNetworks,
     pub routing: routing::RoutingTable,
 }
@@ -48,7 +46,9 @@ pub struct ServerController {
     panel_users: Arc<RwLock<Vec<PanelUser>>>,
     users: Arc<RwLock<Vec<UserCredential>>>,
     method: Arc<RwLock<Option<Method>>>,
+    server_key: Arc<RwLock<String>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
+    tcp_replay: Arc<aead2022::TcpReplayCache>,
     inner: Mutex<Option<RunningServer>>,
 }
 
@@ -65,25 +65,13 @@ struct UdpSession {
     outbound: Arc<UdpSocket>,
     credential: UserCredential,
     client_addr: Arc<Mutex<SocketAddr>>,
+    aead2022: Option<Mutex<aead2022::UdpSession>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq)]
-struct UdpSessionKey {
-    client: SocketAddr,
-    uid: i64,
-}
-
-impl PartialEq for UdpSessionKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.client == other.client && self.uid == other.uid
-    }
-}
-
-impl Hash for UdpSessionKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.client.hash(state);
-        self.uid.hash(state);
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum UdpSessionKey {
+    Legacy { client: SocketAddr, uid: i64 },
+    Aead2022 { session_id: u64, uid: i64 },
 }
 
 impl EffectiveNodeConfig {
@@ -94,6 +82,7 @@ impl EffectiveNodeConfig {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
             method,
+            server_key: remote.server_key.trim().to_string(),
             networks: parse_networks(&remote.network)?,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
@@ -118,7 +107,9 @@ impl ServerController {
             panel_users: Arc::new(RwLock::new(Vec::new())),
             users: Arc::new(RwLock::new(Vec::new())),
             method: Arc::new(RwLock::new(None)),
+            server_key: Arc::new(RwLock::new(String::new())),
             routing: Arc::new(RwLock::new(routing::RoutingTable::default())),
+            tcp_replay: Arc::new(aead2022::TcpReplayCache::default()),
             inner: Mutex::new(None),
         }
     }
@@ -136,7 +127,12 @@ impl ServerController {
             .expect("shadowsocks method lock poisoned")
             .clone();
         if let Some(method) = method {
-            let credentials = build_users(&method, users)?;
+            let server_key = self
+                .server_key
+                .read()
+                .expect("shadowsocks server key lock poisoned")
+                .clone();
+            let credentials = build_users(&method, &server_key, users)?;
             *self.users.write().expect("shadowsocks users lock poisoned") = credentials;
         }
         Ok(())
@@ -148,12 +144,16 @@ impl ServerController {
             .read()
             .expect("shadowsocks panel users lock poisoned")
             .clone();
-        let credentials = build_users(&config.method, &panel_users)?;
+        let credentials = build_users(&config.method, &config.server_key, &panel_users)?;
         *self.users.write().expect("shadowsocks users lock poisoned") = credentials;
         *self
             .method
             .write()
             .expect("shadowsocks method lock poisoned") = Some(config.method.clone());
+        *self
+            .server_key
+            .write()
+            .expect("shadowsocks server key lock poisoned") = config.server_key;
         *self
             .routing
             .write()
@@ -194,8 +194,9 @@ impl ServerController {
                 let accounting = self.accounting.clone();
                 let users = self.users.clone();
                 let routing = self.routing.clone();
+                let tcp_replay = self.tcp_replay.clone();
                 handles.push(tokio::spawn(async move {
-                    accept_tcp_loop(listener, accounting, users, routing).await;
+                    accept_tcp_loop(listener, accounting, users, routing, tcp_replay).await;
                 }));
             }
         }
@@ -262,6 +263,7 @@ async fn accept_tcp_loop(
     accounting: Arc<Accounting>,
     users: Arc<RwLock<Vec<UserCredential>>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
+    tcp_replay: Arc<aead2022::TcpReplayCache>,
 ) {
     let listen = listener
         .local_addr()
@@ -279,6 +281,7 @@ async fn accept_tcp_loop(
         let accounting = accounting.clone();
         let users = users.clone();
         let routing = routing.clone();
+        let tcp_replay = tcp_replay.clone();
         tokio::spawn(async move {
             let users = users
                 .read()
@@ -289,7 +292,7 @@ async fn accept_tcp_loop(
                 .expect("shadowsocks routing lock poisoned")
                 .clone();
             if let Err(error) =
-                serve_tcp_connection(stream, source, accounting, users, routing).await
+                serve_tcp_connection(stream, source, accounting, users, routing, tcp_replay).await
             {
                 warn!(%error, %source, "Shadowsocks TCP session terminated with error");
             }
@@ -303,18 +306,46 @@ async fn serve_tcp_connection(
     accounting: Arc<Accounting>,
     users: Vec<UserCredential>,
     routing: routing::RoutingTable,
+    tcp_replay: Arc<aead2022::TcpReplayCache>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = split(stream);
-    let accepted = timeout(
-        TCP_HANDSHAKE_TIMEOUT,
-        AcceptedTcpReader::accept(reader, &users),
-    )
-    .await;
-    let accepted = match accepted {
-        Ok(result) => result?,
-        Err(_) => bail!("Shadowsocks TCP authentication timed out"),
+    enum AcceptedReader<R> {
+        Legacy(crypto::AcceptedTcpReader<R>),
+        Aead2022(aead2022::AcceptedTcpReader<R>, aead2022::TcpResponseContext),
+    }
+
+    let accepted = match users.first().map(|user| user.method.clone()) {
+        Some(Method::Aead2022(_)) => match timeout(
+            TCP_HANDSHAKE_TIMEOUT,
+            aead2022::AcceptedTcpReader::accept(reader, &users, &tcp_replay),
+        )
+        .await
+        {
+            Ok(result) => {
+                let accepted = result?;
+                let response_context = accepted.response_context();
+                AcceptedReader::Aead2022(accepted, response_context)
+            }
+            Err(_) => bail!("Shadowsocks TCP authentication timed out"),
+        },
+        _ => match timeout(
+            TCP_HANDSHAKE_TIMEOUT,
+            crypto::AcceptedTcpReader::accept(reader, &users),
+        )
+        .await
+        {
+            Ok(result) => AcceptedReader::Legacy(result?),
+            Err(_) => bail!("Shadowsocks TCP authentication timed out"),
+        },
     };
-    let credential = accepted.credential().clone();
+    let credential = match &accepted {
+        AcceptedReader::Legacy(accepted) => accepted.credential().clone(),
+        AcceptedReader::Aead2022(accepted, _) => accepted.credential().clone(),
+    };
+    let response_context = match &accepted {
+        AcceptedReader::Aead2022(_, response_context) => Some(response_context.clone()),
+        AcceptedReader::Legacy(_) => None,
+    };
     let lease = accounting.open_session(&credential.user, source)?;
     let control = lease.control();
     let upload = TrafficRecorder::upload(accounting.clone(), credential.user.id);
@@ -323,15 +354,42 @@ async fn serve_tcp_connection(
     let (mut client_plain_reader, client_plain_writer) = tokio::io::duplex(COPY_BUFFER_LEN);
     let (server_plain_reader, mut server_plain_writer) = tokio::io::duplex(COPY_BUFFER_LEN);
 
-    let decrypt_task = tokio::spawn({
-        let control = control.clone();
-        async move { accepted.pump_to_plain(client_plain_writer, control).await }
-    });
-    let encrypt_task = tokio::spawn({
-        let control = control.clone();
-        let credential = credential.clone();
-        async move { crypto::pump_plain_to_tcp(&credential, server_plain_reader, writer, control).await }
-    });
+    let decrypt_task = match accepted {
+        AcceptedReader::Legacy(accepted) => tokio::spawn({
+            let control = control.clone();
+            async move { accepted.pump_to_plain(client_plain_writer, control).await }
+        }),
+        AcceptedReader::Aead2022(accepted, _) => tokio::spawn({
+            let control = control.clone();
+            async move { accepted.pump_to_plain(client_plain_writer, control).await }
+        }),
+    };
+    let encrypt_task = match &credential.method {
+        Method::Aead2022(_) => {
+            let control = control.clone();
+            let credential = credential.clone();
+            let response_context = response_context
+                .clone()
+                .expect("Shadowsocks 2022 response context missing");
+            tokio::spawn(async move {
+                aead2022::pump_plain_to_tcp(
+                    &credential,
+                    &response_context,
+                    server_plain_reader,
+                    writer,
+                    control,
+                )
+                .await
+            })
+        }
+        _ => tokio::spawn({
+            let control = control.clone();
+            let credential = credential.clone();
+            async move {
+                crypto::pump_plain_to_tcp(&credential, server_plain_reader, writer, control).await
+            }
+        }),
+    };
 
     let destination = match SocksAddr::read_from(&mut client_plain_reader).await {
         Ok(destination) => destination,
@@ -434,64 +492,123 @@ async fn handle_udp_request(
     routing: routing::RoutingTable,
     sessions: Arc<AsyncMutex<HashMap<UdpSessionKey, Arc<UdpSession>>>>,
 ) -> anyhow::Result<()> {
-    let decoded = decode_udp_packet(packet, &users).context("decode Shadowsocks UDP packet")?;
-    let session = get_or_create_udp_session(
-        inbound_socket.clone(),
-        source,
-        &decoded,
-        accounting.clone(),
-        sessions,
-    )
-    .await?;
-    *session
-        .client_addr
-        .lock()
-        .expect("shadowsocks UDP client addr lock poisoned") = source;
+    let method = users
+        .first()
+        .map(|user| user.method.clone())
+        .ok_or_else(|| anyhow!("no Shadowsocks users configured"))?;
 
-    let target = transport::resolve_destination(&decoded.destination, &routing, "udp")
+    let (credential, destination, payload, wire_len, session) = match method {
+        Method::Aead2022(_) => {
+            let identified = aead2022::identify_udp_request(packet, &users)
+                .context("identify Shadowsocks 2022 UDP packet")?;
+            let session = get_or_create_udp_session(
+                inbound_socket.clone(),
+                source,
+                &identified.credential,
+                accounting.clone(),
+                sessions,
+                UdpSessionKey::Aead2022 {
+                    session_id: identified.client_session_id,
+                    uid: identified.credential.user.id,
+                },
+                Some(aead2022::UdpSession::new(&identified)?),
+            )
+            .await?;
+            *session
+                .client_addr
+                .lock()
+                .expect("shadowsocks UDP client addr lock poisoned") = source;
+            let decoded = {
+                let mut codec = session
+                    .aead2022
+                    .as_ref()
+                    .expect("Shadowsocks 2022 UDP session missing codec")
+                    .lock()
+                    .expect("Shadowsocks 2022 UDP codec lock poisoned");
+                aead2022::decode_udp_request_body(packet, &identified, &mut codec)
+                    .context("decode Shadowsocks 2022 UDP packet")?
+            };
+            (
+                identified.credential,
+                decoded.destination,
+                decoded.payload,
+                decoded.wire_len,
+                session,
+            )
+        }
+        _ => {
+            let decoded =
+                decode_udp_packet(packet, &users).context("decode Shadowsocks UDP packet")?;
+            let session = get_or_create_udp_session(
+                inbound_socket.clone(),
+                source,
+                &decoded.credential,
+                accounting.clone(),
+                sessions,
+                UdpSessionKey::Legacy {
+                    client: source,
+                    uid: decoded.credential.user.id,
+                },
+                None,
+            )
+            .await?;
+            *session
+                .client_addr
+                .lock()
+                .expect("shadowsocks UDP client addr lock poisoned") = source;
+            (
+                decoded.credential,
+                decoded.destination,
+                decoded.payload,
+                decoded.wire_len,
+                session,
+            )
+        }
+    };
+
+    let target = transport::resolve_destination(&destination, &routing, "udp")
         .await?
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("no UDP addresses resolved for {}", decoded.destination))?;
+        .ok_or_else(|| anyhow!("no UDP addresses resolved for {}", destination))?;
     let target = transport::normalize_udp_target(&session.outbound, target);
     let sent = session
         .outbound
-        .send_to(&decoded.payload, target)
+        .send_to(&payload, target)
         .await
         .with_context(|| format!("send Shadowsocks UDP payload to {target}"))?;
     ensure!(
-        sent == decoded.payload.len(),
+        sent == payload.len(),
         "short Shadowsocks UDP send: expected {}, wrote {}",
-        decoded.payload.len(),
+        payload.len(),
         sent
     );
-    TrafficRecorder::upload(accounting, decoded.credential.user.id).record(decoded.wire_len as u64);
+    TrafficRecorder::upload(accounting, credential.user.id).record(wire_len as u64);
     Ok(())
 }
 
 async fn get_or_create_udp_session(
     inbound_socket: Arc<UdpSocket>,
     source: SocketAddr,
-    decoded: &DecodedUdpPacket,
+    credential: &UserCredential,
     accounting: Arc<Accounting>,
     sessions: Arc<AsyncMutex<HashMap<UdpSessionKey, Arc<UdpSession>>>>,
+    key: UdpSessionKey,
+    aead2022_session: Option<aead2022::UdpSession>,
 ) -> anyhow::Result<Arc<UdpSession>> {
-    let key = UdpSessionKey {
-        client: source,
-        uid: decoded.credential.user.id,
-    };
     let mut guard = sessions.lock().await;
     if let Some(session) = guard.get(&key) {
         return Ok(session.clone());
     }
 
     let outbound = Arc::new(transport::bind_udp_socket().await?);
-    let lease = accounting.open_session(&decoded.credential.user, source)?;
+    let lease = accounting.open_session(&credential.user, source)?;
     let session = Arc::new(UdpSession {
         _lease: lease,
         outbound: outbound.clone(),
-        credential: decoded.credential.clone(),
+        credential: credential.clone(),
         client_addr: Arc::new(Mutex::new(source)),
+        aead2022: aead2022_session.map(Mutex::new),
     });
     guard.insert(key, session.clone());
     drop(guard);
@@ -532,15 +649,35 @@ async fn run_udp_session(
             .client_addr
             .lock()
             .expect("shadowsocks UDP client addr lock poisoned");
-        let encoded = match encode_udp_packet(
-            &session.credential,
-            &SocksAddr::Ip(transport::normalize_udp_source(source)),
-            &buffer[..size],
-        ) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                warn!(%error, uid = session.credential.user.id, "encode Shadowsocks UDP response failed");
-                break;
+        let encoded = if matches!(session.credential.method, Method::Aead2022(_)) {
+            let mut codec = session
+                .aead2022
+                .as_ref()
+                .expect("Shadowsocks 2022 UDP session missing codec")
+                .lock()
+                .expect("Shadowsocks 2022 UDP codec lock poisoned");
+            match aead2022::encode_udp_response(
+                &mut codec,
+                &SocksAddr::Ip(transport::normalize_udp_source(source)),
+                &buffer[..size],
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    warn!(%error, uid = session.credential.user.id, "encode Shadowsocks 2022 UDP response failed");
+                    break;
+                }
+            }
+        } else {
+            match encode_udp_packet(
+                &session.credential,
+                &SocksAddr::Ip(transport::normalize_udp_source(source)),
+                &buffer[..size],
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    warn!(%error, uid = session.credential.user.id, "encode Shadowsocks UDP response failed");
+                    break;
+                }
             }
         };
         let target = transport::normalize_udp_target(&inbound_socket, client_addr);
@@ -601,11 +738,34 @@ where
     }
 }
 
-fn build_users(method: &Method, users: &[PanelUser]) -> anyhow::Result<Vec<UserCredential>> {
-    let credentials = users
-        .iter()
-        .map(|user| UserCredential::from_panel_user(user, method.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
+fn build_users(
+    method: &Method,
+    server_key: &str,
+    users: &[PanelUser],
+) -> anyhow::Result<Vec<UserCredential>> {
+    let credentials = match method {
+        Method::Aead2022(kind) => {
+            let server_secret = aead2022::decode_server_psk(server_key, *kind)
+                .context("decode Shadowsocks 2022 server_key")?;
+            users
+                .iter()
+                .map(|user| {
+                    let secret = aead2022::derive_user_psk(user, *kind)?;
+                    Ok(UserCredential {
+                        user: UserEntry::from_panel_user(user),
+                        method: method.clone(),
+                        identity_hash: aead2022::identity_hash(&secret),
+                        server_secret: server_secret.clone(),
+                        secret,
+                    })
+                })
+                .collect::<Result<Vec<_>, anyhow::Error>>()?
+        }
+        _ => users
+            .iter()
+            .map(|user| UserCredential::from_panel_user(user, method.clone()))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     if method.is_none() {
         ensure!(
@@ -630,10 +790,15 @@ fn parse_method(remote: &NodeConfigResponse) -> anyhow::Result<Method> {
     if cipher.is_empty() {
         bail!("XBoard cipher is required for Shadowsocks nodes");
     }
-    if cipher.starts_with("2022-") {
-        bail!("Shadowsocks 2022 methods are not implemented yet: {cipher}");
+    let method =
+        Method::parse(cipher).ok_or_else(|| anyhow!("unsupported Shadowsocks cipher {cipher}"))?;
+    if matches!(method, Method::Aead2022(_)) {
+        ensure!(
+            !remote.server_key.trim().is_empty(),
+            "XBoard server_key is required for Shadowsocks 2022 nodes"
+        );
     }
-    Method::parse(cipher).ok_or_else(|| anyhow!("unsupported Shadowsocks cipher {cipher}"))
+    Ok(method)
 }
 
 fn parse_networks(network: &str) -> anyhow::Result<EnabledNetworks> {
@@ -729,6 +894,7 @@ mod tests {
     fn builds_users_from_password_or_uuid() {
         let users = build_users(
             &Method::Legacy(crypto::LegacyAeadMethod::Aes128Gcm),
+            "",
             &[
                 PanelUser {
                     id: 1,
@@ -744,5 +910,16 @@ mod tests {
         )
         .expect("users");
         assert_eq!(users.len(), 2);
+    }
+
+    #[test]
+    fn accepts_shadowsocks_2022_with_server_key() {
+        let remote = NodeConfigResponse {
+            cipher: "2022-blake3-aes-128-gcm".to_string(),
+            server_key: "QUJDREVGR0hJSktMTU5PUA==".to_string(),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.method, Method::Aead2022(_)));
     }
 }

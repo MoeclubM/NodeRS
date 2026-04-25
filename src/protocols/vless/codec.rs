@@ -9,6 +9,8 @@ const ADDONS_LEN_NONE: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
 const CMD_MUX: u8 = 0x03;
+pub const XUDP_MUX_DESTINATION: &str = "v1.mux.cool";
+pub const XUDP_MUX_PORT: u16 = 666;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
@@ -17,13 +19,21 @@ const ATYP_IPV6: u8 = 0x03;
 pub enum Command {
     Tcp,
     Udp,
+    Mux,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub user: [u8; 16],
+    pub addons: Addons,
     pub command: Command,
     pub destination: SocksAddr,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Addons {
+    pub flow: String,
+    pub seed: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,21 +53,22 @@ where
     read_exact_recorded(reader, &mut user, consumed, "read VLESS user uuid").await?;
 
     let addons_len = read_u8_recorded(reader, consumed, "read VLESS addons length").await?;
-    ensure!(
-        addons_len == ADDONS_LEN_NONE,
-        "VLESS addons are not supported"
-    );
+    let addons = read_addons_recorded(reader, consumed, addons_len).await?;
 
     let command = match read_u8_recorded(reader, consumed, "read VLESS command").await? {
         CMD_TCP => Command::Tcp,
         CMD_UDP => Command::Udp,
-        CMD_MUX => bail!("VLESS mux is not supported"),
+        CMD_MUX => Command::Mux,
         other => bail!("unsupported VLESS command {other:#x}"),
     };
 
-    let destination = read_destination_recorded(reader, consumed).await?;
+    let destination = match command {
+        Command::Mux => SocksAddr::Domain(XUDP_MUX_DESTINATION.to_string(), XUDP_MUX_PORT),
+        Command::Tcp | Command::Udp => read_destination_recorded(reader, consumed).await?,
+    };
     Ok(Request {
         user,
+        addons,
         command,
         destination,
     })
@@ -153,6 +164,99 @@ where
     }
 }
 
+async fn read_addons_recorded<R>(
+    reader: &mut R,
+    consumed: &mut Vec<u8>,
+    addons_len: u8,
+) -> anyhow::Result<Addons>
+where
+    R: AsyncRead + Unpin,
+{
+    if addons_len == ADDONS_LEN_NONE {
+        return Ok(Addons::default());
+    }
+
+    let mut encoded = vec![0u8; addons_len as usize];
+    read_exact_recorded(reader, &mut encoded, consumed, "read VLESS addons payload").await?;
+    decode_addons(&encoded)
+}
+
+fn decode_addons(encoded: &[u8]) -> anyhow::Result<Addons> {
+    let mut addons = Addons::default();
+    let mut cursor = 0usize;
+
+    while cursor < encoded.len() {
+        let key = read_varint(encoded, &mut cursor).context("read VLESS addons field key")?;
+        let field_number = key >> 3;
+        let wire_type = key & 0x07;
+        match (field_number, wire_type) {
+            (1, 2) => {
+                let value = read_length_delimited(encoded, &mut cursor)
+                    .context("read VLESS addons flow")?;
+                addons.flow =
+                    String::from_utf8(value.to_vec()).context("decode VLESS addons flow")?;
+            }
+            (2, 2) => {
+                let value = read_length_delimited(encoded, &mut cursor)
+                    .context("read VLESS addons seed")?;
+                addons.seed = value.to_vec();
+            }
+            (_, 0) => {
+                let _ = read_varint(encoded, &mut cursor).context("skip VLESS addons varint")?;
+            }
+            (_, 1) => {
+                ensure!(
+                    cursor + 8 <= encoded.len(),
+                    "truncated VLESS addons fixed64 field"
+                );
+                cursor += 8;
+            }
+            (_, 2) => {
+                let _ = read_length_delimited(encoded, &mut cursor)
+                    .context("skip VLESS addons length-delimited field")?;
+            }
+            (_, 5) => {
+                ensure!(
+                    cursor + 4 <= encoded.len(),
+                    "truncated VLESS addons fixed32 field"
+                );
+                cursor += 4;
+            }
+            _ => bail!("unsupported VLESS addons wire type {wire_type}"),
+        }
+    }
+
+    Ok(addons)
+}
+
+fn read_varint(encoded: &[u8], cursor: &mut usize) -> anyhow::Result<u64> {
+    let mut shift = 0u32;
+    let mut value = 0u64;
+    loop {
+        ensure!(*cursor < encoded.len(), "truncated VLESS addons varint");
+        let byte = encoded[*cursor];
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        ensure!(shift < 64, "VLESS addons varint is too large");
+    }
+}
+
+fn read_length_delimited<'a>(encoded: &'a [u8], cursor: &mut usize) -> anyhow::Result<&'a [u8]> {
+    let len = read_varint(encoded, cursor).context("read VLESS addons length")?;
+    let len = usize::try_from(len).context("VLESS addons length does not fit usize")?;
+    ensure!(
+        *cursor + len <= encoded.len(),
+        "truncated VLESS addons payload"
+    );
+    let start = *cursor;
+    *cursor += len;
+    Ok(&encoded[start..start + len])
+}
+
 async fn read_u8_recorded<R>(
     reader: &mut R,
     consumed: &mut Vec<u8>,
@@ -221,6 +325,7 @@ mod tests {
             .await
             .expect("read request");
         assert_eq!(request.user, USER_UUID);
+        assert_eq!(request.addons, Addons::default());
         assert_eq!(request.command, Command::Tcp);
         assert_eq!(
             request.destination,
@@ -242,6 +347,7 @@ mod tests {
         let request = read_request(&mut bytes.as_slice(), &mut Vec::new())
             .await
             .expect("read request");
+        assert_eq!(request.addons, Addons::default());
         assert_eq!(request.command, Command::Udp);
         assert_eq!(
             request.destination,
@@ -250,11 +356,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_nonzero_addons_len() {
+    async fn reads_addons_flow_and_seed() {
         let mut bytes = Vec::new();
         bytes.push(VERSION);
         bytes.extend_from_slice(&USER_UUID);
-        bytes.push(1);
+        let addons = [
+            0x0a, 0x10, b'x', b't', b'l', b's', b'-', b'r', b'p', b'r', b'x', b'-', b'v', b'i',
+            b's', b'i', b'o', b'n', 0x12, 0x03, 0x01, 0x02, 0x03,
+        ];
+        bytes.push(addons.len() as u8);
+        bytes.extend_from_slice(&addons);
+        bytes.push(CMD_TCP);
+        bytes.extend_from_slice(&443u16.to_be_bytes());
+        bytes.push(ATYP_DOMAIN);
+        bytes.push(11);
+        bytes.extend_from_slice(b"example.com");
+
+        let request = read_request(&mut bytes.as_slice(), &mut Vec::new())
+            .await
+            .expect("addons should parse");
+        assert_eq!(request.addons.flow, "xtls-rprx-vision");
+        assert_eq!(request.addons.seed, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_addons_payload() {
+        let mut bytes = Vec::new();
+        bytes.push(VERSION);
+        bytes.extend_from_slice(&USER_UUID);
+        bytes.push(2);
+        bytes.push(0x0a);
 
         let error = read_request(&mut bytes.as_slice(), &mut Vec::new())
             .await
@@ -263,21 +394,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_mux_command() {
+    async fn reads_vless_mux_request() {
         let mut bytes = Vec::new();
         bytes.push(VERSION);
         bytes.extend_from_slice(&USER_UUID);
         bytes.push(0);
         bytes.push(CMD_MUX);
-        bytes.extend_from_slice(&443u16.to_be_bytes());
-        bytes.push(ATYP_DOMAIN);
-        bytes.push(11);
-        bytes.extend_from_slice(b"example.com");
 
-        let error = read_request(&mut bytes.as_slice(), &mut Vec::new())
+        let request = read_request(&mut bytes.as_slice(), &mut Vec::new())
             .await
-            .expect_err("mux should be rejected");
-        assert!(error.to_string().contains("mux"));
+            .expect("read mux request");
+        assert_eq!(request.addons, Addons::default());
+        assert_eq!(request.command, Command::Mux);
+        assert_eq!(
+            request.destination,
+            SocksAddr::Domain(XUDP_MUX_DESTINATION.to_string(), XUDP_MUX_PORT)
+        );
     }
 
     #[tokio::test]

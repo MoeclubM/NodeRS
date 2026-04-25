@@ -24,6 +24,7 @@ const ATYP_IPV6: u8 = 0x04;
 pub enum Method {
     None,
     Legacy(LegacyAeadMethod),
+    Aead2022(Aead2022Method),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,11 +36,19 @@ pub enum LegacyAeadMethod {
     XChaCha20Poly1305,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Aead2022Method {
+    Aes128Gcm,
+    Aes256Gcm,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserCredential {
     pub user: UserEntry,
     pub method: Method,
     pub(crate) secret: Vec<u8>,
+    pub(crate) server_secret: Vec<u8>,
+    pub(crate) identity_hash: [u8; 16],
 }
 
 pub struct AcceptedTcpReader<R> {
@@ -87,6 +96,10 @@ impl Method {
             Some(Self::Legacy(LegacyAeadMethod::ChaCha20Poly1305))
         } else if cipher.eq_ignore_ascii_case("xchacha20-ietf-poly1305") {
             Some(Self::Legacy(LegacyAeadMethod::XChaCha20Poly1305))
+        } else if cipher.eq_ignore_ascii_case("2022-blake3-aes-128-gcm") {
+            Some(Self::Aead2022(Aead2022Method::Aes128Gcm))
+        } else if cipher.eq_ignore_ascii_case("2022-blake3-aes-256-gcm") {
+            Some(Self::Aead2022(Aead2022Method::Aes256Gcm))
         } else {
             None
         }
@@ -100,6 +113,7 @@ impl Method {
         match self {
             Self::None => 0,
             Self::Legacy(kind) => kind.salt_len(),
+            Self::Aead2022(kind) => kind.key_len(),
         }
     }
 }
@@ -127,6 +141,15 @@ impl LegacyAeadMethod {
     }
 }
 
+impl Aead2022Method {
+    pub(crate) fn key_len(self) -> usize {
+        match self {
+            Self::Aes128Gcm => 16,
+            Self::Aes256Gcm => 32,
+        }
+    }
+}
+
 impl UserCredential {
     pub fn from_panel_user(user: &PanelUser, method: Method) -> anyhow::Result<Self> {
         let password = effective_password(user)
@@ -134,6 +157,8 @@ impl UserCredential {
         Ok(Self {
             user: UserEntry::from_panel_user(user),
             secret: derive_secret(&method, password)?,
+            server_secret: Vec::new(),
+            identity_hash: [0u8; 16],
             method,
         })
     }
@@ -392,6 +417,7 @@ where
                 }
             }
         }
+        Method::Aead2022(_) => bail!("Shadowsocks 2022 TCP encoder must be handled separately"),
     }
 }
 
@@ -461,6 +487,7 @@ pub fn encode_udp_packet(
             encoded.extend_from_slice(&ciphertext);
             Ok(encoded)
         }
+        Method::Aead2022(_) => bail!("Shadowsocks 2022 UDP encoder must be handled separately"),
     }
 }
 
@@ -480,6 +507,9 @@ fn derive_secret(method: &Method, password: &str) -> anyhow::Result<Vec<u8>> {
     Ok(match method {
         Method::None => Vec::new(),
         Method::Legacy(kind) => password_to_cipher_key(password.as_bytes(), kind.key_len()),
+        Method::Aead2022(_) => {
+            bail!("Shadowsocks 2022 users must be built with explicit server/user keys")
+        }
     })
 }
 
@@ -662,13 +692,13 @@ fn payload_len_with_tag(payload_len: usize) -> usize {
     payload_len + LEGACY_TAG_LEN
 }
 
-fn random_bytes(len: usize) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn random_bytes(len: usize) -> anyhow::Result<Vec<u8>> {
     let mut bytes = vec![0u8; len];
     boring::rand::rand_bytes(&mut bytes).context("generate random bytes")?;
     Ok(bytes)
 }
 
-fn parse_socks_addr(packet: &[u8]) -> anyhow::Result<(SocksAddr, usize)> {
+pub(crate) fn parse_socks_addr(packet: &[u8]) -> anyhow::Result<(SocksAddr, usize)> {
     ensure!(!packet.is_empty(), "missing Shadowsocks address type");
     match packet[0] {
         ATYP_IPV4 => {
@@ -703,7 +733,10 @@ fn parse_socks_addr(packet: &[u8]) -> anyhow::Result<(SocksAddr, usize)> {
     }
 }
 
-fn write_socks_addr(buffer: &mut Vec<u8>, destination: &SocksAddr) -> anyhow::Result<()> {
+pub(crate) fn write_socks_addr(
+    buffer: &mut Vec<u8>,
+    destination: &SocksAddr,
+) -> anyhow::Result<()> {
     match destination {
         SocksAddr::Ip(addr) => match addr.ip() {
             IpAddr::V4(ip) => {
@@ -734,7 +767,7 @@ fn write_socks_addr(buffer: &mut Vec<u8>, destination: &SocksAddr) -> anyhow::Re
     Ok(())
 }
 
-fn address_wire_len(destination: &SocksAddr) -> usize {
+pub(crate) fn address_wire_len(destination: &SocksAddr) -> usize {
     match destination {
         SocksAddr::Ip(addr) if addr.is_ipv4() => 1 + 4 + 2,
         SocksAddr::Ip(_) => 1 + 16 + 2,
@@ -835,6 +868,7 @@ mod tests {
                 )?);
                 Ok(packet)
             }
+            Method::Aead2022(_) => bail!("test helper does not support Shadowsocks 2022"),
         }
     }
 
@@ -849,7 +883,10 @@ mod tests {
             Method::parse("chacha20-ietf-poly1305"),
             Some(Method::Legacy(LegacyAeadMethod::ChaCha20Poly1305))
         );
-        assert!(Method::parse("2022-blake3-aes-128-gcm").is_none());
+        assert_eq!(
+            Method::parse("2022-blake3-aes-128-gcm"),
+            Some(Method::Aead2022(Aead2022Method::Aes128Gcm))
+        );
     }
 
     #[test]

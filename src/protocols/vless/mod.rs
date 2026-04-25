@@ -1,4 +1,9 @@
 mod codec;
+mod http1;
+mod httpupgrade;
+mod ws;
+mod xhttp;
+mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use serde::Deserialize;
@@ -32,6 +37,8 @@ pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
     pub tls: EffectiveTlsConfig,
+    transport: TransportMode,
+    packet_encoding: PacketEncoding,
     pub routing: routing::RoutingTable,
     pub fallbacks: FallbackConfig,
 }
@@ -39,10 +46,17 @@ pub struct EffectiveNodeConfig {
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
+        let transport = parse_transport_mode(remote)?;
+        let mut tls = EffectiveTlsConfig::from_remote(remote)?;
+        if matches!(transport, TransportMode::Xhttp(_)) && tls.alpn.is_empty() {
+            tls.alpn = default_xhttp_alpn();
+        }
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
-            tls: EffectiveTlsConfig::from_remote(remote)?,
+            tls,
+            transport,
+            packet_encoding: parse_packet_encoding(remote)?,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
                 &remote.custom_outbounds,
@@ -52,6 +66,25 @@ impl EffectiveNodeConfig {
             fallbacks: FallbackConfig::from_remote(remote)?,
         })
     }
+}
+
+fn default_xhttp_alpn() -> Vec<String> {
+    vec!["h2".to_string(), "http/1.1".to_string()]
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TransportMode {
+    Tcp,
+    Ws(ws::WsConfig),
+    HttpUpgrade(httpupgrade::HttpUpgradeConfig),
+    Xhttp(xhttp::XhttpConfig),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PacketEncoding {
+    #[default]
+    None,
+    Xudp,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +157,8 @@ pub struct ServerController {
     tls_materials: AsyncMutex<Option<tls::LoadedTlsMaterials>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
+    transport: Arc<RwLock<TransportMode>>,
+    packet_encoding: Arc<RwLock<PacketEncoding>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
     inner: Mutex<Option<RunningServer>>,
@@ -142,6 +177,8 @@ impl ServerController {
             tls_materials: AsyncMutex::new(None),
             accounting,
             users: Arc::new(RwLock::new(UserValidator::default())),
+            transport: Arc::new(RwLock::new(TransportMode::Tcp)),
+            packet_encoding: Arc::new(RwLock::new(PacketEncoding::None)),
             routing: Arc::new(RwLock::new(routing::RoutingTable::default())),
             fallbacks: Arc::new(RwLock::new(FallbackConfig::default())),
             inner: Mutex::new(None),
@@ -156,6 +193,14 @@ impl ServerController {
     }
 
     pub async fn apply_config(&self, config: EffectiveNodeConfig) -> anyhow::Result<()> {
+        *self
+            .transport
+            .write()
+            .expect("vless transport lock poisoned") = config.transport;
+        *self
+            .packet_encoding
+            .write()
+            .expect("vless packet encoding lock poisoned") = config.packet_encoding;
         *self.routing.write().expect("vless routing lock poisoned") = config.routing;
         *self
             .fallbacks
@@ -187,6 +232,8 @@ impl ServerController {
         let tls_config = self.tls_config.clone();
         let accounting = self.accounting.clone();
         let users = self.users.clone();
+        let transport = self.transport.clone();
+        let packet_encoding = self.packet_encoding.clone();
         let routing = self.routing.clone();
         let fallbacks = self.fallbacks.clone();
         let handle = tokio::spawn(async move {
@@ -196,10 +243,22 @@ impl ServerController {
                 let tls_config = tls_config.clone();
                 let accounting = accounting.clone();
                 let users = users.clone();
+                let transport = transport.clone();
+                let packet_encoding = packet_encoding.clone();
                 let routing = routing.clone();
                 let fallbacks = fallbacks.clone();
                 accept_loops.spawn(async move {
-                    accept_loop(listener, tls_config, accounting, users, routing, fallbacks).await;
+                    accept_loop(
+                        listener,
+                        tls_config,
+                        accounting,
+                        users,
+                        transport,
+                        packet_encoding,
+                        routing,
+                        fallbacks,
+                    )
+                    .await;
                 });
             }
 
@@ -250,14 +309,14 @@ impl ServerController {
 
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
-        let should_reload = tls_materials
-            .as_ref()
-            .is_none_or(|current| !current.matches_source(&tls.source, tls.ech.as_ref()));
+        let should_reload = tls_materials.as_ref().is_none_or(|current| {
+            !current.matches_source(&tls.source, tls.ech.as_ref(), &tls.alpn)
+        });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref())
+        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), &tls.alpn)
             .await
             .context("load VLESS TLS materials")?;
         *self
@@ -274,6 +333,8 @@ async fn accept_loop(
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
+    transport: Arc<RwLock<TransportMode>>,
+    packet_encoding: Arc<RwLock<PacketEncoding>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
 ) {
@@ -303,6 +364,8 @@ async fn accept_loop(
         };
         let accounting = accounting.clone();
         let users = users.clone();
+        let transport = transport.clone();
+        let packet_encoding = packet_encoding.clone();
         let routing = routing.clone();
         let fallbacks = fallbacks.clone();
         tokio::spawn(async move {
@@ -323,14 +386,69 @@ async fn accept_loop(
                 }
             };
             let users = users.read().expect("vless users lock poisoned").clone();
+            let transport = transport
+                .read()
+                .expect("vless transport lock poisoned")
+                .clone();
+            let packet_encoding = *packet_encoding
+                .read()
+                .expect("vless packet encoding lock poisoned");
             let routing = routing.read().expect("vless routing lock poisoned").clone();
             let fallbacks = fallbacks
                 .read()
                 .expect("vless fallback lock poisoned")
                 .clone();
-            if let Err(error) =
-                serve_connection(tls_stream, source, accounting, users, routing, fallbacks).await
-            {
+            let result = match transport {
+                TransportMode::Tcp => {
+                    serve_connection(
+                        tls_stream,
+                        source,
+                        accounting,
+                        users,
+                        packet_encoding,
+                        routing,
+                        fallbacks,
+                    )
+                    .await
+                }
+                TransportMode::Ws(config) => {
+                    serve_ws_connection(
+                        tls_stream,
+                        source,
+                        accounting,
+                        users,
+                        packet_encoding,
+                        routing,
+                        config,
+                    )
+                    .await
+                }
+                TransportMode::HttpUpgrade(config) => {
+                    serve_httpupgrade_connection(
+                        tls_stream,
+                        source,
+                        accounting,
+                        users,
+                        packet_encoding,
+                        routing,
+                        config,
+                    )
+                    .await
+                }
+                TransportMode::Xhttp(config) => {
+                    serve_xhttp_connection(
+                        tls_stream,
+                        source,
+                        accounting,
+                        users,
+                        packet_encoding,
+                        routing,
+                        config,
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = result {
                 warn!(%error, %source, "VLESS session terminated with error");
             }
         });
@@ -342,6 +460,7 @@ async fn serve_connection(
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
+    packet_encoding: PacketEncoding,
     routing: routing::RoutingTable,
     fallbacks: FallbackConfig,
 ) -> anyhow::Result<()> {
@@ -366,6 +485,13 @@ async fn serve_connection(
         }
         Err(_) => return Err(anyhow!("VLESS request header timed out")),
     };
+    if let Err(error) = validate_request_addons(&request) {
+        if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
+            proxy_fallback(stream, target, consumed).await?;
+            return Ok(());
+        }
+        return Err(error);
+    }
 
     let user = match users.get(&request.user) {
         Some(user) => user,
@@ -379,6 +505,226 @@ async fn serve_connection(
     };
 
     let lease = accounting.open_session(&user, source)?;
+    serve_authenticated_connection(
+        stream,
+        accounting,
+        lease,
+        user,
+        request,
+        packet_encoding,
+        routing,
+    )
+    .await
+}
+
+async fn serve_ws_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+    config: ws::WsConfig,
+) -> anyhow::Result<()> {
+    let Some(mut stream) = ws::accept(stream, &config).await? else {
+        return Ok(());
+    };
+    let request = timeout(
+        REQUEST_HEADER_TIMEOUT,
+        codec::read_request(&mut stream, &mut Vec::new()),
+    )
+    .await
+    .map_err(|_| anyhow!("VLESS request header timed out"))??;
+    validate_request_addons(&request)?;
+    let user = users
+        .get(&request.user)
+        .ok_or_else(|| anyhow!("unknown VLESS user"))?;
+    let lease = accounting.open_session(&user, source)?;
+    serve_authenticated_connection(
+        stream,
+        accounting,
+        lease,
+        user,
+        request,
+        packet_encoding,
+        routing,
+    )
+    .await
+}
+
+async fn serve_httpupgrade_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+    config: httpupgrade::HttpUpgradeConfig,
+) -> anyhow::Result<()> {
+    let Some(mut stream) = httpupgrade::accept(stream, &config).await? else {
+        return Ok(());
+    };
+    let request = timeout(
+        REQUEST_HEADER_TIMEOUT,
+        codec::read_request(&mut stream, &mut Vec::new()),
+    )
+    .await
+    .map_err(|_| anyhow!("VLESS request header timed out"))??;
+    validate_request_addons(&request)?;
+    let user = users
+        .get(&request.user)
+        .ok_or_else(|| anyhow!("unknown VLESS user"))?;
+    let lease = accounting.open_session(&user, source)?;
+    serve_authenticated_connection(
+        stream,
+        accounting,
+        lease,
+        user,
+        request,
+        packet_encoding,
+        routing,
+    )
+    .await
+}
+
+async fn serve_xhttp_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()> {
+    let negotiated_alpn = stream
+        .ssl()
+        .selected_alpn_protocol()
+        .map(|value| value.to_vec());
+    if negotiated_alpn.as_deref() == Some(b"h2") {
+        return serve_xhttp_h2_connection(
+            stream,
+            source,
+            accounting,
+            users,
+            packet_encoding,
+            routing,
+            config,
+        )
+        .await;
+    }
+
+    serve_xhttp_http1_connection(
+        stream,
+        source,
+        accounting,
+        users,
+        packet_encoding,
+        routing,
+        config,
+    )
+    .await
+}
+
+async fn serve_xhttp_http1_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()> {
+    let mut stream = http1::PrefixedIo::new(stream, Vec::new());
+    loop {
+        let wrapped = xhttp::accept_prefixed(stream, &config).await?;
+        match wrapped {
+            xhttp::AcceptResult::Stream(stream) => {
+                return serve_xhttp_stream(
+                    stream,
+                    source,
+                    accounting,
+                    users,
+                    packet_encoding,
+                    routing,
+                )
+                .await;
+            }
+            xhttp::AcceptResult::Responded(xhttp::ResponseState::Continue(next_stream)) => {
+                stream = next_stream;
+            }
+            xhttp::AcceptResult::Responded(xhttp::ResponseState::Closed) => return Ok(()),
+        }
+    }
+}
+
+async fn serve_xhttp_h2_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()> {
+    let on_stream: Arc<dyn Fn(xhttp::XhttpStream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let routing = routing.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                serve_xhttp_stream(stream, source, accounting, users, packet_encoding, routing)
+                    .await
+            {
+                warn!(%error, %source, "VLESS XHTTP h2 session terminated with error");
+            }
+        });
+    });
+    xhttp::serve_h2(stream, config, on_stream).await
+}
+
+async fn serve_xhttp_stream(
+    mut stream: xhttp::XhttpStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()> {
+    let request = timeout(
+        REQUEST_HEADER_TIMEOUT,
+        codec::read_request(&mut stream, &mut Vec::new()),
+    )
+    .await
+    .map_err(|_| anyhow!("VLESS request header timed out"))??;
+    validate_request_addons(&request)?;
+    let user = users
+        .get(&request.user)
+        .ok_or_else(|| anyhow!("unknown VLESS user"))?;
+    let lease = accounting.open_session(&user, source)?;
+    serve_authenticated_connection(
+        stream,
+        accounting,
+        lease,
+        user,
+        request,
+        packet_encoding,
+        routing,
+    )
+    .await
+}
+
+async fn serve_authenticated_connection<S>(
+    stream: S,
+    accounting: Arc<Accounting>,
+    lease: SessionLease,
+    user: UserEntry,
+    request: codec::Request,
+    packet_encoding: PacketEncoding,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     match request.command {
         Command::Tcp => {
             serve_connect(
@@ -402,17 +748,36 @@ async fn serve_connection(
             )
             .await
         }
+        Command::Mux => {
+            ensure!(
+                packet_encoding == PacketEncoding::Xudp,
+                "VLESS mux is only supported for packet_encoding xudp"
+            );
+            ensure!(
+                request.destination
+                    == SocksAddr::Domain(
+                        codec::XUDP_MUX_DESTINATION.to_string(),
+                        codec::XUDP_MUX_PORT
+                    ),
+                "unsupported VLESS mux destination {}",
+                request.destination
+            );
+            serve_xudp(stream, accounting, lease, user, routing).await
+        }
     }
 }
 
-async fn serve_connect(
-    stream: TlsStream,
+async fn serve_connect<S>(
+    stream: S,
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
     destination: SocksAddr,
     routing: routing::RoutingTable,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let remote = transport::connect_tcp_destination(&destination, &routing)
         .await
         .with_context(|| format!("connect VLESS destination {destination}"))?;
@@ -439,14 +804,17 @@ async fn serve_connect(
     Ok(())
 }
 
-async fn serve_udp(
-    stream: TlsStream,
+async fn serve_udp<S>(
+    stream: S,
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
     destination: SocksAddr,
     routing: routing::RoutingTable,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let target = transport::resolve_destination(&destination, &routing, "udp")
         .await?
         .into_iter()
@@ -492,6 +860,27 @@ async fn serve_udp(
     }
 }
 
+async fn serve_xudp<S>(
+    mut stream: S,
+    accounting: Arc<Accounting>,
+    lease: SessionLease,
+    user: UserEntry,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    codec::write_response_header(&mut stream).await?;
+    xudp::relay(
+        stream,
+        routing,
+        lease.control(),
+        TrafficRecorder::upload(accounting.clone(), user.id),
+        TrafficRecorder::download(accounting, user.id),
+    )
+    .await
+}
+
 async fn proxy_fallback(
     stream: TlsStream,
     target: &FallbackTarget,
@@ -528,12 +917,15 @@ async fn proxy_fallback(
     Ok(())
 }
 
-async fn relay_client_to_udp(
-    mut reader: ReadHalf<TlsStream>,
+async fn relay_client_to_udp<R>(
+    mut reader: ReadHalf<R>,
     socket: Arc<UdpSocket>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let frame = tokio::select! {
             _ = control.cancelled() => return Ok(()),
@@ -557,12 +949,15 @@ async fn relay_client_to_udp(
     }
 }
 
-async fn relay_udp_to_client(
-    mut writer: WriteHalf<TlsStream>,
+async fn relay_udp_to_client<W>(
+    mut writer: WriteHalf<W>,
     socket: Arc<UdpSocket>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    W: AsyncRead + AsyncWrite + Unpin,
+{
     let mut buffer = vec![0u8; u16::MAX as usize];
     loop {
         let payload_len = tokio::select! {
@@ -619,17 +1014,59 @@ fn flatten_join(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> a
     }
 }
 
-fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
-        bail!("Xboard network must be tcp for VLESS nodes");
+fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<TransportMode> {
+    let network = remote.network.trim();
+    if network.is_empty() || network.eq_ignore_ascii_case("tcp") {
+        ensure!(
+            remote.network_settings.is_none(),
+            "Xboard networkSettings is only supported for VLESS ws/httpupgrade/xhttp nodes"
+        );
+        return Ok(TransportMode::Tcp);
     }
-    if remote.network_settings.is_some() {
-        bail!("Xboard networkSettings is not supported by NodeRS VLESS server yet");
+    if network.eq_ignore_ascii_case("ws") {
+        return Ok(TransportMode::Ws(ws::WsConfig::from_network_settings(
+            remote.network_settings.as_ref(),
+        )?));
+    }
+    if network.eq_ignore_ascii_case("httpupgrade") {
+        return Ok(TransportMode::HttpUpgrade(
+            httpupgrade::HttpUpgradeConfig::from_network_settings(
+                remote.network_settings.as_ref(),
+            )?,
+        ));
+    }
+    if network.eq_ignore_ascii_case("xhttp") {
+        return Ok(TransportMode::Xhttp(
+            xhttp::XhttpConfig::from_network_settings(remote.network_settings.as_ref())?,
+        ));
+    }
+    bail!("Xboard network must be tcp, ws, httpupgrade or xhttp for VLESS nodes");
+}
+
+fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEncoding> {
+    let packet_encoding = remote.packet_encoding.trim();
+    if packet_encoding.is_empty() {
+        return Ok(PacketEncoding::None);
+    }
+    if packet_encoding.eq_ignore_ascii_case("xudp") {
+        return Ok(PacketEncoding::Xudp);
+    }
+    bail!("unsupported VLESS packet_encoding {packet_encoding}");
+}
+
+fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
+    parse_transport_mode(remote)?;
+    parse_packet_encoding(remote)?;
+    if remote.tls.is_some() && remote.tls_mode() != 1 {
+        bail!(
+            "Xboard tls mode {} is not supported by NodeRS VLESS server yet",
+            remote.tls_mode()
+        );
     }
     if remote.transport.is_some() {
         bail!("Xboard transport is not supported by NodeRS VLESS server yet");
     }
-    if remote.multiplex.is_some() {
+    if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
     }
     if remote.fallbacks.is_some() {
@@ -641,9 +1078,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     }
     if !remote.flow.trim().is_empty() {
         bail!("Xboard flow is not supported by NodeRS VLESS server yet");
-    }
-    if !remote.packet_encoding.trim().is_empty() {
-        bail!("Xboard packet_encoding is not supported by NodeRS VLESS server yet");
     }
     Ok(())
 }
@@ -695,6 +1129,18 @@ fn parse_uuid(value: &str) -> anyhow::Result<[u8; 16]> {
     let mut uuid = [0u8; 16];
     hex::decode_to_slice(compact.as_bytes(), &mut uuid).context("decode VLESS uuid")?;
     Ok(uuid)
+}
+
+fn validate_request_addons(request: &codec::Request) -> anyhow::Result<()> {
+    ensure!(
+        request.addons.seed.is_empty(),
+        "VLESS addons seed is not supported by NodeRS VLESS server yet"
+    );
+    ensure!(
+        request.addons.flow.trim().is_empty(),
+        "VLESS addons flow is not supported by NodeRS VLESS server yet"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -783,12 +1229,135 @@ mod tests {
     }
 
     #[test]
-    fn rejects_packet_encoding_extension() {
+    fn accepts_xudp_packet_encoding() {
         let remote = NodeConfigResponse {
             packet_encoding: "xudp".to_string(),
             ..base_remote()
         };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("packet encoding");
+        assert_eq!(config.packet_encoding, PacketEncoding::Xudp);
+    }
+
+    #[test]
+    fn rejects_unknown_packet_encoding() {
+        let remote = NodeConfigResponse {
+            packet_encoding: "packetaddr".to_string(),
+            ..base_remote()
+        };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("packet encoding");
         assert!(error.to_string().contains("packet_encoding"));
+    }
+
+    #[test]
+    fn accepts_disabled_multiplex_but_rejects_non_tls_mode() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            multiplex: Some(serde_json::json!({
+                "enabled": false,
+                "protocol": "yamux"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 443);
+
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
+        assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
+    fn accepts_xhttp_network_settings() {
+        let remote = NodeConfigResponse {
+            network: "xhttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
+        assert_eq!(
+            config.tls.alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_alpn_for_xhttp() {
+        let remote = NodeConfigResponse {
+            network: "xhttp".to_string(),
+            alpn: vec!["http/1.1".to_string()],
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.tls.alpn, vec!["http/1.1".to_string()]);
+    }
+
+    #[test]
+    fn rejects_runtime_vless_addons_until_flow_support_lands() {
+        let request = codec::Request {
+            user: [0u8; 16],
+            addons: codec::Addons {
+                flow: "xtls-rprx-vision".to_string(),
+                seed: Vec::new(),
+            },
+            command: Command::Tcp,
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+        };
+
+        let error = validate_request_addons(&request).expect_err("flow should be rejected");
+        assert!(error.to_string().contains("addons flow"));
+
+        let request = codec::Request {
+            addons: codec::Addons {
+                flow: String::new(),
+                seed: vec![1, 2, 3],
+            },
+            ..request
+        };
+        let error = validate_request_addons(&request).expect_err("seed should be rejected");
+        assert!(error.to_string().contains("addons seed"));
+    }
+
+    #[test]
+    fn accepts_websocket_network_settings() {
+        let remote = NodeConfigResponse {
+            network: "ws".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/ws",
+                "headers": {
+                    "Host": "cdn.example.com"
+                }
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Ws(_)));
+    }
+
+    #[test]
+    fn accepts_httpupgrade_network_settings() {
+        let remote = NodeConfigResponse {
+            network: "httpupgrade".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/upgrade",
+                "host": "cdn.example.com"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::HttpUpgrade(_)));
     }
 }

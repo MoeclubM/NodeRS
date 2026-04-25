@@ -2,7 +2,7 @@ use anyhow::{Context, ensure};
 use base64::Engine as _;
 use boring::hpke::HpkeKey;
 use boring::pkey::PKey;
-use boring::ssl::{SslAcceptor, SslEchKeys, SslMethod};
+use boring::ssl::{AlpnError, SslAcceptor, SslEchKeys, SslMethod};
 use boring::x509::X509;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,7 @@ pub enum EchConfigSource {
 pub struct LoadedTlsMaterials {
     source: TlsMaterialSource,
     ech_source: Option<EchConfigSource>,
+    alpn_protocols: Vec<String>,
     cert_digest: [u8; 32],
     key_digest: [u8; 32],
     ech_key_digest: Option<[u8; 32]>,
@@ -63,27 +64,38 @@ impl LoadedTlsMaterials {
         &self,
         source: &TlsMaterialSource,
         ech_source: Option<&EchConfigSource>,
+        alpn_protocols: &[String],
     ) -> bool {
-        self.source == *source && self.ech_source.as_ref() == ech_source
+        self.source == *source
+            && self.ech_source.as_ref() == ech_source
+            && self.alpn_protocols == alpn_protocols
     }
 }
 
 pub async fn load_tls_materials(
     source: &TlsMaterialSource,
     ech_source: Option<&EchConfigSource>,
+    alpn_protocols: &[String],
 ) -> anyhow::Result<LoadedTlsMaterials> {
     let source = source.clone();
     let ech_source = ech_source.cloned();
+    let alpn_protocols = alpn_protocols.to_vec();
     let (cert_pem, key_pem) = load_source_materials(&source).await?;
     let ech_materials = match ech_source.as_ref() {
         Some(ech_source) => Some(load_ech_source_materials(ech_source).await?),
         None => None,
     };
-    let acceptor =
-        build_acceptor(cert_pem.clone(), key_pem.clone(), ech_materials.as_ref()).await?;
+    let acceptor = build_acceptor(
+        cert_pem.clone(),
+        key_pem.clone(),
+        ech_materials.as_ref(),
+        &alpn_protocols,
+    )
+    .await?;
     Ok(LoadedTlsMaterials {
         source,
         ech_source,
+        alpn_protocols,
         cert_digest: digest(&cert_pem),
         key_digest: digest(&key_pem),
         ech_key_digest: ech_materials.as_ref().map(|(key, _)| digest(key)),
@@ -124,7 +136,13 @@ pub async fn reload_if_changed(
         return Ok(None);
     }
 
-    let acceptor = build_acceptor(cert_pem, key_pem, ech_materials.as_ref()).await?;
+    let acceptor = build_acceptor(
+        cert_pem,
+        key_pem,
+        ech_materials.as_ref(),
+        &materials.alpn_protocols,
+    )
+    .await?;
     materials.cert_digest = cert_digest;
     materials.key_digest = key_digest;
     materials.ech_key_digest = ech_key_digest;
@@ -212,8 +230,10 @@ async fn build_acceptor(
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
     ech_materials: Option<&(Vec<u8>, Option<Vec<u8>>)>,
+    alpn_protocols: &[String],
 ) -> anyhow::Result<Arc<SslAcceptor>> {
     let ech_materials = ech_materials.cloned();
+    let alpn_wire = encode_alpn_protocols(alpn_protocols)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<SslAcceptor>> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .context("build BoringSSL acceptor")?;
@@ -243,10 +263,65 @@ async fn build_acceptor(
             builder.set_ech_keys(&ech_keys).context("set ECH keys")?;
         }
 
+        if !alpn_wire.is_empty() {
+            builder
+                .set_alpn_protos(&alpn_wire)
+                .context("set ALPN protocols")?;
+            let server_protocols = alpn_wire.clone();
+            builder.set_alpn_select_callback(move |_, client| {
+                let mut server_pos = 0;
+                while server_pos < server_protocols.len() {
+                    let server_len = server_protocols[server_pos] as usize;
+                    let server_start = server_pos + 1;
+                    let server_end = server_start + server_len;
+                    let server_protocol = &server_protocols[server_start..server_end];
+
+                    let mut client_pos = 0;
+                    while client_pos < client.len() {
+                        let client_len = client[client_pos] as usize;
+                        let client_start = client_pos + 1;
+                        let client_end = client_start + client_len;
+                        if client_end > client.len() {
+                            return Err(AlpnError::NOACK);
+                        }
+                        if &client[client_start..client_end] == server_protocol {
+                            return Ok(&client[client_start..client_end]);
+                        }
+                        client_pos = client_end;
+                    }
+
+                    server_pos = server_end;
+                }
+                Err(AlpnError::NOACK)
+            });
+        }
+
         Ok(Arc::new(builder.build()))
     })
     .await
     .context("join BoringSSL builder")?
+}
+
+fn encode_alpn_protocols(protocols: &[String]) -> anyhow::Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for protocol in protocols {
+        let protocol = protocol.trim();
+        ensure!(
+            !protocol.is_empty(),
+            "ALPN protocols cannot contain empty values"
+        );
+        ensure!(
+            protocol.is_ascii(),
+            "ALPN protocol {protocol:?} must be ASCII"
+        );
+        ensure!(
+            protocol.len() <= u8::MAX as usize,
+            "ALPN protocol {protocol:?} is too long"
+        );
+        encoded.push(protocol.len() as u8);
+        encoded.extend_from_slice(protocol.as_bytes());
+    }
+    Ok(encoded)
 }
 
 fn build_ech_keys(
@@ -506,6 +581,7 @@ mod tests {
                 subject_alt_names: vec!["node.example.com".to_string()],
             },
             None,
+            &[],
         )
         .await
         .expect("self-signed materials");
@@ -529,6 +605,7 @@ mod tests {
                 key: ech_key,
                 config: None,
             }),
+            &[],
         )
         .await
         .expect("load ECH");
@@ -547,10 +624,24 @@ mod tests {
                 key: ech_key,
                 config: Some(ech_config),
             }),
+            &[],
         )
         .await
         .expect("load ECH");
 
         let _ = materials.acceptor();
+    }
+
+    #[test]
+    fn encodes_alpn_protocols_in_wire_format() {
+        let encoded = encode_alpn_protocols(&["h2".to_string(), "http/1.1".to_string()])
+            .expect("encode alpn");
+        assert_eq!(encoded, b"\x02h2\x08http/1.1");
+    }
+
+    #[test]
+    fn rejects_empty_alpn_protocol_values() {
+        let error = encode_alpn_protocols(&[String::new()]).expect_err("empty alpn");
+        assert!(error.to_string().contains("empty values"));
     }
 }
