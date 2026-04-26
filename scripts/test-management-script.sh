@@ -177,10 +177,44 @@ test_upgrade_rejects_legacy_layout() (
   assert_contains "$expected_hint" "$stderr_path" "upgrade.sh did not report the manual reinstall guidance"
 )
 
+test_install_management_support_skips_self_copy() (
+  local tmp_root stdout_path stderr_path support_dir
+
+  tmp_root="$(mktemp -d)"
+  cleanup_self_copy_test() {
+    rm -rf "$tmp_root"
+  }
+  trap cleanup_self_copy_test EXIT
+
+  PREFIX="$tmp_root/prefix"
+  CONFIG_DIR="$tmp_root/config"
+  STATE_DIR="$tmp_root/state"
+  LOG_DIR="$tmp_root/log"
+  RUN_DIR="$tmp_root/run"
+
+  install_management_support "$ROOT_DIR/scripts"
+  support_dir="$PREFIX/lib/noders"
+
+  stdout_path="$tmp_root/stdout"
+  stderr_path="$tmp_root/stderr"
+  if ! install_management_support "$support_dir" >"$stdout_path" 2>"$stderr_path"; then
+    echo "install_management_support failed when source and destination support directories matched" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+
+  if [[ -s "$stderr_path" ]]; then
+    echo "install_management_support emitted unexpected stderr when source and destination matched" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+)
+
 main() {
   test_validate_args
   test_management_script_filters_invalid_units
   test_upgrade_rejects_legacy_layout
+  test_install_management_support_skips_self_copy
 }
 
 main "$@"

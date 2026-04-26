@@ -930,6 +930,19 @@ EOF
   chmod 0755 "$target"
 }
 
+install_support_file() {
+  local src dst mode
+  src="$1"
+  dst="$2"
+  mode="$3"
+
+  if [[ -e "$dst" && "$src" -ef "$dst" ]]; then
+    return 0
+  fi
+
+  install -m "$mode" "$src" "$dst"
+}
+
 install_management_support() {
   local staging_dir support_dir
   staging_dir="$1"
@@ -937,10 +950,10 @@ install_management_support() {
 
   install -d "$PREFIX/bin" "$support_dir" "$support_dir/lib"
   write_management_script "$PREFIX/bin/noders"
-  install -m 0755 "$staging_dir/install.sh" "$support_dir/install.sh"
-  install -m 0755 "$staging_dir/install-openrc.sh" "$support_dir/install-openrc.sh"
-  install -m 0755 "$staging_dir/upgrade.sh" "$support_dir/upgrade.sh"
-  install -m 0644 "$staging_dir/lib/install-common.sh" "$support_dir/lib/install-common.sh"
+  install_support_file "$staging_dir/install.sh" "$support_dir/install.sh" 0755
+  install_support_file "$staging_dir/install-openrc.sh" "$support_dir/install-openrc.sh" 0755
+  install_support_file "$staging_dir/upgrade.sh" "$support_dir/upgrade.sh" 0755
+  install_support_file "$staging_dir/lib/install-common.sh" "$support_dir/lib/install-common.sh" 0644
   write_manager_install_env "$support_dir/install.env"
 }
 
