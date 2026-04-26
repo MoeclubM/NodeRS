@@ -304,6 +304,7 @@ pub struct NodeTlsSettings {
     #[serde(
         default,
         alias = "shortId",
+        alias = "shortid",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub short_id: String,
@@ -344,6 +345,7 @@ pub struct NodeRealitySettings {
     #[serde(
         default,
         alias = "shortId",
+        alias = "shortid",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub short_id: String,
@@ -2564,6 +2566,31 @@ mod tests {
         assert_eq!(reality.private_key, "tls-priv");
         assert_eq!(reality.short_id, "abcd");
         assert!(reality.allow_insecure);
+    }
+
+    #[test]
+    fn accepts_lowercase_shortid_alias_in_reality_fields() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "tls.example.com",
+                "public_key": "tls-pub",
+                "private_key": "tls-priv",
+                "shortid": "abcd"
+            },
+            "reality_settings": {
+                "server_name": "reality.example.com",
+                "public_key": "reality-pub",
+                "private_key": "reality-priv",
+                "shortid": "beef"
+            }
+        }))
+        .expect("parse shortid alias config");
+
+        let reality = config.effective_reality_settings();
+        assert_eq!(reality.short_id, "beef");
     }
 
     #[test]
