@@ -218,6 +218,54 @@ impl Accounting {
             .expect("external alive lock poisoned") = parsed;
     }
 
+    pub fn try_mark_local_alive(
+        &self,
+        uid: i64,
+        device_limit: i64,
+        ip: &str,
+    ) -> anyhow::Result<()> {
+        let ip = normalize_ip(ip.to_string());
+        let external = self
+            .external_alive
+            .lock()
+            .expect("external alive lock poisoned");
+        let mut online = self.online.lock().expect("online lock poisoned");
+        let ip_map = online.entry(uid).or_default();
+        if device_limit > 0 && !ip_map.contains_key(&ip) {
+            let local_unique = ip_map.len();
+            let external_count = external.get(&uid).copied().unwrap_or(0);
+            let adjusted_external = external_count.saturating_sub(local_unique);
+            if adjusted_external + local_unique >= device_limit as usize {
+                bail!(
+                    "device limit exceeded: uid={}, limit={}, local_unique={}, external_alive={}",
+                    uid,
+                    device_limit,
+                    local_unique,
+                    external_count
+                );
+            }
+        }
+        *ip_map.entry(ip).or_default() += 1;
+        Ok(())
+    }
+
+    pub fn replace_local_alive_ips(&self, alive: &HashMap<i64, Vec<String>>) {
+        let mut next = HashMap::new();
+        for (uid, ips) in alive {
+            let mut ip_map = HashMap::new();
+            for ip in ips {
+                let ip = normalize_ip(ip.clone());
+                if !ip.trim().is_empty() {
+                    ip_map.insert(ip, 1);
+                }
+            }
+            if !ip_map.is_empty() {
+                next.insert(*uid, ip_map);
+            }
+        }
+        *self.online.lock().expect("online lock poisoned") = next;
+    }
+
     pub fn find_user_by_hash(&self, hash: &[u8; 32]) -> Option<UserEntry> {
         self.users
             .read()
@@ -355,7 +403,7 @@ impl Accounting {
         }
     }
 
-    fn cancel_sessions_for_ids(&self, ids: &HashSet<i64>) {
+    pub(crate) fn cancel_sessions_for_ids(&self, ids: &HashSet<i64>) {
         if ids.is_empty() {
             return;
         }

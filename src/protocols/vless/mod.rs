@@ -1129,7 +1129,10 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
     let network = remote.network.trim();
     if network.is_empty() || network.eq_ignore_ascii_case("tcp") {
         ensure!(
-            remote.network_settings.is_none(),
+            remote
+                .network_settings
+                .as_ref()
+                .is_none_or(|value| !json_value_effectively_enabled(value)),
             "Xboard networkSettings is only supported for VLESS grpc/ws/httpupgrade/xhttp nodes"
         );
         return Ok(TransportMode::Tcp);
@@ -1171,7 +1174,7 @@ fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEn
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    parse_transport_mode(remote)?;
+    let transport_mode = parse_transport_mode(remote)?;
     parse_packet_encoding(remote)?;
     if remote.tls.is_some() && !matches!(remote.tls_mode(), 1 | 2) {
         bail!(
@@ -1183,7 +1186,7 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
     }
     if let Some(transport) = remote.transport.as_ref() {
-        validate_transport_field(transport)?;
+        validate_transport_field(transport, &transport_mode)?;
     }
     let decryption = remote.decryption.trim();
     if !decryption.is_empty() && !decryption.eq_ignore_ascii_case("none") {
@@ -1193,19 +1196,63 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
-    let Some(object) = value.as_object() else {
-        bail!("Xboard transport must be an object when provided");
-    };
-    let transport_type = object
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    if transport_type.is_empty() || transport_type.eq_ignore_ascii_case("tcp") {
+fn validate_transport_field(
+    value: &serde_json::Value,
+    transport_mode: &TransportMode,
+) -> anyhow::Result<()> {
+    if !json_value_effectively_enabled(value) {
         return Ok(());
     }
+
+    let expected = match transport_mode {
+        TransportMode::Tcp => "tcp",
+        TransportMode::Grpc(_) => "grpc",
+        TransportMode::Ws(_) => "ws",
+        TransportMode::HttpUpgrade(_) => "httpupgrade",
+        TransportMode::Xhttp(_) => "xhttp",
+    };
+
+    let transport_type = match value {
+        serde_json::Value::String(text) => text.trim(),
+        serde_json::Value::Object(object) => object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default(),
+        _ => {
+            bail!("Xboard transport must be a string or object when provided");
+        }
+    };
+
+    if transport_type.is_empty() || transport_type.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+
     bail!("Xboard transport is not supported by NodeRS VLESS server yet");
+}
+
+fn json_value_effectively_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(number) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        serde_json::Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            !matches!(
+                normalized.as_str(),
+                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
+            )
+        }
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(object) => object
+            .get("enabled")
+            .map(json_value_effectively_enabled)
+            .unwrap_or(!object.is_empty()),
+    }
 }
 
 fn parse_fallback_map(
@@ -1698,5 +1745,39 @@ mod tests {
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert!(matches!(config.transport, TransportMode::HttpUpgrade(_)));
+    }
+
+    #[test]
+    fn accepts_disabled_tcp_network_settings_from_xboard() {
+        let remote = NodeConfigResponse {
+            network: "tcp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "enabled": false,
+                "headers": {}
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Tcp));
+    }
+
+    #[test]
+    fn accepts_transport_type_matching_selected_network() {
+        let remote = NodeConfigResponse {
+            network: "xhttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            transport: Some(serde_json::json!({
+                "type": "xhttp"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
     }
 }

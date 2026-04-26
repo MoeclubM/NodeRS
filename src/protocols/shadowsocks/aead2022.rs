@@ -1,6 +1,7 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use boring::aead::{AeadCtx, Algorithm};
 use boring::symm::{self, Cipher, Crypter, Mode};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
@@ -19,7 +20,8 @@ use super::crypto::{
 };
 
 const TAG_LEN: usize = 16;
-const MAX_TCP_CHUNK_LEN: usize = 0x3fff;
+const MAX_TCP_CHUNK_LEN: usize = 0xffff;
+const UDP_CHACHA_NONCE_LEN: usize = 24;
 const REQUEST_FIXED_HEADER_LEN: usize = 1 + 8 + 2;
 const HEADER_TYPE_CLIENT: u8 = 0;
 const HEADER_TYPE_SERVER: u8 = 1;
@@ -91,14 +93,24 @@ pub(crate) fn decode_server_psk(value: &str, method: Aead2022Method) -> anyhow::
 }
 
 pub(crate) fn derive_user_psk(user: &PanelUser, method: Aead2022Method) -> anyhow::Result<Vec<u8>> {
+    let key_len = method.key_len();
+    let password = user.password.trim();
+    if !password.is_empty() {
+        if let Ok(decoded) = STANDARD.decode(password) {
+            if decoded.len() >= key_len {
+                return Ok(normalize_psk(&decoded, key_len)?);
+            }
+        }
+
+        return Ok(fixed_length_raw_key(password.as_bytes(), key_len));
+    }
+
     let uuid = user.uuid.trim();
-    ensure!(
-        uuid.len() >= method.key_len(),
-        "Shadowsocks 2022 user {} uuid is shorter than {} bytes",
-        user.id,
-        method.key_len()
-    );
-    Ok(uuid.as_bytes()[..method.key_len()].to_vec())
+    if !uuid.is_empty() {
+        return Ok(fixed_length_raw_key(uuid.as_bytes(), key_len));
+    }
+
+    bail!("Shadowsocks 2022 user {} is missing password/uuid", user.id)
 }
 
 pub(crate) fn identity_hash(psk: &[u8]) -> [u8; 16] {
@@ -106,6 +118,11 @@ pub(crate) fn identity_hash(psk: &[u8]) -> [u8; 16] {
     let mut truncated = [0u8; 16];
     truncated.copy_from_slice(&hash.as_bytes()[..16]);
     truncated
+}
+
+fn has_identity_header(users: &[UserCredential], method: Aead2022Method) -> bool {
+    let _ = users;
+    !matches!(method, Aead2022Method::ChaCha20Poly1305)
 }
 
 impl TcpReplayCache {
@@ -147,7 +164,8 @@ where
             _ => bail!("internal Shadowsocks 2022 method mismatch"),
         };
         let key_len = method.key_len();
-        let prefix_len = key_len + 16 + REQUEST_FIXED_HEADER_LEN + TAG_LEN;
+        let identity_len = usize::from(has_identity_header(users, method)) * 16;
+        let prefix_len = key_len + identity_len + REQUEST_FIXED_HEADER_LEN + TAG_LEN;
         let mut prefix = vec![0u8; prefix_len];
         inner
             .read_exact(&mut prefix)
@@ -159,26 +177,31 @@ where
             replay.accept(salt),
             "duplicate Shadowsocks 2022 request salt"
         );
-        let encrypted_identity = &prefix[key_len..key_len + 16];
-        let server_secret = &users[0].server_secret;
-        ensure!(
-            !server_secret.is_empty(),
-            "Shadowsocks 2022 server key is not configured"
-        );
-        let identity = decrypt_identity_header(server_secret, salt, encrypted_identity)
-            .context("decrypt Shadowsocks 2022 identity header")?;
-        let credential = users
-            .iter()
-            .find(|user| user.identity_hash == identity)
-            .cloned()
-            .ok_or_else(|| anyhow!("failed to match Shadowsocks 2022 TCP user"))?;
+        let (credential, encrypted_identity_len) = if has_identity_header(users, method) {
+            let encrypted_identity = &prefix[key_len..key_len + 16];
+            let server_secret = &users[0].server_secret;
+            ensure!(
+                !server_secret.is_empty(),
+                "Shadowsocks 2022 server key is not configured"
+            );
+            let identity = decrypt_identity_header(server_secret, salt, encrypted_identity)
+                .context("decrypt Shadowsocks 2022 identity header")?;
+            let credential = users
+                .iter()
+                .find(|user| user.identity_hash == identity)
+                .cloned()
+                .ok_or_else(|| anyhow!("failed to match Shadowsocks 2022 TCP user"))?;
+            (credential, 16usize)
+        } else {
+            (users[0].clone(), 0usize)
+        };
 
         let session_key = session_subkey(&credential.secret, salt, key_len);
         let fixed_plain = decrypt_tcp_chunk(
             method,
             &session_key,
             0,
-            &prefix[key_len + 16..],
+            &prefix[key_len + encrypted_identity_len..],
             "Shadowsocks 2022 TCP fixed header",
         )?;
         ensure!(
@@ -412,50 +435,14 @@ pub(crate) fn identify_udp_request(
     users: &[UserCredential],
 ) -> anyhow::Result<UdpIdentification> {
     ensure!(!users.is_empty(), "no Shadowsocks users configured");
-    ensure!(
-        packet.len() > 32 + TAG_LEN,
-        "short Shadowsocks 2022 UDP packet"
-    );
-    let server_secret = &users[0].server_secret;
-    ensure!(
-        !server_secret.is_empty(),
-        "Shadowsocks 2022 server key is not configured"
-    );
-
-    let mut packet_header = [0u8; 16];
-    packet_header.copy_from_slice(&packet[..16]);
-    packet_header = ecb_crypt(
-        server_secret,
-        &packet_header,
-        false,
-        "decrypt Shadowsocks 2022 UDP header",
-    )?;
-
-    let mut encrypted_identity = [0u8; 16];
-    encrypted_identity.copy_from_slice(&packet[16..32]);
-    let mut identity = ecb_crypt(
-        server_secret,
-        &encrypted_identity,
-        false,
-        "decrypt Shadowsocks 2022 UDP identity header",
-    )?;
-    xor_in_place(&mut identity, &packet_header);
-
-    let credential = users
-        .iter()
-        .find(|user| user.identity_hash == identity)
-        .cloned()
-        .ok_or_else(|| anyhow!("failed to match Shadowsocks 2022 UDP user"))?;
-    let client_session_id = u64::from_be_bytes(packet_header[..8].try_into().expect("session id"));
-    let client_packet_id = u64::from_be_bytes(packet_header[8..].try_into().expect("packet id"));
-
-    Ok(UdpIdentification {
-        credential,
-        packet_header,
-        client_session_id,
-        client_packet_id,
-        wire_len: packet.len(),
-    })
+    let method = match users[0].method {
+        super::crypto::Method::Aead2022(method) => method,
+        _ => bail!("internal Shadowsocks 2022 method mismatch"),
+    };
+    match method {
+        Aead2022Method::ChaCha20Poly1305 => identify_udp_request_chacha(packet, users),
+        _ => identify_udp_request_aes(packet, users),
+    }
 }
 
 impl UdpSession {
@@ -474,16 +461,24 @@ impl UdpSession {
             credential: identified.credential.clone(),
             client_session_id: identified.client_session_id,
             server_session_id,
-            inbound_key: session_subkey(
-                &identified.credential.secret,
-                &identified.client_session_id.to_be_bytes(),
-                method.key_len(),
-            ),
-            outbound_key: session_subkey(
-                &identified.credential.secret,
-                &server_session_id.to_be_bytes(),
-                method.key_len(),
-            ),
+            inbound_key: if matches!(method, Aead2022Method::ChaCha20Poly1305) {
+                identified.credential.secret.clone()
+            } else {
+                session_subkey(
+                    &identified.credential.secret,
+                    &identified.client_session_id.to_be_bytes(),
+                    method.key_len(),
+                )
+            },
+            outbound_key: if matches!(method, Aead2022Method::ChaCha20Poly1305) {
+                identified.credential.secret.clone()
+            } else {
+                session_subkey(
+                    &identified.credential.secret,
+                    &server_session_id.to_be_bytes(),
+                    method.key_len(),
+                )
+            },
             replay_window: SlidingWindow::default(),
             next_server_packet_id: 0,
         })
@@ -513,31 +508,51 @@ pub(crate) fn decode_udp_request_body(
         super::crypto::Method::Aead2022(method) => method,
         _ => bail!("internal Shadowsocks 2022 method mismatch"),
     };
-    let plain = decrypt_packet_body(
-        method,
-        &session.inbound_key,
-        &identified.packet_header[4..16],
-        &packet[32..],
-        "decrypt Shadowsocks 2022 UDP payload",
-    )?;
+    let plain = match method {
+        Aead2022Method::ChaCha20Poly1305 => decrypt_packet_body(
+            method,
+            &session.credential.secret,
+            &packet[..UDP_CHACHA_NONCE_LEN],
+            &packet[UDP_CHACHA_NONCE_LEN..],
+            "decrypt Shadowsocks 2022 UDP payload",
+        )?,
+        _ => decrypt_packet_body(
+            method,
+            &session.inbound_key,
+            &identified.packet_header[4..16],
+            &packet[32..],
+            "decrypt Shadowsocks 2022 UDP payload",
+        )?,
+    };
     ensure!(
         plain.len() >= 1 + 8 + 2,
         "short Shadowsocks 2022 UDP payload"
     );
+    let (header, destination_bytes) = match method {
+        Aead2022Method::ChaCha20Poly1305 => {
+            ensure!(
+                plain.len() >= 16 + 1 + 8 + 2,
+                "short Shadowsocks 2022 UDP payload"
+            );
+            (&plain[16..], &plain[27..])
+        }
+        _ => (&plain[..], &plain[11..]),
+    };
     ensure!(
-        plain[0] == HEADER_TYPE_CLIENT,
+        header[0] == HEADER_TYPE_CLIENT,
         "unexpected Shadowsocks 2022 UDP header type {}",
-        plain[0]
+        header[0]
     );
-    let timestamp = u64::from_be_bytes(plain[1..9].try_into().expect("timestamp"));
+    let timestamp = u64::from_be_bytes(header[1..9].try_into().expect("timestamp"));
     validate_timestamp(timestamp)?;
-    let padding_len = u16::from_be_bytes(plain[9..11].try_into().expect("padding length")) as usize;
+    let padding_len =
+        u16::from_be_bytes(header[9..11].try_into().expect("padding length")) as usize;
     ensure!(
-        plain.len() >= 11 + padding_len,
+        destination_bytes.len() >= padding_len,
         "short Shadowsocks 2022 UDP padding"
     );
-    let (destination, offset) = parse_socks_addr(&plain[11 + padding_len..])?;
-    let payload = plain[11 + padding_len + offset..].to_vec();
+    let (destination, offset) = parse_socks_addr(&destination_bytes[padding_len..])?;
+    let payload = destination_bytes[padding_len + offset..].to_vec();
     session.replay_window.add(identified.client_packet_id);
     Ok(DecodedUdpPacket {
         destination,
@@ -557,6 +572,10 @@ pub(crate) fn encode_udp_response(
     };
     let packet_id = session.next_server_packet_id;
     session.next_server_packet_id = session.next_server_packet_id.wrapping_add(1);
+
+    if matches!(method, Aead2022Method::ChaCha20Poly1305) {
+        return encode_udp_response_chacha(session, destination, payload);
+    }
 
     let mut header_plain = [0u8; 16];
     header_plain[..8].copy_from_slice(&session.server_session_id.to_be_bytes());
@@ -640,6 +659,114 @@ fn decode_psk(value: &str, key_len: usize) -> anyhow::Result<Vec<u8>> {
         .decode(value)
         .context("decode Shadowsocks 2022 key")?;
     normalize_psk(&decoded, key_len)
+}
+
+fn identify_udp_request_aes(
+    packet: &[u8],
+    users: &[UserCredential],
+) -> anyhow::Result<UdpIdentification> {
+    let method = match users[0].method {
+        super::crypto::Method::Aead2022(method) => method,
+        _ => bail!("internal Shadowsocks 2022 method mismatch"),
+    };
+    ensure!(!matches!(method, Aead2022Method::ChaCha20Poly1305));
+    let has_identity = has_identity_header(users, method);
+    let min_len = 16 + usize::from(has_identity) * 16 + TAG_LEN;
+    ensure!(packet.len() > min_len, "short Shadowsocks 2022 UDP packet");
+
+    let server_secret = &users[0].server_secret;
+    ensure!(
+        !server_secret.is_empty(),
+        "Shadowsocks 2022 server key is not configured"
+    );
+
+    let mut packet_header = [0u8; 16];
+    packet_header.copy_from_slice(&packet[..16]);
+    packet_header = ecb_crypt(
+        server_secret,
+        &packet_header,
+        false,
+        "decrypt Shadowsocks 2022 UDP header",
+    )?;
+
+    let credential = if has_identity {
+        let mut encrypted_identity = [0u8; 16];
+        encrypted_identity.copy_from_slice(&packet[16..32]);
+        let mut identity = ecb_crypt(
+            server_secret,
+            &encrypted_identity,
+            false,
+            "decrypt Shadowsocks 2022 UDP identity header",
+        )?;
+        xor_in_place(&mut identity, &packet_header);
+        users
+            .iter()
+            .find(|user| user.identity_hash == identity)
+            .cloned()
+            .ok_or_else(|| anyhow!("failed to match Shadowsocks 2022 UDP user"))?
+    } else {
+        users[0].clone()
+    };
+    let client_session_id = u64::from_be_bytes(packet_header[..8].try_into().expect("session id"));
+    let client_packet_id = u64::from_be_bytes(packet_header[8..].try_into().expect("packet id"));
+
+    Ok(UdpIdentification {
+        credential,
+        packet_header,
+        client_session_id,
+        client_packet_id,
+        wire_len: packet.len(),
+    })
+}
+
+fn identify_udp_request_chacha(
+    packet: &[u8],
+    users: &[UserCredential],
+) -> anyhow::Result<UdpIdentification> {
+    ensure!(
+        packet.len() > UDP_CHACHA_NONCE_LEN + TAG_LEN,
+        "short Shadowsocks 2022 UDP packet"
+    );
+    ensure!(
+        users.len() == 1,
+        "Shadowsocks 2022 chacha20-poly1305 does not support multi-user"
+    );
+
+    let credential = users[0].clone();
+    let method = match credential.method {
+        super::crypto::Method::Aead2022(method) => method,
+        _ => bail!("internal Shadowsocks 2022 method mismatch"),
+    };
+    ensure!(matches!(method, Aead2022Method::ChaCha20Poly1305));
+
+    let plain = decrypt_packet_body(
+        method,
+        &credential.secret,
+        &packet[..UDP_CHACHA_NONCE_LEN],
+        &packet[UDP_CHACHA_NONCE_LEN..],
+        "decrypt Shadowsocks 2022 UDP payload",
+    )?;
+    ensure!(plain.len() >= 16, "short Shadowsocks 2022 UDP payload");
+
+    let client_session_id = u64::from_be_bytes(plain[..8].try_into().expect("session id"));
+    let client_packet_id = u64::from_be_bytes(plain[8..16].try_into().expect("packet id"));
+    let mut packet_header = [0u8; 16];
+    packet_header.copy_from_slice(&plain[..16]);
+
+    Ok(UdpIdentification {
+        credential,
+        packet_header,
+        client_session_id,
+        client_packet_id,
+        wire_len: packet.len(),
+    })
+}
+
+fn fixed_length_raw_key(bytes: &[u8], key_len: usize) -> Vec<u8> {
+    let mut raw = vec![0u8; key_len];
+    let copy_len = bytes.len().min(key_len);
+    raw[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    raw
 }
 
 fn normalize_psk(value: &[u8], key_len: usize) -> anyhow::Result<Vec<u8>> {
@@ -732,10 +859,60 @@ fn encrypt_packet_body(
     plaintext: &[u8],
     context: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let cipher = match method {
-        Aead2022Method::Aes128Gcm => Cipher::aes_128_gcm(),
-        Aead2022Method::Aes256Gcm => Cipher::aes_256_gcm(),
-    };
+    match method {
+        Aead2022Method::Aes128Gcm => {
+            encrypt_boring_symm(Cipher::aes_128_gcm(), key, nonce, plaintext, context)
+        }
+        Aead2022Method::Aes256Gcm => {
+            encrypt_boring_symm(Cipher::aes_256_gcm(), key, nonce, plaintext, context)
+        }
+        Aead2022Method::ChaCha20Poly1305 => {
+            let algorithm = match nonce.len() {
+                12 => Algorithm::chacha20_poly1305(),
+                24 => Algorithm::xchacha20_poly1305(),
+                other => {
+                    bail!("unsupported chacha nonce length {other} for {context}");
+                }
+            };
+            encrypt_boring_aead(algorithm, key, nonce, plaintext, context)
+        }
+    }
+}
+
+fn decrypt_packet_body(
+    method: Aead2022Method,
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    context: &str,
+) -> anyhow::Result<Vec<u8>> {
+    match method {
+        Aead2022Method::Aes128Gcm => {
+            decrypt_boring_symm(Cipher::aes_128_gcm(), key, nonce, ciphertext, context)
+        }
+        Aead2022Method::Aes256Gcm => {
+            decrypt_boring_symm(Cipher::aes_256_gcm(), key, nonce, ciphertext, context)
+        }
+        Aead2022Method::ChaCha20Poly1305 => {
+            let algorithm = match nonce.len() {
+                12 => Algorithm::chacha20_poly1305(),
+                24 => Algorithm::xchacha20_poly1305(),
+                other => {
+                    bail!("unsupported chacha nonce length {other} for {context}");
+                }
+            };
+            decrypt_boring_aead(algorithm, key, nonce, ciphertext, context)
+        }
+    }
+}
+
+fn encrypt_boring_symm(
+    cipher: Cipher,
+    key: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+    context: &str,
+) -> anyhow::Result<Vec<u8>> {
     let mut tag = [0u8; TAG_LEN];
     let mut ciphertext = symm::encrypt_aead(cipher, key, Some(nonce), &[], plaintext, &mut tag)
         .with_context(|| context.to_string())?;
@@ -743,8 +920,8 @@ fn encrypt_packet_body(
     Ok(ciphertext)
 }
 
-fn decrypt_packet_body(
-    method: Aead2022Method,
+fn decrypt_boring_symm(
+    cipher: Cipher,
     key: &[u8],
     nonce: &[u8],
     ciphertext: &[u8],
@@ -755,14 +932,81 @@ fn decrypt_packet_body(
         "ciphertext too short for {context}: {}",
         ciphertext.len()
     );
-    let cipher = match method {
-        Aead2022Method::Aes128Gcm => Cipher::aes_128_gcm(),
-        Aead2022Method::Aes256Gcm => Cipher::aes_256_gcm(),
-    };
     let split = ciphertext.len() - TAG_LEN;
     let (data, tag) = ciphertext.split_at(split);
     symm::decrypt_aead(cipher, key, Some(nonce), &[], data, tag)
         .with_context(|| context.to_string())
+}
+
+fn encrypt_boring_aead(
+    algorithm: Algorithm,
+    key: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+    context: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let ctx = AeadCtx::new_default_tag(&algorithm, key).with_context(|| context.to_string())?;
+    let mut buffer = plaintext.to_vec();
+    let mut tag = vec![0u8; algorithm.max_overhead()];
+    let tag = ctx
+        .seal_in_place(nonce, &mut buffer, &mut tag, &[])
+        .with_context(|| context.to_string())?;
+    buffer.extend_from_slice(tag);
+    Ok(buffer)
+}
+
+fn decrypt_boring_aead(
+    algorithm: Algorithm,
+    key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    context: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let ctx = AeadCtx::new_default_tag(&algorithm, key).with_context(|| context.to_string())?;
+    let tag_len = algorithm.max_overhead();
+    ensure!(
+        ciphertext.len() >= tag_len,
+        "ciphertext too short for {context}: {}",
+        ciphertext.len()
+    );
+    let split = ciphertext.len() - tag_len;
+    let (data, tag) = ciphertext.split_at(split);
+    let mut buffer = data.to_vec();
+    ctx.open_in_place(nonce, &mut buffer, tag, &[])
+        .with_context(|| context.to_string())?;
+    Ok(buffer)
+}
+
+fn encode_udp_response_chacha(
+    session: &mut UdpSession,
+    destination: &SocksAddr,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let nonce = random_bytes(UDP_CHACHA_NONCE_LEN)?;
+    let packet_id = session.next_server_packet_id;
+    session.next_server_packet_id = session.next_server_packet_id.wrapping_add(1);
+
+    let mut body_plain =
+        Vec::with_capacity(8 + 8 + 1 + 8 + 8 + 2 + address_wire_len(destination) + payload.len());
+    body_plain.extend_from_slice(&session.server_session_id.to_be_bytes());
+    body_plain.extend_from_slice(&packet_id.to_be_bytes());
+    body_plain.push(HEADER_TYPE_SERVER);
+    body_plain.extend_from_slice(&(current_unix_time()? as u64).to_be_bytes());
+    body_plain.extend_from_slice(&session.client_session_id.to_be_bytes());
+    body_plain.extend_from_slice(&0u16.to_be_bytes());
+    write_socks_addr(&mut body_plain, destination)?;
+    body_plain.extend_from_slice(payload);
+
+    let body = encrypt_packet_body(
+        Aead2022Method::ChaCha20Poly1305,
+        &session.credential.secret,
+        &nonce,
+        &body_plain,
+        "encrypt Shadowsocks 2022 UDP response payload",
+    )?;
+    let mut packet = nonce;
+    packet.extend_from_slice(&body);
+    Ok(packet)
 }
 
 fn ecb_crypt(
@@ -836,17 +1080,25 @@ where
 mod tests {
     use super::*;
     use crate::accounting::UserEntry;
+    use crate::protocols::shadowsocks::crypto::Method;
 
     fn sample_credential(method: Aead2022Method) -> UserCredential {
         let secret = derive_user_psk(
             &PanelUser {
                 id: 1,
+                password: "12345678-1234-1234-1234-123456789abc".to_string(),
                 uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
                 ..Default::default()
             },
             method,
         )
         .expect("user psk");
+        let server_psk = match method {
+            Aead2022Method::Aes128Gcm => "QUJDREVGR0hJSktMTU5PUA==",
+            Aead2022Method::Aes256Gcm | Aead2022Method::ChaCha20Poly1305 => {
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+            }
+        };
         UserCredential {
             user: UserEntry {
                 id: 1,
@@ -856,8 +1108,7 @@ mod tests {
             },
             method: super::super::crypto::Method::Aead2022(method),
             secret: secret.clone(),
-            server_secret: decode_server_psk("QUJDREVGR0hJSktMTU5PUA==", method)
-                .expect("server psk"),
+            server_secret: decode_server_psk(server_psk, method).expect("server psk"),
             identity_hash: identity_hash(&secret),
         }
     }
@@ -874,6 +1125,54 @@ mod tests {
         )
         .expect("key");
         assert_eq!(key, b"12345678-1234-12");
+    }
+
+    #[test]
+    fn derives_user_key_from_password_prefix_when_present() {
+        let key = derive_user_psk(
+            &PanelUser {
+                id: 1,
+                password: "password-based-key-material".to_string(),
+                uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
+                ..Default::default()
+            },
+            Aead2022Method::Aes128Gcm,
+        )
+        .expect("key");
+        assert_eq!(key, b"password-based-k");
+    }
+
+    #[test]
+    fn derives_user_key_from_base64_password() {
+        let key = derive_user_psk(
+            &PanelUser {
+                id: 1,
+                password: "MTIzNDU2Nzg5MEFCQ0RFRg==".to_string(),
+                ..Default::default()
+            },
+            Aead2022Method::Aes128Gcm,
+        )
+        .expect("key");
+        assert_eq!(key, b"1234567890ABCDEF");
+    }
+
+    #[test]
+    fn treats_uuid_as_raw_material_instead_of_base64() {
+        let key = derive_user_psk(
+            &PanelUser {
+                id: 1,
+                uuid: "1234567890abcdef1234567890abcdef".to_string(),
+                ..Default::default()
+            },
+            Aead2022Method::Aes128Gcm,
+        )
+        .expect("key");
+        assert_eq!(key, b"1234567890abcdef");
+    }
+
+    #[test]
+    fn accepts_large_tcp_chunk_lengths() {
+        assert_eq!(MAX_TCP_CHUNK_LEN, u16::MAX as usize);
     }
 
     #[test]
@@ -903,5 +1202,127 @@ mod tests {
         )
         .expect("packet");
         assert!(packet.len() > 16 + TAG_LEN);
+    }
+
+    #[test]
+    fn chacha_udp_identification_uses_nonce_prefixed_single_user_format() {
+        let credential = sample_credential(Aead2022Method::ChaCha20Poly1305);
+        let client_session_id = 9u64;
+        let client_packet_id = 2u64;
+        let nonce = vec![7u8; UDP_CHACHA_NONCE_LEN];
+
+        let mut body_plain = Vec::new();
+        body_plain.extend_from_slice(&client_session_id.to_be_bytes());
+        body_plain.extend_from_slice(&client_packet_id.to_be_bytes());
+        body_plain.push(HEADER_TYPE_CLIENT);
+        body_plain.extend_from_slice(&(current_unix_time().expect("time") as u64).to_be_bytes());
+        body_plain.extend_from_slice(&0u16.to_be_bytes());
+        write_socks_addr(
+            &mut body_plain,
+            &SocksAddr::Domain("example.com".to_string(), 443),
+        )
+        .expect("addr");
+        body_plain.extend_from_slice(b"hello");
+        let body = encrypt_packet_body(
+            Aead2022Method::ChaCha20Poly1305,
+            &credential.secret,
+            &nonce,
+            &body_plain,
+            "encrypt test udp body",
+        )
+        .expect("body");
+
+        let mut packet = nonce;
+        packet.extend_from_slice(&body);
+        let identified =
+            identify_udp_request(&packet, std::slice::from_ref(&credential)).expect("identify");
+        assert_eq!(identified.client_session_id, client_session_id);
+        assert_eq!(identified.client_packet_id, client_packet_id);
+        assert_eq!(identified.credential.user.id, credential.user.id);
+    }
+
+    #[test]
+    fn chacha_udp_response_uses_nonce_prefixed_format() {
+        let credential = sample_credential(Aead2022Method::ChaCha20Poly1305);
+        let identified = UdpIdentification {
+            credential: credential.clone(),
+            packet_header: [0u8; 16],
+            client_session_id: 9,
+            client_packet_id: 0,
+            wire_len: 0,
+        };
+        let mut session = UdpSession::new(&identified).expect("session");
+        let packet = encode_udp_response(
+            &mut session,
+            &SocksAddr::Domain("example.com".to_string(), 443),
+            b"hello",
+        )
+        .expect("packet");
+        assert!(packet.len() > UDP_CHACHA_NONCE_LEN + TAG_LEN);
+    }
+
+    #[test]
+    fn chacha_tcp_accept_uses_single_user_format_without_identity_header() {
+        let credential = sample_credential(Aead2022Method::ChaCha20Poly1305);
+        let request_salt = vec![7u8; credential.secret.len()];
+        let session_key =
+            session_subkey(&credential.secret, &request_salt, credential.secret.len());
+
+        let mut variable_plain = Vec::new();
+        write_socks_addr(
+            &mut variable_plain,
+            &SocksAddr::Domain("example.com".to_string(), 443),
+        )
+        .expect("addr");
+        variable_plain.extend_from_slice(&0u16.to_be_bytes());
+        variable_plain.extend_from_slice(b"hello");
+        let fixed_plain = {
+            let mut bytes = Vec::new();
+            bytes.push(HEADER_TYPE_CLIENT);
+            bytes.extend_from_slice(&(current_unix_time().expect("time") as u64).to_be_bytes());
+            bytes.extend_from_slice(&(variable_plain.len() as u16).to_be_bytes());
+            bytes
+        };
+
+        let mut request = request_salt.clone();
+        request.extend_from_slice(
+            &encrypt_tcp_chunk(
+                Aead2022Method::ChaCha20Poly1305,
+                &session_key,
+                0,
+                &fixed_plain,
+                "encrypt fixed",
+            )
+            .expect("fixed"),
+        );
+        request.extend_from_slice(
+            &encrypt_tcp_chunk(
+                Aead2022Method::ChaCha20Poly1305,
+                &session_key,
+                1,
+                &variable_plain,
+                "encrypt variable",
+            )
+            .expect("variable"),
+        );
+
+        let replay = TcpReplayCache::default();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let accepted = runtime
+            .block_on(AcceptedTcpReader::accept(
+                std::io::Cursor::new(request),
+                std::slice::from_ref(&credential),
+                &replay,
+            ))
+            .expect("accept");
+        assert_eq!(accepted.credential().user.id, credential.user.id);
+    }
+
+    #[test]
+    fn parses_chacha_method() {
+        assert!(matches!(
+            Method::parse("2022-blake3-chacha20-poly1305"),
+            Some(Method::Aead2022(Aead2022Method::ChaCha20Poly1305))
+        ));
     }
 }

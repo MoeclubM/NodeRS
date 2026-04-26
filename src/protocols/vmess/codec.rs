@@ -4,7 +4,7 @@ use anyhow::{Context, bail, ensure};
 
 use crate::protocols::anytls::socksaddr::SocksAddr;
 
-use super::crypto::{BodyConfig, BodyReader, RequestOptions, SecurityType};
+use super::crypto::{BodyConfig, RequestOptions, SecurityType};
 
 const VMESS_VERSION: u8 = 0x01;
 const COMMAND_TCP: u8 = 0x01;
@@ -125,33 +125,6 @@ pub fn parse_request_header(header: &[u8]) -> anyhow::Result<Request> {
         request_body_iv,
         request_body_key,
     })
-}
-
-pub async fn read_udp_frame<R>(reader: &mut BodyReader<R>) -> anyhow::Result<Option<Vec<u8>>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let Some(length_bytes) = reader.read_exact_plain_or_eof(2).await? else {
-        return Ok(None);
-    };
-    let length = u16::from_be_bytes([length_bytes[0], length_bytes[1]]) as usize;
-    let payload = reader
-        .read_exact_plain(length)
-        .await
-        .with_context(|| format!("read VMess UDP payload of {length} bytes"))?;
-    Ok(Some(payload))
-}
-
-pub fn encode_udp_frame(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    ensure!(
-        payload.len() <= u16::MAX as usize,
-        "VMess UDP payload too large: {}",
-        payload.len()
-    );
-    let mut frame = Vec::with_capacity(2 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
 }
 
 fn parse_destination(data: &[u8]) -> anyhow::Result<(SocksAddr, usize)> {
@@ -294,11 +267,5 @@ mod tests {
         let last = header.len() - 1;
         header[last] ^= 0xff;
         assert!(parse_request_header(&header).is_err());
-    }
-
-    #[test]
-    fn encodes_udp_frame() {
-        let frame = encode_udp_frame(b"hello").unwrap();
-        assert_eq!(frame, b"\x00\x05hello");
     }
 }

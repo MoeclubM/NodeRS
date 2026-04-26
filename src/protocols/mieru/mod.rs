@@ -1,7 +1,9 @@
 mod codec;
 mod crypto;
+mod traffic_pattern;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use rand::RngExt;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -31,6 +33,7 @@ const COPY_BUFFER_LEN: usize = 32 * 1024;
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
+    pub traffic_pattern: traffic_pattern::TrafficPatternConfig,
     pub routing: routing::RoutingTable,
 }
 
@@ -38,6 +41,7 @@ pub struct ServerController {
     accounting: Arc<Accounting>,
     panel_users: Arc<RwLock<Vec<PanelUser>>>,
     users: Arc<RwLock<UserValidator>>,
+    traffic_pattern: Arc<RwLock<traffic_pattern::TrafficPatternConfig>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     replay: Arc<ReplayCache>,
     inner: Mutex<Option<RunningServer>>,
@@ -68,6 +72,7 @@ struct ReplayCache {
 struct ConnectionWriter {
     stream: WriteHalf<TcpStream>,
     cipher: crypto::CipherState,
+    traffic_pattern: traffic_pattern::TrafficPattern,
 }
 
 struct SessionState {
@@ -89,6 +94,8 @@ impl EffectiveNodeConfig {
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
+            traffic_pattern: traffic_pattern::TrafficPatternConfig::decode(&remote.traffic_pattern)
+                .context("decode Mieru traffic_pattern")?,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
                 &remote.custom_outbounds,
@@ -105,6 +112,9 @@ impl ServerController {
             accounting,
             panel_users: Arc::new(RwLock::new(Vec::new())),
             users: Arc::new(RwLock::new(UserValidator::default())),
+            traffic_pattern: Arc::new(
+                RwLock::new(traffic_pattern::TrafficPatternConfig::default()),
+            ),
             routing: Arc::new(RwLock::new(routing::RoutingTable::default())),
             replay: Arc::new(ReplayCache::default()),
             inner: Mutex::new(None),
@@ -129,6 +139,10 @@ impl ServerController {
             .clone();
         *self.users.write().expect("mieru users lock poisoned") =
             UserValidator::from_users(&users)?;
+        *self
+            .traffic_pattern
+            .write()
+            .expect("mieru traffic pattern lock poisoned") = config.traffic_pattern;
         *self.routing.write().expect("mieru routing lock poisoned") = config.routing;
 
         let old = {
@@ -159,10 +173,19 @@ impl ServerController {
         for listener in listeners {
             let accounting = self.accounting.clone();
             let users = self.users.clone();
+            let traffic_pattern = self.traffic_pattern.clone();
             let routing = self.routing.clone();
             let replay = self.replay.clone();
             handles.push(tokio::spawn(async move {
-                accept_loop(listener, accounting, users, routing, replay).await;
+                accept_loop(
+                    listener,
+                    accounting,
+                    users,
+                    traffic_pattern,
+                    routing,
+                    replay,
+                )
+                .await;
             }));
         }
 
@@ -249,6 +272,7 @@ async fn accept_loop(
     listener: TcpListener,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
+    traffic_pattern: Arc<RwLock<traffic_pattern::TrafficPatternConfig>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     replay: Arc<ReplayCache>,
 ) {
@@ -267,13 +291,26 @@ async fn accept_loop(
         configure_tcp_stream(&stream);
         let accounting = accounting.clone();
         let users = users.clone();
+        let traffic_pattern = traffic_pattern.clone();
         let routing = routing.clone();
         let replay = replay.clone();
         tokio::spawn(async move {
             let users = users.read().expect("mieru users lock poisoned").clone();
+            let traffic_pattern = traffic_pattern
+                .read()
+                .expect("mieru traffic pattern lock poisoned")
+                .clone();
             let routing = routing.read().expect("mieru routing lock poisoned").clone();
-            if let Err(error) =
-                serve_underlay_connection(stream, source, accounting, users, routing, replay).await
+            if let Err(error) = serve_underlay_connection(
+                stream,
+                source,
+                accounting,
+                users,
+                traffic_pattern,
+                routing,
+                replay,
+            )
+            .await
             {
                 warn!(%error, %source, "Mieru TCP underlay terminated with error");
             }
@@ -286,13 +323,19 @@ async fn serve_underlay_connection(
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
+    traffic_pattern: traffic_pattern::TrafficPatternConfig,
     routing: routing::RoutingTable,
     replay: Arc<ReplayCache>,
 ) -> anyhow::Result<()> {
     let (mut reader, writer) = split(stream);
     let (credential, key, mut recv_cipher, first_metadata) = match timeout(
         AUTHENTICATION_TIMEOUT,
-        authenticate_connection(&mut reader, &users, &replay),
+        authenticate_connection(
+            &mut reader,
+            &users,
+            &replay,
+            traffic_pattern.effective().nonce.clone(),
+        ),
     )
     .await
     {
@@ -301,7 +344,12 @@ async fn serve_underlay_connection(
     };
     let writer = Arc::new(AsyncMutex::new(ConnectionWriter {
         stream: writer,
-        cipher: crypto::CipherState::new(key, Some(credential.name.clone())),
+        cipher: crypto::CipherState::new(
+            key,
+            Some(credential.name.clone()),
+            traffic_pattern.effective().nonce.clone(),
+        ),
+        traffic_pattern: traffic_pattern.effective().clone(),
     }));
     let sessions = Arc::new(AsyncMutex::new(HashMap::<u32, Arc<SessionState>>::new()));
 
@@ -347,6 +395,7 @@ async fn authenticate_connection<R>(
     reader: &mut R,
     users: &UserValidator,
     replay: &ReplayCache,
+    nonce_pattern: traffic_pattern::NoncePattern,
 ) -> anyhow::Result<(UserCredential, [u8; 32], crypto::CipherState, Metadata)>
 where
     R: AsyncRead + Unpin,
@@ -387,7 +436,7 @@ where
             return Ok((
                 user,
                 key,
-                crypto::CipherState::from_received(key, nonce, None),
+                crypto::CipherState::from_received(key, nonce, None, nonce_pattern.clone()),
                 metadata,
             ));
         }
@@ -749,19 +798,62 @@ async fn write_segment(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     let mut writer = writer.lock().await;
+    let traffic_pattern = writer.traffic_pattern.clone();
     let encoded_metadata = writer.cipher.encrypt(metadata)?;
-    writer
-        .stream
-        .write_all(&encoded_metadata)
-        .await
-        .context("write Mieru metadata")?;
+    write_with_possible_fragment(
+        &mut writer.stream,
+        &traffic_pattern,
+        &encoded_metadata,
+        "write Mieru metadata",
+    )
+    .await?;
     if !payload.is_empty() {
         let encoded_payload = writer.cipher.encrypt(payload)?;
-        writer
-            .stream
-            .write_all(&encoded_payload)
+        write_with_possible_fragment(
+            &mut writer.stream,
+            &traffic_pattern,
+            &encoded_payload,
+            "write Mieru payload",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn write_with_possible_fragment(
+    stream: &mut WriteHalf<TcpStream>,
+    traffic_pattern: &traffic_pattern::TrafficPattern,
+    bytes: &[u8],
+    context: &str,
+) -> anyhow::Result<()> {
+    if !traffic_pattern.tcp_fragment.enable || bytes.is_empty() {
+        stream
+            .write_all(bytes)
             .await
-            .context("write Mieru payload")?;
+            .with_context(|| context.to_string())?;
+        return Ok(());
+    }
+
+    let total_len = bytes.len();
+    let min_len = (total_len as f64).sqrt() as usize + 1;
+    let max_len = min_len.max(total_len / 2);
+    let mut sent = 0usize;
+    while sent < total_len {
+        let remaining = total_len - sent;
+        let chunk_len = if min_len >= max_len {
+            remaining.min(max_len.max(1))
+        } else {
+            rand::rng().random_range(min_len..=max_len).min(remaining)
+        };
+        stream
+            .write_all(&bytes[sent..sent + chunk_len])
+            .await
+            .with_context(|| context.to_string())?;
+        sent += chunk_len;
+        if sent < total_len && traffic_pattern.tcp_fragment.max_sleep_ms > 0 {
+            let sleep_ms = rand::rng().random_range(0..=traffic_pattern.tcp_fragment.max_sleep_ms);
+            tokio::time::sleep(Duration::from_millis(u64::from(sleep_ms))).await;
+        }
     }
     Ok(())
 }
@@ -809,6 +901,10 @@ async fn cancel_all_sessions(sessions: &Arc<AsyncMutex<HashMap<u32, Arc<SessionS
 }
 
 fn parse_transport(value: Option<&Value>) -> anyhow::Result<()> {
+    if value.is_some_and(|value| !json_value_effectively_enabled(value)) {
+        return Ok(());
+    }
+
     match value {
         None | Some(Value::Null) => Ok(()),
         Some(Value::String(text))
@@ -843,13 +939,14 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
         bail!("Xboard network must be tcp for Mieru nodes");
     }
-    if remote.network_settings.is_some() {
+    if remote
+        .network_settings
+        .as_ref()
+        .is_some_and(json_value_effectively_enabled)
+    {
         bail!("Xboard networkSettings is not supported by NodeRS Mieru server yet");
     }
     parse_transport(remote.transport.as_ref())?;
-    if !remote.traffic_pattern.trim().is_empty() {
-        bail!("Xboard traffic_pattern is not supported by NodeRS Mieru server yet");
-    }
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS Mieru server yet");
     }
@@ -865,14 +962,38 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn effective_identity(user: &PanelUser) -> Option<&str> {
-    let password = user.password.trim();
-    if !password.is_empty() {
-        return Some(password);
+fn json_value_effectively_enabled(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            !matches!(
+                normalized.as_str(),
+                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
+            )
+        }
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => object
+            .get("enabled")
+            .map(json_value_effectively_enabled)
+            .unwrap_or(!object.is_empty()),
     }
+}
+
+fn effective_identity(user: &PanelUser) -> Option<&str> {
     let uuid = user.uuid.trim();
     if !uuid.is_empty() {
         return Some(uuid);
+    }
+    let password = user.password.trim();
+    if !password.is_empty() {
+        return Some(password);
     }
     None
 }
@@ -886,6 +1007,7 @@ fn is_clean_eof(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -903,7 +1025,11 @@ mod tests {
         payload: &[u8],
     ) -> anyhow::Result<([u8; 32], Vec<u8>)> {
         let key = crypto::derive_keys(&user.hashed_password, std::time::SystemTime::now())?[1];
-        let mut cipher = crypto::CipherState::new(key, Some(user.name.clone()));
+        let mut cipher = crypto::CipherState::new(
+            key,
+            Some(user.name.clone()),
+            traffic_pattern::NoncePattern::default(),
+        );
         let metadata = codec::encode_session_metadata(
             ProtocolType::OpenSessionRequest,
             session_id,
@@ -941,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn user_validator_uses_password_before_uuid() {
+    fn user_validator_uses_uuid_before_password() {
         let validator = UserValidator::from_users(&[PanelUser {
             id: 1,
             uuid: "uuid-secret".to_string(),
@@ -949,7 +1075,40 @@ mod tests {
             ..Default::default()
         }])
         .expect("validator");
-        assert_eq!(validator.users[0].name, "real-secret");
+        assert_eq!(validator.users[0].name, "uuid-secret");
+    }
+
+    #[test]
+    fn accepts_xboard_mieru_traffic_pattern() {
+        let remote = NodeConfigResponse {
+            traffic_pattern: base64::engine::general_purpose::STANDARD
+                .encode(traffic_pattern::build_pattern_bytes_for_test()),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(config.traffic_pattern.effective().tcp_fragment.enable);
+        assert_eq!(
+            config.traffic_pattern.effective().nonce.kind,
+            traffic_pattern::NoncePatternKind::PrintableSubset
+        );
+    }
+
+    #[test]
+    fn accepts_disabled_network_settings_and_transport_object() {
+        let remote = NodeConfigResponse {
+            network_settings: Some(serde_json::json!({
+                "enabled": false,
+                "header": { "type": "none" }
+            })),
+            transport: Some(serde_json::json!({
+                "enabled": false,
+                "type": "udp"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 8964);
     }
 
     #[tokio::test]
@@ -985,6 +1144,7 @@ mod tests {
                 UserValidator {
                     users: vec![server_user],
                 },
+                traffic_pattern::TrafficPatternConfig::default(),
                 routing::RoutingTable::default(),
                 replay,
             )
@@ -1015,7 +1175,8 @@ mod tests {
         let (key, frame) = build_client_open_frame(&user, 1, &request).expect("frame");
         client_writer.write_all(&frame).await.expect("client write");
 
-        let mut client_recv = crypto::CipherState::new(key, None);
+        let mut client_recv =
+            crypto::CipherState::new(key, None, traffic_pattern::NoncePattern::default());
         let (metadata, payload) = read_client_segment(&mut client_reader, &mut client_recv)
             .await
             .expect("open response");

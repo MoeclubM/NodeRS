@@ -4,6 +4,8 @@ use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::traffic_pattern::{NoncePattern, NoncePatternState};
+
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
@@ -19,14 +21,16 @@ pub struct CipherState {
     key: [u8; KEY_LEN],
     nonce: Option<[u8; NONCE_LEN]>,
     user_name: Option<String>,
+    nonce_pattern: Option<NoncePatternState>,
 }
 
 impl CipherState {
-    pub fn new(key: [u8; KEY_LEN], user_name: Option<String>) -> Self {
+    pub fn new(key: [u8; KEY_LEN], user_name: Option<String>, nonce_pattern: NoncePattern) -> Self {
         Self {
             key,
             nonce: None,
             user_name,
+            nonce_pattern: Some(NoncePatternState::new(nonce_pattern)),
         }
     }
 
@@ -34,11 +38,13 @@ impl CipherState {
         key: [u8; KEY_LEN],
         nonce: [u8; NONCE_LEN],
         user_name: Option<String>,
+        nonce_pattern: NoncePattern,
     ) -> Self {
         Self {
             key,
             nonce: Some(nonce),
             user_name,
+            nonce_pattern: Some(NoncePatternState::new(nonce_pattern)),
         }
     }
 
@@ -49,6 +55,9 @@ impl CipherState {
             *current
         } else {
             let mut nonce = random_nonce()?;
+            if let Some(pattern) = self.nonce_pattern.as_ref() {
+                pattern.rewrite_nonce(&mut nonce, true);
+            }
             if let Some(user_name) = self.user_name.as_deref() {
                 apply_user_hint(&mut nonce, user_name);
             }
@@ -221,8 +230,8 @@ mod tests {
     #[test]
     fn roundtrips_implicit_nonce_cipher() {
         let key = [3u8; KEY_LEN];
-        let mut send = CipherState::new(key, Some("user".to_string()));
-        let mut recv = CipherState::new(key, None);
+        let mut send = CipherState::new(key, Some("user".to_string()), NoncePattern::default());
+        let mut recv = CipherState::new(key, None, NoncePattern::default());
         let first = send.encrypt(b"metadata").expect("encrypt first");
         let second = send.encrypt(b"payload").expect("encrypt second");
         assert_eq!(recv.decrypt(&first).expect("decrypt first"), b"metadata");
