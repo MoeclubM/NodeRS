@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from statistics import median
@@ -1019,6 +1020,35 @@ def binary_path(target_dir: pathlib.Path, target: str, name: str) -> pathlib.Pat
     return target_dir / target / "release" / name
 
 
+def package_name_from_manifest_text(manifest_text: str, *, source: str) -> str:
+    try:
+        manifest = tomllib.loads(manifest_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise RuntimeError(f"unable to parse Cargo manifest from {source}") from exc
+
+    package = manifest.get("package")
+    if not isinstance(package, dict):
+        raise RuntimeError(f"missing [package] section in Cargo manifest from {source}")
+
+    name = package.get("name")
+    if not isinstance(name, str) or not name:
+        raise RuntimeError(f"missing package name in Cargo manifest from {source}")
+
+    return name
+
+
+def package_name_from_manifest(manifest_path: pathlib.Path) -> str:
+    try:
+        return package_name_from_manifest_text(manifest_path.read_text(encoding="utf-8"), source=str(manifest_path))
+    except OSError as exc:
+        raise RuntimeError(f"unable to read Cargo manifest from {manifest_path}") from exc
+
+
+def package_name_for_ref(ref: str) -> str:
+    manifest_text = run_checked(["git", "show", f"{ref}:Cargo.toml"], capture_output=True).stdout
+    return package_name_from_manifest_text(manifest_text, source=f"{ref}:Cargo.toml")
+
+
 def build_current_variant(
     output_dir: pathlib.Path,
     target: str,
@@ -1026,6 +1056,7 @@ def build_current_variant(
     label: str,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     target_dir = output_dir / "build-current" / label
+    node_binary_name = package_name_from_manifest(ROOT / "Cargo.toml")
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
     command = [
@@ -1036,26 +1067,26 @@ def build_current_variant(
         "--target",
         target,
         "--bin",
-        "noders",
+        node_binary_name,
         "--bin",
         "bench_anytls",
     ]
     run_checked(command, env=env)
-    return binary_path(target_dir, target, "noders"), binary_path(target_dir, target, "bench_anytls")
+    return binary_path(target_dir, target, node_binary_name), binary_path(target_dir, target, "bench_anytls")
 
 
-def release_asset_name_for_target(ref: str, target: str) -> str | None:
+def release_asset_name_for_target(ref: str, target: str, *, binary_name: str) -> str | None:
     target_asset_names = {
-        "x86_64-unknown-linux-musl": f"noders-{ref}-linux-amd64-musl.tar.gz",
-        "x86_64-unknown-linux-gnu": f"noders-{ref}-linux-amd64.tar.gz",
-        "aarch64-unknown-linux-musl": f"noders-{ref}-linux-arm64-musl.tar.gz",
-        "aarch64-unknown-linux-gnu": f"noders-{ref}-linux-arm64.tar.gz",
+        "x86_64-unknown-linux-musl": f"{binary_name}-{ref}-linux-amd64-musl.tar.gz",
+        "x86_64-unknown-linux-gnu": f"{binary_name}-{ref}-linux-amd64.tar.gz",
+        "aarch64-unknown-linux-musl": f"{binary_name}-{ref}-linux-arm64-musl.tar.gz",
+        "aarch64-unknown-linux-gnu": f"{binary_name}-{ref}-linux-arm64.tar.gz",
     }
     return target_asset_names.get(target)
 
 
-def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Path | None:
-    asset_name = release_asset_name_for_target(ref, target)
+def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str, binary_name: str) -> pathlib.Path | None:
+    asset_name = release_asset_name_for_target(ref, target, binary_name=binary_name)
     if asset_name is None:
         return None
 
@@ -1070,7 +1101,7 @@ def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str) -> 
     release_root = output_dir / "release-binaries"
     release_root.mkdir(parents=True, exist_ok=True)
     extract_root = release_root / ref.replace("/", "_")
-    binary_path_local = extract_root / asset_name[: -len(".tar.gz")] / "noders"
+    binary_path_local = extract_root / asset_name[: -len(".tar.gz")] / binary_name
     if binary_path_local.exists():
         return binary_path_local
 
@@ -1086,7 +1117,8 @@ def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str) -> 
 
 
 def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Path:
-    released_binary = download_ref_release(ref, output_dir=output_dir, target=target)
+    binary_name = package_name_for_ref(ref)
+    released_binary = download_ref_release(ref, output_dir=output_dir, target=target, binary_name=binary_name)
     if released_binary is not None:
         return released_binary
 
@@ -1109,14 +1141,14 @@ def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Pat
                 "--target",
                 target,
                 "--bin",
-                "noders",
+                binary_name,
             ],
             cwd=worktree_path,
             env=env,
         )
     finally:
         run_checked(["git", "worktree", "remove", "--force", str(worktree_path)])
-    return binary_path(target_dir, target, "noders")
+    return binary_path(target_dir, target, binary_name)
 
 
 def github_json(url: str) -> dict:
