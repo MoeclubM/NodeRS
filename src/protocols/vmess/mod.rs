@@ -603,7 +603,15 @@ where
     loop {
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            read = reader.read_plain(&mut buffer) => read?,
+            read = reader.read_plain(&mut buffer) => match read {
+                Ok(read) => read,
+                Err(error) if is_broken_pipe(&error) =>
+                {
+                    let _ = writer.shutdown().await;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
         };
         if read == 0 {
             let _ = writer.shutdown().await;
@@ -611,7 +619,15 @@ where
         }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            result = writer.write_all(&buffer[..read]) => result.context("write proxied VMess TCP chunk")?,
+            result = writer.write_all(&buffer[..read]) => match result {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) => return Ok(()),
+                Err(error) => return Err(error).context("write proxied VMess TCP chunk"),
+            },
         }
         traffic.record(read as u64);
     }
@@ -630,7 +646,19 @@ where
     loop {
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            read = reader.read(&mut buffer) => read.context("read proxied VMess TCP chunk")?,
+            read = reader.read(&mut buffer) => match read {
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    writer.finish().await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("read proxied VMess TCP chunk"),
+            },
         };
         if read == 0 {
             writer.finish().await?;
@@ -642,6 +670,17 @@ where
         }
         traffic.record(read as u64);
     }
+}
+
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| {
+                error.kind() == std::io::ErrorKind::BrokenPipe
+                    || error.kind() == std::io::ErrorKind::ConnectionReset
+            })
+    })
 }
 
 async fn relay_client_to_udp<R>(
