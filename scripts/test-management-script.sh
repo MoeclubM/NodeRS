@@ -210,11 +210,50 @@ test_install_management_support_skips_self_copy() (
   fi
 )
 
+test_upgrade_skips_binary_self_copy() (
+  local tmp_root prefix_dir support_dir config_dir stdout_path stderr_path
+
+  tmp_root="$(mktemp -d)"
+  cleanup_upgrade_self_copy_test() {
+    rm -rf "$tmp_root"
+  }
+  trap cleanup_upgrade_self_copy_test EXIT
+
+  prefix_dir="$tmp_root/prefix"
+  support_dir="$prefix_dir/lib/noders"
+  config_dir="$tmp_root/config"
+  install -d "$support_dir/lib" "$support_dir/packaging/systemd" "$prefix_dir/bin" "$config_dir"
+
+  cp "$ROOT_DIR/scripts/install.sh" "$support_dir/install.sh"
+  cp "$ROOT_DIR/scripts/install-openrc.sh" "$support_dir/install-openrc.sh"
+  cp "$ROOT_DIR/scripts/upgrade.sh" "$support_dir/upgrade.sh"
+  cp "$ROOT_DIR/scripts/lib/install-common.sh" "$support_dir/lib/install-common.sh"
+  cp "$ROOT_DIR/packaging/systemd/noders.service" "$support_dir/packaging/systemd/noders.service"
+  install -m 0755 /bin/sh "$support_dir/noders"
+
+  stdout_path="$tmp_root/stdout"
+  stderr_path="$tmp_root/stderr"
+  if ! bash "$support_dir/upgrade.sh" --prefix "$prefix_dir" --config-dir "$config_dir" --no-restart >"$stdout_path" 2>"$stderr_path"; then
+    echo "upgrade.sh failed when running from installed support directory" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+
+  if grep -Fq "are the same file" "$stderr_path"; then
+    echo "upgrade.sh still hit same-file install error for binary self-copy" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+
+  assert_contains "Upgraded NodeRS" "$stdout_path" "upgrade.sh did not finish successfully in binary self-copy scenario"
+)
+
 main() {
   test_validate_args
   test_management_script_filters_invalid_units
   test_upgrade_rejects_legacy_layout
   test_install_management_support_skips_self_copy
+  test_upgrade_skips_binary_self_copy
 }
 
 main "$@"
