@@ -1377,6 +1377,18 @@ impl MachinePanelClient {
     pub fn websocket_url(&self, ws_url: &str) -> anyhow::Result<String> {
         let mut url =
             reqwest::Url::parse(ws_url).with_context(|| format!("parse websocket url {ws_url}"))?;
+        match url.scheme() {
+            "ws" | "wss" => {}
+            "http" => {
+                url.set_scheme("ws")
+                    .map_err(|_| anyhow::anyhow!("convert websocket scheme to ws failed for {ws_url}"))?;
+            }
+            "https" => {
+                url.set_scheme("wss")
+                    .map_err(|_| anyhow::anyhow!("convert websocket scheme to wss failed for {ws_url}"))?;
+            }
+            other => bail!("unsupported websocket scheme {other} in {ws_url}"),
+        }
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("token", &self.token);
@@ -2540,6 +2552,24 @@ mod tests {
             .websocket_url("wss://panel.example.com:8076")
             .expect("websocket url");
 
+        assert!(ws_url.contains("machine_id=9"));
+        assert!(ws_url.contains("token=replace-me"));
+    }
+
+    #[test]
+    fn websocket_url_accepts_http_scheme_from_panel() {
+        let panel = MachinePanelClient::new(&PanelConfig {
+            api: "https://xboard.example.com".to_string(),
+            key: "replace-me".to_string(),
+            machine_id: 9,
+        })
+        .expect("panel client");
+
+        let ws_url = panel
+            .websocket_url("https://panel.example.com/ws")
+            .expect("websocket url");
+
+        assert!(ws_url.starts_with("wss://panel.example.com/ws"));
         assert!(ws_url.contains("machine_id=9"));
         assert!(ws_url.contains("token=replace-me"));
     }
