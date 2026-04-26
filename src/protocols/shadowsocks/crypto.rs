@@ -808,7 +808,19 @@ where
     loop {
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            read = reader.read(&mut buffer) => read.context("read raw Shadowsocks stream")?,
+            read = reader.read(&mut buffer) => match read {
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    let _ = writer.shutdown().await;
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("read raw Shadowsocks stream"),
+            },
         };
         if read == 0 {
             let _ = writer.shutdown().await;
@@ -816,7 +828,15 @@ where
         }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            result = writer.write_all(&buffer[..read]) => result.context("write raw Shadowsocks stream")?,
+            result = writer.write_all(&buffer[..read]) => match result {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) => return Ok(()),
+                Err(error) => return Err(error).context("write raw Shadowsocks stream"),
+            },
         }
     }
 }

@@ -782,7 +782,19 @@ where
     loop {
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer) => read.context("read Trojan proxied chunk")?,
+            read = reader.read(&mut buffer) => match read {
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    let _ = writer.shutdown().await;
+                    return Ok(total);
+                }
+                Err(error) => return Err(error).context("read Trojan proxied chunk"),
+            },
         };
         if read == 0 {
             let _ = writer.shutdown().await;
