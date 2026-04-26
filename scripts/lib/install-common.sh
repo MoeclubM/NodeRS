@@ -939,9 +939,6 @@ install_management_support() {
   write_management_script "$PREFIX/bin/noders"
   install -m 0755 "$staging_dir/install.sh" "$support_dir/install.sh"
   install -m 0755 "$staging_dir/install-openrc.sh" "$support_dir/install-openrc.sh"
-  if [[ -f "$staging_dir/migrate-legacy-install.sh" ]]; then
-    install -m 0755 "$staging_dir/migrate-legacy-install.sh" "$support_dir/migrate-legacy-install.sh"
-  fi
   install -m 0755 "$staging_dir/upgrade.sh" "$support_dir/upgrade.sh"
   install -m 0644 "$staging_dir/lib/install-common.sh" "$support_dir/lib/install-common.sh"
   write_manager_install_env "$support_dir/install.env"
