@@ -364,7 +364,7 @@ impl Session {
         self.connected.load(Ordering::Relaxed)
     }
 
-    async fn push_packet(&self, seq: u64, payload: Vec<u8>) -> anyhow::Result<()> {
+    async fn push_packet(&self, seq: u64, payload: Vec<u8>) -> anyhow::Result<bool> {
         ensure!(
             !*self
                 .stream_upload_started
@@ -372,10 +372,10 @@ impl Session {
                 .expect("xhttp stream upload lock poisoned"),
             "XHTTP stream-up request already exists for this session"
         );
-        self.uploads
-            .send(UploadItem::Packet { seq, payload })
-            .await
-            .map_err(|_| anyhow!("XHTTP upload session is closed"))
+        match self.uploads.send(UploadItem::Packet { seq, payload }).await {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     async fn push_stream(
@@ -1008,6 +1008,7 @@ where
                 None => completed_rx.await,
             } {
                 Ok(Ok(())) => {}
+                Ok(Err(error)) if is_broken_pipe(&error) => {}
                 Ok(Err(error)) => return Err(error),
                 Err(_) => return Err(anyhow!("XHTTP stream-up session closed unexpectedly")),
             }
@@ -1076,16 +1077,8 @@ where
                 return Ok(AcceptResult::Responded(ResponseState::Closed));
             }
         };
-        if session.push_packet(seq, payload).await.is_err() {
-            respond_status(
-                config,
-                &mut stream,
-                &parsed.request,
-                500,
-                "Internal Server Error",
-                allow_credentials,
-            )
-            .await?;
+        if !session.push_packet(seq, payload).await? {
+            respond_upload_ack(config, &mut stream, &parsed.request, allow_credentials).await?;
             return Ok(AcceptResult::Responded(ResponseState::Closed));
         }
         respond_upload_ack(config, &mut stream, &parsed.request, allow_credentials).await?;
@@ -1322,6 +1315,7 @@ async fn handle_h2_request(
                 None => completed_rx.await,
             } {
                 Ok(Ok(())) => {}
+                Ok(Err(error)) if is_broken_pipe(&error) => {}
                 Ok(Err(error)) => return Err(error),
                 Err(_) => return Err(anyhow!("XHTTP h2 stream-up session closed unexpectedly")),
             }
@@ -1356,8 +1350,8 @@ async fn handle_h2_request(
                 return Ok(());
             }
         };
-        if session.push_packet(seq, payload).await.is_err() {
-            respond_h2_status(&mut respond, &config, &request, 500, allow_credentials).await?;
+        if !session.push_packet(seq, payload).await? {
+            respond_h2_upload_ack(&mut respond, &config, &request, allow_credentials).await?;
             return Ok(());
         }
         respond_h2_upload_ack(&mut respond, &config, &request, allow_credentials).await?;
