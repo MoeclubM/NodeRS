@@ -357,6 +357,16 @@ impl ServerController {
             return Ok(());
         }
 
+        if let Some(reality) = tls.reality.as_ref() {
+            let short_id_hex = hex::encode(reality.short_id);
+            let short_id_tail = &short_id_hex[short_id_hex.len().saturating_sub(4)..];
+            info!(
+                reality_server_name = %reality.server_name,
+                reality_short_id_tail = %short_id_tail,
+                "applying VLESS REALITY TLS config"
+            );
+        }
+
         let reloaded =
             tls::load_tls_materials(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
                 .await
