@@ -482,12 +482,17 @@ refresh_openrc_unit_scripts() {
 }
 
 install_from_bundle() {
-  local staging_dir
+  local staging_dir runtime_binary
   staging_dir="$1"
+  runtime_binary="$(runtime_binary_path)"
 
   install -d "$PREFIX/bin"
   install_management_support "$staging_dir"
-  install -m 0755 "$staging_dir/noders" "$(runtime_binary_path)"
+  if [[ -e "$runtime_binary" && "$staging_dir/noders" -ef "$runtime_binary" ]]; then
+    :
+  else
+    install -m 0755 "$staging_dir/noders" "$runtime_binary"
+  fi
   rm -f "$PREFIX/bin/${SERVICE_NAME}-anytls"
 }
 
