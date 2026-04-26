@@ -237,13 +237,33 @@ impl NodeConfigResponse {
     }
 
     pub fn effective_reality_settings(&self) -> NodeRealitySettings {
-        if self.reality_settings.is_configured() {
-            self.reality_settings.clone()
-        } else if self.tls_mode() == 2 {
-            self.tls_settings.reality_settings()
-        } else {
-            NodeRealitySettings::default()
+        if self.tls_mode() != 2 {
+            return NodeRealitySettings::default();
         }
+
+        let mut settings = self.tls_settings.reality_settings();
+        let reality = &self.reality_settings;
+
+        if reality.allow_insecure {
+            settings.allow_insecure = true;
+        }
+        if !reality.server_name.trim().is_empty() {
+            settings.server_name = reality.server_name.clone();
+        }
+        if reality.server_port != 0 {
+            settings.server_port = reality.server_port;
+        }
+        if !reality.public_key.trim().is_empty() {
+            settings.public_key = reality.public_key.clone();
+        }
+        if !reality.private_key.trim().is_empty() {
+            settings.private_key = reality.private_key.clone();
+        }
+        if !reality.short_id.trim().is_empty() {
+            settings.short_id = reality.short_id.clone();
+        }
+
+        settings
     }
 }
 
@@ -2514,6 +2534,36 @@ mod tests {
         assert_eq!(reality.server_port, 7443);
         assert_eq!(reality.public_key, "reality-pub");
         assert_eq!(reality.short_id, "beef");
+    }
+
+    #[test]
+    fn merges_partial_reality_settings_with_tls_reality_fields() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": 2,
+            "tls_settings": {
+                "server_name": "tls.example.com",
+                "allow_insecure": true,
+                "server_port": 8443,
+                "public_key": "tls-pub",
+                "private_key": "tls-priv",
+                "short_id": "abcd"
+            },
+            "reality_settings": {
+                "server_name": "reality.example.com",
+                "public_key": "reality-pub"
+            }
+        }))
+        .expect("parse partial reality config");
+
+        let reality = config.effective_reality_settings();
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.server_port, 8443);
+        assert_eq!(reality.public_key, "reality-pub");
+        assert_eq!(reality.private_key, "tls-priv");
+        assert_eq!(reality.short_id, "abcd");
+        assert!(reality.allow_insecure);
     }
 
     #[test]
