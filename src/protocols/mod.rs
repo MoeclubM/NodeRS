@@ -34,8 +34,7 @@ impl ProtocolKind {
 
         if normalized == "anytls" {
             Some(Self::Anytls)
-        } else if matches!(normalized.as_str(), "hysteria" | "hysteria2" | "hy2")
-        {
+        } else if matches!(normalized.as_str(), "hysteria" | "hysteria2" | "hy2") {
             Some(Self::Hysteria2)
         } else if normalized == "mieru" {
             Some(Self::Mieru)
@@ -86,7 +85,10 @@ mod tests {
             ProtocolKind::parse("shadowsocks-2022"),
             Some(ProtocolKind::Shadowsocks)
         );
-        assert_eq!(ProtocolKind::parse("ss2022"), Some(ProtocolKind::Shadowsocks));
+        assert_eq!(
+            ProtocolKind::parse("ss2022"),
+            Some(ProtocolKind::Shadowsocks)
+        );
         assert_eq!(
             ProtocolKind::parse("vless_reality"),
             Some(ProtocolKind::Vless)
