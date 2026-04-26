@@ -1380,12 +1380,14 @@ impl MachinePanelClient {
         match url.scheme() {
             "ws" | "wss" => {}
             "http" => {
-                url.set_scheme("ws")
-                    .map_err(|_| anyhow::anyhow!("convert websocket scheme to ws failed for {ws_url}"))?;
+                url.set_scheme("ws").map_err(|_| {
+                    anyhow::anyhow!("convert websocket scheme to ws failed for {ws_url}")
+                })?;
             }
             "https" => {
-                url.set_scheme("wss")
-                    .map_err(|_| anyhow::anyhow!("convert websocket scheme to wss failed for {ws_url}"))?;
+                url.set_scheme("wss").map_err(|_| {
+                    anyhow::anyhow!("convert websocket scheme to wss failed for {ws_url}")
+                })?;
             }
             other => bail!("unsupported websocket scheme {other} in {ws_url}"),
         }
