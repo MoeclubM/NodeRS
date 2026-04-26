@@ -38,19 +38,34 @@ pub struct NodePanelClient {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeConfigResponse {
     pub protocol: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "listenIp",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub listen_ip: String,
-    #[serde(deserialize_with = "deserialize_u16_from_number_or_string")]
+    #[serde(
+        alias = "serverPort",
+        deserialize_with = "deserialize_u16_from_number_or_string"
+    )]
     pub server_port: u16,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub network: String,
     #[serde(default, alias = "networkSettings")]
     pub network_settings: Option<Value>,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "serverName",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub server_name: String,
     #[serde(default)]
     pub tls: Option<Value>,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "tlsSettings",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub tls_settings: NodeTlsSettings,
     #[serde(
         default,
@@ -76,7 +91,11 @@ pub struct NodeConfigResponse {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub plugin_opts: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "serverKey",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub server_key: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub flow: String,
@@ -97,11 +116,23 @@ pub struct NodeConfigResponse {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub obfs_password: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "congestionControl",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub congestion_control: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "authTimeout",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub auth_timeout: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "zeroRttHandshake",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub zero_rtt_handshake: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub heartbeat: String,
@@ -120,7 +151,11 @@ pub struct NodeConfigResponse {
         deserialize_with = "deserialize_string_list_on_null"
     )]
     pub alpn: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "packetEncoding",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub packet_encoding: String,
     #[serde(
         default,
@@ -138,7 +173,7 @@ pub struct NodeConfigResponse {
     pub fallbacks: Option<Value>,
     #[serde(default)]
     pub fallback: Option<Value>,
-    #[serde(default)]
+    #[serde(default, alias = "fallbackForAlpn")]
     pub fallback_for_alpn: Option<Value>,
     #[serde(
         default,
@@ -160,17 +195,29 @@ pub struct NodeConfigResponse {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub udp_over_stream: bool,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "paddingScheme",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub padding_scheme: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub routes: Vec<RouteConfig>,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "customOutbounds",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub custom_outbounds: Vec<Value>,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "customRoutes",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub custom_routes: Vec<Value>,
-    #[serde(default)]
+    #[serde(default, alias = "certConfig")]
     pub cert_config: Option<CertConfig>,
-    #[serde(default)]
+    #[serde(default, alias = "baseConfig")]
     pub base_config: Option<BaseConfig>,
 }
 
@@ -202,9 +249,17 @@ impl NodeConfigResponse {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeTlsSettings {
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "serverName",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub server_name: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "allowInsecure",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub allow_insecure: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub ech: NodeEchSettings,
@@ -236,9 +291,17 @@ pub struct NodeTlsSettings {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeRealitySettings {
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "allowInsecure",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub allow_insecure: bool,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "serverName",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub server_name: String,
     #[serde(
         default,
@@ -272,13 +335,25 @@ pub struct NodeEchSettings {
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub config: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "queryServerName",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub query_server_name: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub key: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "keyPath",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub key_path: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "configPath",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub config_path: String,
 }
 
@@ -296,6 +371,12 @@ impl NodeEchSettings {
 impl NodeTlsSettings {
     pub fn is_configured(&self) -> bool {
         !self.server_name.trim().is_empty() || self.allow_insecure || self.ech.is_enabled()
+    }
+
+    pub fn has_reality_key_material(&self) -> bool {
+        !self.public_key.trim().is_empty()
+            || !self.private_key.trim().is_empty()
+            || !self.short_id.trim().is_empty()
     }
 
     pub fn reality_settings(&self) -> NodeRealitySettings {
@@ -326,13 +407,16 @@ pub struct CertConfig {
     #[serde(
         default,
         alias = "mode",
+        alias = "certMode",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub cert_mode: String,
     #[serde(
         default,
         alias = "certificate_path",
+        alias = "certificatePath",
         alias = "fullchain_path",
+        alias = "fullchainPath",
         alias = "fullchain",
         deserialize_with = "deserialize_default_on_null"
     )]
@@ -340,7 +424,9 @@ pub struct CertConfig {
     #[serde(
         default,
         alias = "private_key_path",
+        alias = "privateKeyPath",
         alias = "privkey_path",
+        alias = "privkeyPath",
         alias = "privkey",
         deserialize_with = "deserialize_default_on_null"
     )]
@@ -350,7 +436,9 @@ pub struct CertConfig {
         alias = "cert",
         alias = "certificate",
         alias = "cert_content",
+        alias = "certContent",
         alias = "certificate_pem",
+        alias = "certificatePem",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub cert_pem: String,
@@ -359,7 +447,9 @@ pub struct CertConfig {
         alias = "key",
         alias = "private_key",
         alias = "key_content",
+        alias = "keyContent",
         alias = "private_key_pem",
+        alias = "privateKeyPem",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub key_pem: String,
@@ -371,21 +461,27 @@ pub struct CertConfig {
         default,
         alias = "directory",
         alias = "acme_directory_url",
+        alias = "directoryUrl",
+        alias = "acmeDirectoryUrl",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub directory_url: String,
     #[serde(
         default,
         alias = "http01_listen",
+        alias = "http01Listen",
         alias = "acme_challenge_listen",
+        alias = "acmeChallengeListen",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub challenge_listen: String,
-    #[serde(default)]
+    #[serde(default, alias = "renewBeforeDays")]
     pub renew_before_days: Option<u64>,
     #[serde(
         default,
         alias = "acme_account_key_path",
+        alias = "acmeAccountKeyPath",
+        alias = "accountKeyPath",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub account_key_path: String,
@@ -1119,7 +1215,11 @@ pub struct RouteConfig {
     pub match_value: Option<RouteMatch>,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub action: String,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "actionValue",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub action_value: String,
 }
 
@@ -1134,7 +1234,9 @@ impl RouteConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct BaseConfig {
+    #[serde(default, alias = "pushInterval")]
     pub push_interval: Option<serde_json::Value>,
+    #[serde(default, alias = "pullInterval")]
     pub pull_interval: Option<serde_json::Value>,
 }
 
@@ -1152,7 +1254,7 @@ impl BaseConfig {
 pub struct MachineNodesResponse {
     #[serde(default)]
     pub nodes: Vec<MachineNodeSummary>,
-    #[serde(default)]
+    #[serde(default, alias = "baseConfig")]
     pub base_config: Option<BaseConfig>,
 }
 
@@ -1183,9 +1285,17 @@ pub struct PanelUser {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub alter_id: i64,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "speedLimit",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub speed_limit: i64,
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(
+        default,
+        alias = "deviceLimit",
+        deserialize_with = "deserialize_default_on_null"
+    )]
     pub device_limit: i64,
 }
 
@@ -2098,28 +2208,67 @@ mod tests {
     fn accepts_vmess_field_aliases() {
         let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
             "protocol": "vmess",
-            "listen_ip": "0.0.0.0",
-            "server_port": 443,
-            "server_name": "node.example.com",
+            "listenIp": "0.0.0.0",
+            "serverPort": 443,
+            "serverName": "node.example.com",
             "security": "aes-128-gcm",
+            "tlsSettings": {
+                "serverName": "tls.example.com",
+                "serverPort": "8443"
+            },
             "globalPadding": true,
             "authenticatedLength": true,
+            "packetEncoding": "xudp",
+            "fallbackForAlpn": {
+                "h2": {
+                    "server": "127.0.0.1",
+                    "server_port": 8443
+                }
+            },
+            "customOutbounds": [{ "tag": "direct" }],
+            "customRoutes": [{ "match": "domain:example.com", "outbound": "direct" }],
+            "certConfig": {
+                "certMode": "file",
+                "certificatePath": "/tmp/fullchain.pem",
+                "privateKeyPath": "/tmp/privkey.pem"
+            },
+            "baseConfig": {
+                "pushInterval": "120",
+                "pullInterval": 30
+            },
             "padding_scheme": [],
             "routes": []
         }))
         .expect("parse config");
 
+        assert_eq!(config.listen_ip, "0.0.0.0");
+        assert_eq!(config.server_port, 443);
+        assert_eq!(config.server_name, "node.example.com");
         assert_eq!(config.cipher, "aes-128-gcm");
+        assert_eq!(config.tls_settings.server_name, "tls.example.com");
+        assert_eq!(config.tls_settings.server_port, 8443);
         assert!(config.global_padding);
         assert!(config.authenticated_length);
+        assert_eq!(config.packet_encoding, "xudp");
+        assert!(config.fallback_for_alpn.is_some());
+        assert_eq!(config.custom_outbounds.len(), 1);
+        assert_eq!(config.custom_routes.len(), 1);
+        assert_eq!(config.cert_config.as_ref().unwrap().cert_mode(), "file");
+        let base_config = config.base_config.as_ref().expect("base config");
+        assert_eq!(base_config.push_interval_seconds(), Some(120));
+        assert_eq!(base_config.pull_interval_seconds(), Some(30));
 
         let user: PanelUser = serde_json::from_value(serde_json::json!({
             "id": 7,
             "uuid": "00000000-0000-0000-0000-000000000001",
-            "alterId": 0
+            "alterId": 0,
+            "speedLimit": 1024,
+            "deviceLimit": 2
         }))
         .expect("parse user");
         assert_eq!(user.alter_id, 0);
+        assert_eq!(user.speed_limit, 1024);
+        assert_eq!(user.device_limit, 2);
     }
 
     #[test]

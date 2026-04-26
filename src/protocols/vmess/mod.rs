@@ -19,8 +19,8 @@ use crate::panel::{NodeConfigResponse, PanelUser};
 
 use self::codec::{Command, Request};
 use self::crypto::{
-    BodyReader, BodyWriter, RequestOptions, SecurityType, auth_id_is_fresh, cmd_key,
-    decode_auth_id, encode_response_header, parse_uuid,
+    BodyReader, BodyWriter, SecurityType, auth_id_is_fresh, cmd_key, decode_auth_id,
+    encode_response_header, parse_uuid,
 };
 use super::anytls::{
     EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing, tls,
@@ -71,8 +71,9 @@ impl EffectiveNodeConfig {
         })
     }
 
-    fn expected_request_options(&self, command: Command) -> RequestOptions {
-        let mut options = RequestOptions::default();
+    #[cfg(test)]
+    fn expected_request_options(&self, command: Command) -> crypto::RequestOptions {
+        let mut options = crypto::RequestOptions::default();
         match self.security.normalized() {
             SecurityType::None => {
                 if self.authenticated_length {
@@ -102,19 +103,11 @@ impl EffectiveNodeConfig {
 
     fn validate_request(&self, request: &Request) -> anyhow::Result<()> {
         ensure!(
-            request.security == self.security.normalized(),
-            "VMess request security mismatch: expected {}, got {}",
-            self.security.normalized(),
-            request.security,
+            !matches!(request.command, Command::Udp) || request.options.chunk_stream(),
+            "VMess UDP packet transfer requires chunk stream"
         );
-        let expected = self.expected_request_options(request.command);
-        ensure!(
-            request.options.bits() == expected.bits(),
-            "VMess request options mismatch: expected 0x{:02x} ({expected}), got 0x{:02x} ({})",
-            expected.bits(),
-            request.options.bits(),
-            request.options,
-        );
+        request.request_body_config()?;
+        request.response_body_config()?;
         Ok(())
     }
 }
@@ -478,7 +471,6 @@ where
 
     let response_header = encode_response_header(
         request.response_header,
-        request.options,
         &request.request_body_key,
         &request.request_body_iv,
     )?;
@@ -549,7 +541,6 @@ where
 
     let response_header = encode_response_header(
         request.response_header,
-        request.options,
         &request.request_body_key,
         &request.request_body_iv,
     )?;
@@ -665,7 +656,7 @@ where
     loop {
         let frame = tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            frame = codec::read_udp_frame(&mut reader) => frame?,
+            frame = reader.read_packet() => frame?,
         };
         let Some(frame) = frame else {
             return Ok(());
@@ -680,7 +671,7 @@ where
             frame.len(),
             sent
         );
-        traffic.record((frame.len() + 2) as u64);
+        traffic.record(frame.len() as u64);
     }
 }
 
@@ -699,12 +690,11 @@ where
             _ = control.cancelled() => return Ok(()),
             read = socket.recv(&mut buffer) => read.context("receive VMess UDP payload")?,
         };
-        let encoded = codec::encode_udp_frame(&buffer[..payload_len])?;
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            result = writer.write_all_plain(&encoded) => result?,
+            result = writer.write_packet_plain(&buffer[..payload_len]) => result?,
         }
-        traffic.record(encoded.len() as u64);
+        traffic.record(payload_len as u64);
     }
 }
 
@@ -723,10 +713,18 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
         bail!("Xboard network must be tcp for VMess nodes");
     }
-    if remote.network_settings.is_some() {
+    if remote
+        .network_settings
+        .as_ref()
+        .is_some_and(json_has_meaningful_config)
+    {
         bail!("Xboard networkSettings is not supported by NodeRS VMess server yet");
     }
-    if remote.transport.is_some() {
+    if remote
+        .transport
+        .as_ref()
+        .is_some_and(json_has_meaningful_config)
+    {
         bail!("Xboard transport is not supported by NodeRS VMess server yet");
     }
     if remote.multiplex_enabled() {
@@ -738,10 +736,13 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             remote.tls_mode()
         );
     }
-    if remote.tls_mode() == 0 && remote.tls_settings.is_configured() {
+    if remote.tls_mode() == 0
+        && (remote.tls_settings.is_configured() || remote.tls_settings.has_reality_key_material())
+    {
         bail!("Xboard tls_settings requires tls mode 1 for VMess nodes");
     }
-    if !remote.packet_encoding.trim().is_empty() {
+    let packet_encoding = remote.packet_encoding.trim();
+    if !packet_encoding.is_empty() && !packet_encoding.eq_ignore_ascii_case("none") {
         bail!("Xboard packet_encoding is not supported by NodeRS VMess server yet");
     }
     if !remote.flow.trim().is_empty() {
@@ -753,10 +754,26 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn json_has_meaningful_config(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(number) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(values) => values.iter().any(json_has_meaningful_config),
+        serde_json::Value::Object(values) => values.values().any(json_has_meaningful_config),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::panel::CertConfig;
+    use crate::protocols::anytls::socksaddr::SocksAddr;
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -833,6 +850,82 @@ mod tests {
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert_eq!(config.server_port, 10086);
+    }
+
+    #[test]
+    fn accepts_empty_xboard_network_settings_for_tcp() {
+        let remote = NodeConfigResponse {
+            network: "tcp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "",
+                "host": "",
+                "headers": null,
+                "serviceName": "",
+                "header": null
+            })),
+            ..base_remote()
+        };
+        EffectiveNodeConfig::from_remote(&remote).expect("config");
+    }
+
+    #[test]
+    fn rejects_meaningful_xboard_network_settings() {
+        let remote = NodeConfigResponse {
+            network: "tcp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/ws"
+            })),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network settings");
+        assert!(error.to_string().contains("networkSettings"));
+    }
+
+    #[test]
+    fn validates_client_wire_options_not_panel_cipher_template() {
+        let config = EffectiveNodeConfig::from_remote(&base_remote()).unwrap();
+        let request = Request {
+            command: Command::Tcp,
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+            response_header: 0x7f,
+            options: crypto::RequestOptions::default(),
+            security: SecurityType::None,
+            request_body_iv: [0x11; 16],
+            request_body_key: [0x22; 16],
+        };
+        config.validate_request(&request).expect("request");
+    }
+
+    #[test]
+    fn rejects_udp_without_chunk_stream() {
+        let config = EffectiveNodeConfig::from_remote(&base_remote()).unwrap();
+        let request = Request {
+            command: Command::Udp,
+            destination: SocksAddr::Domain("example.com".to_string(), 53),
+            response_header: 0x7f,
+            options: crypto::RequestOptions::default(),
+            security: SecurityType::None,
+            request_body_iv: [0x11; 16],
+            request_body_key: [0x22; 16],
+        };
+        let error = config.validate_request(&request).expect_err("chunk stream");
+        assert!(error.to_string().contains("chunk stream"));
+    }
+
+    #[test]
+    fn rejects_invalid_body_options_before_proxying() {
+        let config = EffectiveNodeConfig::from_remote(&base_remote()).unwrap();
+        let request = Request {
+            command: Command::Tcp,
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+            response_header: 0x7f,
+            options: crypto::RequestOptions::default(),
+            security: SecurityType::Aes128Gcm,
+            request_body_iv: [0x11; 16],
+            request_body_key: [0x22; 16],
+        };
+        let error = config.validate_request(&request).expect_err("body options");
+        assert!(error.to_string().contains("requires chunk stream"));
     }
 
     #[test]

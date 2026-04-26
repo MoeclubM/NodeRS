@@ -2,6 +2,7 @@ mod aead2022;
 mod crypto;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -747,6 +748,10 @@ fn build_users(
         Method::Aead2022(kind) => {
             let server_secret = aead2022::decode_server_psk(server_key, *kind)
                 .context("decode Shadowsocks 2022 server_key")?;
+            ensure!(
+                !matches!(kind, crypto::Aead2022Method::ChaCha20Poly1305) || users.len() <= 1,
+                "Shadowsocks 2022 chacha20-poly1305 does not support multi-user"
+            );
             users
                 .iter()
                 .map(|user| {
@@ -832,19 +837,89 @@ fn parse_networks(network: &str) -> anyhow::Result<EnabledNetworks> {
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    if remote.network_settings.is_some() {
+    if remote
+        .network_settings
+        .as_ref()
+        .is_some_and(network_settings_enabled)
+    {
         bail!("XBoard networkSettings is not supported by NodeRS Shadowsocks server");
     }
     if !remote.plugin.trim().is_empty() || !remote.plugin_opts.trim().is_empty() {
         bail!("Shadowsocks SIP003 plugin is not implemented yet");
     }
-    if remote.multiplex.is_some() {
+    if remote.multiplex_enabled() {
         bail!("Shadowsocks multiplex is not implemented yet");
     }
-    if remote.transport.is_some() {
+    if remote.transport.as_ref().is_some_and(value_enabled) {
         bail!("Shadowsocks transport is not supported");
     }
     Ok(())
+}
+
+fn network_settings_enabled(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            !matches!(
+                normalized.as_str(),
+                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
+            )
+        }
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => {
+            if object.is_empty() {
+                return false;
+            }
+            if let Some(enabled) = object.get("enabled") {
+                return value_enabled(enabled);
+            }
+            object.iter().any(|(key, value)| {
+                let normalized = normalize_option_key(key);
+                if normalized == "acceptproxyprotocol" {
+                    return false;
+                }
+                value_enabled(value)
+            })
+        }
+    }
+}
+
+fn value_enabled(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            !matches!(
+                normalized.as_str(),
+                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
+            )
+        }
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => object
+            .get("enabled")
+            .map(value_enabled)
+            .unwrap_or(!object.is_empty()),
+    }
+}
+
+fn normalize_option_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 fn flatten_join(
@@ -921,5 +996,71 @@ mod tests {
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert!(matches!(config.method, Method::Aead2022(_)));
+    }
+
+    #[test]
+    fn accepts_shadowsocks_2022_chacha_method() {
+        let remote = NodeConfigResponse {
+            cipher: "2022-blake3-chacha20-poly1305".to_string(),
+            server_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(
+            config.method,
+            Method::Aead2022(crypto::Aead2022Method::ChaCha20Poly1305)
+        ));
+    }
+
+    #[test]
+    fn rejects_shadowsocks_2022_chacha_multi_user() {
+        let error = build_users(
+            &Method::Aead2022(crypto::Aead2022Method::ChaCha20Poly1305),
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            &[
+                PanelUser {
+                    id: 1,
+                    uuid: "user-1".to_string(),
+                    ..Default::default()
+                },
+                PanelUser {
+                    id: 2,
+                    uuid: "user-2".to_string(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect_err("multi-user chacha");
+        assert!(error.to_string().contains("does not support multi-user"));
+    }
+
+    #[test]
+    fn accepts_disabled_transport_extension_values() {
+        let remote = NodeConfigResponse {
+            network_settings: Some(serde_json::json!({ "enabled": false })),
+            multiplex: Some(serde_json::json!({ "enabled": false })),
+            transport: Some(serde_json::json!({ "enabled": false })),
+            ..base_remote()
+        };
+        EffectiveNodeConfig::from_remote(&remote).expect("config");
+    }
+
+    #[test]
+    fn rejects_enabled_transport_extension_values() {
+        let remote = NodeConfigResponse {
+            network_settings: Some(serde_json::json!({ "ws": true })),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network settings");
+        assert!(error.to_string().contains("networkSettings"));
+    }
+
+    #[test]
+    fn accepts_proxy_protocol_noise_in_network_settings() {
+        let remote = NodeConfigResponse {
+            network_settings: Some(serde_json::json!({ "acceptProxyProtocol": true })),
+            ..base_remote()
+        };
+        EffectiveNodeConfig::from_remote(&remote).expect("config");
     }
 }

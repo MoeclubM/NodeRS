@@ -6,6 +6,8 @@ use tokio::fs;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub panel: PanelConfig,
+    #[serde(default)]
+    pub hysteria: HysteriaConfig,
 }
 
 impl AppConfig {
@@ -22,6 +24,23 @@ pub struct PanelConfig {
     #[serde(alias = "token")]
     pub key: String,
     pub machine_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HysteriaConfig {
+    #[serde(default)]
+    pub binary: String,
+}
+
+impl HysteriaConfig {
+    pub fn binary(&self) -> &str {
+        let binary = self.binary.trim();
+        if binary.is_empty() {
+            "hysteria"
+        } else {
+            binary
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -119,5 +138,54 @@ mod tests {
 
         assert_eq!(parsed.panel.api, "https://xboard.example.com");
         assert_eq!(parsed.panel.key, "replace-me");
+    }
+
+    #[test]
+    fn uses_default_hysteria_binary() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            panel: PanelConfig,
+            #[serde(default)]
+            hysteria: HysteriaConfig,
+        }
+
+        let parsed: Wrapper = toml::from_str(
+            r#"
+                [panel]
+                api = "https://xboard.example.com"
+                key = "replace-me"
+                machine_id = 9
+            "#,
+        )
+        .expect("parse config");
+
+        assert_eq!(parsed.hysteria.binary(), "hysteria");
+        assert_eq!(parsed.panel.machine_id, 9);
+    }
+
+    #[test]
+    fn accepts_custom_hysteria_binary() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            panel: PanelConfig,
+            #[serde(default)]
+            hysteria: HysteriaConfig,
+        }
+
+        let parsed: Wrapper = toml::from_str(
+            r#"
+                [panel]
+                api = "https://xboard.example.com"
+                key = "replace-me"
+                machine_id = 9
+
+                [hysteria]
+                binary = "/usr/local/bin/hysteria"
+            "#,
+        )
+        .expect("parse config");
+
+        assert_eq!(parsed.hysteria.binary(), "/usr/local/bin/hysteria");
+        assert_eq!(parsed.panel.machine_id, 9);
     }
 }

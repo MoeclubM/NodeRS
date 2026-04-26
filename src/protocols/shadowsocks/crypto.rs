@@ -40,6 +40,7 @@ pub enum LegacyAeadMethod {
 pub enum Aead2022Method {
     Aes128Gcm,
     Aes256Gcm,
+    ChaCha20Poly1305,
 }
 
 #[derive(Debug, Clone)]
@@ -83,25 +84,23 @@ struct PrefixedReader<R> {
 
 impl Method {
     pub fn parse(cipher: &str) -> Option<Self> {
-        let cipher = cipher.trim();
-        if cipher.eq_ignore_ascii_case("none") {
-            Some(Self::None)
-        } else if cipher.eq_ignore_ascii_case("aes-128-gcm") {
-            Some(Self::Legacy(LegacyAeadMethod::Aes128Gcm))
-        } else if cipher.eq_ignore_ascii_case("aes-192-gcm") {
-            Some(Self::Legacy(LegacyAeadMethod::Aes192Gcm))
-        } else if cipher.eq_ignore_ascii_case("aes-256-gcm") {
-            Some(Self::Legacy(LegacyAeadMethod::Aes256Gcm))
-        } else if cipher.eq_ignore_ascii_case("chacha20-ietf-poly1305") {
-            Some(Self::Legacy(LegacyAeadMethod::ChaCha20Poly1305))
-        } else if cipher.eq_ignore_ascii_case("xchacha20-ietf-poly1305") {
-            Some(Self::Legacy(LegacyAeadMethod::XChaCha20Poly1305))
-        } else if cipher.eq_ignore_ascii_case("2022-blake3-aes-128-gcm") {
-            Some(Self::Aead2022(Aead2022Method::Aes128Gcm))
-        } else if cipher.eq_ignore_ascii_case("2022-blake3-aes-256-gcm") {
-            Some(Self::Aead2022(Aead2022Method::Aes256Gcm))
-        } else {
-            None
+        match cipher.trim().to_ascii_lowercase().as_str() {
+            "none" | "plain" => Some(Self::None),
+            "aes-128-gcm" | "aead_aes_128_gcm" => Some(Self::Legacy(LegacyAeadMethod::Aes128Gcm)),
+            "aes-192-gcm" | "aead_aes_192_gcm" => Some(Self::Legacy(LegacyAeadMethod::Aes192Gcm)),
+            "aes-256-gcm" | "aead_aes_256_gcm" => Some(Self::Legacy(LegacyAeadMethod::Aes256Gcm)),
+            "chacha20-poly1305" | "aead_chacha20_poly1305" | "chacha20-ietf-poly1305" => {
+                Some(Self::Legacy(LegacyAeadMethod::ChaCha20Poly1305))
+            }
+            "xchacha20-poly1305" | "aead_xchacha20_poly1305" | "xchacha20-ietf-poly1305" => {
+                Some(Self::Legacy(LegacyAeadMethod::XChaCha20Poly1305))
+            }
+            "2022-blake3-aes-128-gcm" => Some(Self::Aead2022(Aead2022Method::Aes128Gcm)),
+            "2022-blake3-aes-256-gcm" => Some(Self::Aead2022(Aead2022Method::Aes256Gcm)),
+            "2022-blake3-chacha20-poly1305" => {
+                Some(Self::Aead2022(Aead2022Method::ChaCha20Poly1305))
+            }
+            _ => None,
         }
     }
 
@@ -146,6 +145,7 @@ impl Aead2022Method {
         match self {
             Self::Aes128Gcm => 16,
             Self::Aes256Gcm => 32,
+            Self::ChaCha20Poly1305 => 32,
         }
     }
 }
@@ -875,8 +875,13 @@ mod tests {
     #[test]
     fn parses_supported_methods() {
         assert_eq!(Method::parse("none"), Some(Method::None));
+        assert_eq!(Method::parse("plain"), Some(Method::None));
         assert_eq!(
             Method::parse("aes-128-gcm"),
+            Some(Method::Legacy(LegacyAeadMethod::Aes128Gcm))
+        );
+        assert_eq!(
+            Method::parse("aead_aes_128_gcm"),
             Some(Method::Legacy(LegacyAeadMethod::Aes128Gcm))
         );
         assert_eq!(
@@ -884,8 +889,20 @@ mod tests {
             Some(Method::Legacy(LegacyAeadMethod::ChaCha20Poly1305))
         );
         assert_eq!(
+            Method::parse("chacha20-poly1305"),
+            Some(Method::Legacy(LegacyAeadMethod::ChaCha20Poly1305))
+        );
+        assert_eq!(
+            Method::parse("xchacha20-poly1305"),
+            Some(Method::Legacy(LegacyAeadMethod::XChaCha20Poly1305))
+        );
+        assert_eq!(
             Method::parse("2022-blake3-aes-128-gcm"),
             Some(Method::Aead2022(Aead2022Method::Aes128Gcm))
+        );
+        assert_eq!(
+            Method::parse("2022-blake3-chacha20-poly1305"),
+            Some(Method::Aead2022(Aead2022Method::ChaCha20Poly1305))
         );
     }
 

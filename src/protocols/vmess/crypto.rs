@@ -28,10 +28,12 @@ const SECURITY_TYPE_CHACHA20_POLY1305: u8 = 0x04;
 const SECURITY_TYPE_NONE: u8 = 0x05;
 const SECURITY_TYPE_ZERO: u8 = 0x06;
 const REQUEST_OPTION_CHUNK_STREAM: u8 = 0x01;
+const REQUEST_OPTION_CONNECTION_REUSE: u8 = 0x02;
 const REQUEST_OPTION_CHUNK_MASKING: u8 = 0x04;
 const REQUEST_OPTION_GLOBAL_PADDING: u8 = 0x08;
 const REQUEST_OPTION_AUTHENTICATED_LENGTH: u8 = 0x10;
 const SUPPORTED_OPTION_BITS: u8 = REQUEST_OPTION_CHUNK_STREAM
+    | REQUEST_OPTION_CONNECTION_REUSE
     | REQUEST_OPTION_CHUNK_MASKING
     | REQUEST_OPTION_GLOBAL_PADDING
     | REQUEST_OPTION_AUTHENTICATED_LENGTH;
@@ -491,17 +493,12 @@ pub fn generate_chacha20_poly1305_key(value: &[u8]) -> [u8; CHACHA_KEY_LEN] {
 
 pub fn encode_response_header(
     response_header: u8,
-    options: RequestOptions,
     request_body_key: &[u8; 16],
     request_body_iv: &[u8; 16],
 ) -> anyhow::Result<Vec<u8>> {
     let response_key = response_body_key(request_body_key);
     let response_iv = response_body_iv(request_body_iv);
-    let header_plain = aes_128_ctr_xor(
-        &response_key,
-        &response_iv,
-        &[response_header, options.bits(), 0, 0],
-    )?;
+    let header_plain = [response_header, 0, 0, 0];
 
     let length_key = kdf16(&response_key, AEAD_RESPONSE_HEADER_LENGTH_KEY_SALT, &[]);
     let length_nonce = kdf(&response_iv, AEAD_RESPONSE_HEADER_LENGTH_IV_SALT, &[]);
@@ -574,27 +571,25 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
         Ok(to_copy)
     }
 
-    pub async fn read_exact_plain(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
-        match self.read_exact_plain_or_eof(len).await? {
-            Some(bytes) => Ok(bytes),
-            None => bail!("unexpected EOF while reading VMess body"),
+    pub async fn read_packet(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        ensure!(
+            !self.state.raw_mode(),
+            "VMess packet transfer requires chunk stream"
+        );
+        ensure!(
+            self.pending_pos >= self.pending.len(),
+            "VMess packet transfer cannot continue after partial stream reads"
+        );
+        if self.finished {
+            return Ok(None);
         }
-    }
-
-    pub async fn read_exact_plain_or_eof(&mut self, len: usize) -> anyhow::Result<Option<Vec<u8>>> {
-        let mut out = vec![0u8; len];
-        let mut filled = 0usize;
-        while filled < len {
-            let n = self.read_plain(&mut out[filled..]).await?;
-            if n == 0 {
-                if filled == 0 {
-                    return Ok(None);
-                }
-                bail!("unexpected EOF after reading {filled} of {len} VMess plaintext bytes");
-            }
-            filled += n;
+        self.pending.clear();
+        self.pending_pos = 0;
+        self.read_next_chunk().await?;
+        if self.finished {
+            return Ok(None);
         }
-        Ok(Some(out))
+        Ok(Some(std::mem::take(&mut self.pending)))
     }
 
     async fn read_next_chunk(&mut self) -> anyhow::Result<()> {
@@ -603,8 +598,17 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
             .read_exact(&mut size_bytes)
             .await
             .context("read VMess chunk size")?;
+        let padding_len = if self.state.padding_before_size_decode() {
+            self.state.next_padding_len()
+        } else {
+            0
+        };
         let encoded_size = self.state.decode_size(&size_bytes)? as usize;
-        let padding_len = self.state.next_padding_len_after_size();
+        let padding_len = if self.state.padding_before_size_decode() {
+            padding_len
+        } else {
+            self.state.next_padding_len()
+        };
         ensure!(
             encoded_size >= padding_len,
             "invalid VMess chunk size {encoded_size} smaller than padding {padding_len}"
@@ -630,7 +634,7 @@ impl<R: AsyncRead + Unpin> BodyReader<R> {
                 .context("read VMess chunk padding")?;
         }
         let plaintext = self.state.decrypt_payload(&payload)?;
-        if payload_len == self.state.payload_overhead() + padding_len.saturating_sub(padding_len) {
+        if payload_len == self.state.payload_overhead() {
             if plaintext.is_empty() {
                 self.finished = true;
                 self.pending.clear();
@@ -680,6 +684,18 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
         Ok(())
     }
 
+    pub async fn write_packet_plain(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        ensure!(!self.finished, "VMess body writer already finished");
+        ensure!(
+            !self.state.raw_mode(),
+            "VMess packet transfer requires chunk stream"
+        );
+        self.write_chunk(data).await
+    }
+
     pub async fn finish(&mut self) -> anyhow::Result<()> {
         if self.finished {
             return Ok(());
@@ -693,7 +709,7 @@ impl<W: AsyncWrite + Unpin> BodyWriter<W> {
     }
 
     async fn write_chunk(&mut self, plaintext: &[u8]) -> anyhow::Result<()> {
-        let padding_len = self.state.next_padding_len_before_size();
+        let padding_len = self.state.next_padding_len();
         let ciphertext = self.state.encrypt_payload(plaintext)?;
         let total_len = ciphertext.len() + padding_len;
         ensure!(
@@ -731,7 +747,6 @@ struct ChunkState {
     padding_from_size_shake: bool,
     size_counter: u16,
     payload_counter: u16,
-    pending_padding_len: Option<usize>,
 }
 
 impl ChunkState {
@@ -764,7 +779,6 @@ impl ChunkState {
             padding_from_size_shake,
             size_counter: 0,
             payload_counter: 0,
-            pending_padding_len: None,
         }
     }
 
@@ -784,22 +798,12 @@ impl ChunkState {
         self.config.security.payload_overhead()
     }
 
-    fn next_padding_len_before_size(&mut self) -> usize {
-        if let Some(padding) = self.pending_padding_len.take() {
-            return padding;
-        }
-        self.compute_padding_len()
+    fn padding_before_size_decode(&self) -> bool {
+        self.padding_from_size_shake
     }
 
-    fn next_padding_len_after_size(&mut self) -> usize {
-        if let Some(padding) = self.pending_padding_len.take() {
-            return padding;
-        }
-        self.compute_padding_len()
-    }
-
-    fn compute_padding_len(&mut self) -> usize {
-        let padding = if self.padding_from_size_shake {
+    fn next_padding_len(&mut self) -> usize {
+        if self.padding_from_size_shake {
             self.size_shake
                 .as_mut()
                 .map(Shake128::next_padding_len)
@@ -809,9 +813,7 @@ impl ChunkState {
                 .as_mut()
                 .map(Shake128::next_padding_len)
                 .unwrap_or(0)
-        };
-        self.pending_padding_len = Some(padding);
-        padding
+        }
     }
 
     fn decode_size(&mut self, encoded: &[u8]) -> anyhow::Result<u16> {
@@ -843,7 +845,6 @@ impl ChunkState {
         } else {
             size.to_be_bytes().to_vec()
         };
-        self.pending_padding_len = None;
         Ok(output)
     }
 
@@ -1211,21 +1212,6 @@ fn decrypt_chacha20_poly1305(
     Ok(buffer)
 }
 
-fn aes_128_ctr_xor(key: &[u8], iv: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut crypter = Crypter::new(Cipher::aes_128_ctr(), Mode::Encrypt, key, Some(iv))
-        .context("init aes-128-ctr")?;
-    crypter.pad(false);
-    let mut out = vec![0u8; data.len() + Cipher::aes_128_ctr().block_size()];
-    let mut count = crypter
-        .update(data, &mut out)
-        .context("update aes-128-ctr")?;
-    count += crypter
-        .finalize(&mut out[count..])
-        .context("finalize aes-128-ctr")?;
-    out.truncate(count);
-    Ok(out)
-}
-
 fn aes_128_ecb_crypt(key: &[u8], block: &[u8; 16], mode: Mode) -> anyhow::Result<[u8; 16]> {
     let mut crypter =
         Crypter::new(Cipher::aes_128_ecb(), mode, key, None).context("init aes-128-ecb")?;
@@ -1292,5 +1278,102 @@ mod tests {
             hex::encode(key),
             "4032af8d61035123906e58e067140cc567304ba676a616064c4340059e1b6370"
         );
+    }
+
+    #[test]
+    fn response_header_uses_plain_aead_payload() {
+        let request_key = [0x11; 16];
+        let request_iv = [0x22; 16];
+        let encoded = encode_response_header(0x7f, &request_key, &request_iv).unwrap();
+        let response_key = response_body_key(&request_key);
+        let response_iv = response_body_iv(&request_iv);
+
+        let length_key = kdf16(&response_key, AEAD_RESPONSE_HEADER_LENGTH_KEY_SALT, &[]);
+        let length_nonce = kdf(&response_iv, AEAD_RESPONSE_HEADER_LENGTH_IV_SALT, &[]);
+        let payload_key = kdf16(&response_key, AEAD_RESPONSE_HEADER_PAYLOAD_KEY_SALT, &[]);
+        let payload_nonce = kdf(&response_iv, AEAD_RESPONSE_HEADER_PAYLOAD_IV_SALT, &[]);
+
+        let length_plain = decrypt_aes_gcm(
+            &length_key,
+            &length_nonce[..12],
+            &encoded[..2 + AEAD_TAG_LEN],
+            &[],
+            "test response header length",
+        )
+        .unwrap();
+        assert_eq!(u16::from_be_bytes([length_plain[0], length_plain[1]]), 4);
+
+        let payload_plain = decrypt_aes_gcm(
+            &payload_key,
+            &payload_nonce[..12],
+            &encoded[2 + AEAD_TAG_LEN..],
+            &[],
+            "test response header payload",
+        )
+        .unwrap();
+        assert_eq!(payload_plain, [0x7f, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn packet_roundtrip_preserves_datagram_boundaries() {
+        let mut options = RequestOptions::default();
+        options.set_chunk_stream();
+        let config = BodyConfig::new(
+            SecurityType::None,
+            options,
+            [0x11; 16],
+            [0x22; 16],
+            [0x11; 16],
+            [0x22; 16],
+        )
+        .unwrap();
+        let (reader_io, writer_io) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            let mut writer = BodyWriter::new(writer_io, config).unwrap();
+            writer.write_packet_plain(b"one").await.unwrap();
+            writer.write_packet_plain(b"two-two").await.unwrap();
+            writer.finish().await.unwrap();
+        });
+
+        let mut reader = BodyReader::new(reader_io, config).unwrap();
+        assert_eq!(reader.read_packet().await.unwrap(), Some(b"one".to_vec()));
+        assert_eq!(
+            reader.read_packet().await.unwrap(),
+            Some(b"two-two".to_vec())
+        );
+        assert_eq!(reader.read_packet().await.unwrap(), None);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn global_padding_and_chunk_masking_roundtrip_multiple_chunks() {
+        let mut options = RequestOptions::default();
+        options.set_chunk_stream();
+        options.set_chunk_masking();
+        options.set_global_padding();
+        let config = BodyConfig::new(
+            SecurityType::None,
+            options,
+            [0x33; 16],
+            [0x44; 16],
+            [0x33; 16],
+            [0x44; 16],
+        )
+        .unwrap();
+        let (reader_io, writer_io) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            let mut writer = BodyWriter::new(writer_io, config).unwrap();
+            writer.write_packet_plain(b"alpha").await.unwrap();
+            writer.write_packet_plain(b"beta").await.unwrap();
+            writer.write_packet_plain(b"gamma").await.unwrap();
+            writer.finish().await.unwrap();
+        });
+
+        let mut reader = BodyReader::new(reader_io, config).unwrap();
+        assert_eq!(reader.read_packet().await.unwrap(), Some(b"alpha".to_vec()));
+        assert_eq!(reader.read_packet().await.unwrap(), Some(b"beta".to_vec()));
+        assert_eq!(reader.read_packet().await.unwrap(), Some(b"gamma".to_vec()));
+        assert_eq!(reader.read_packet().await.unwrap(), None);
+        writer.await.unwrap();
     }
 }

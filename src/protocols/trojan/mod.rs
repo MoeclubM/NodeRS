@@ -1,7 +1,8 @@
 use anyhow::{Context, anyhow, bail, ensure};
+use boring::ssl::NameType;
 use serde::Deserialize;
 use sha2::{Digest, Sha224};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
@@ -61,41 +62,186 @@ impl EffectiveNodeConfig {
     }
 }
 
+type PathFallbacks = HashMap<String, FallbackTarget>;
+type AlpnFallbacks = HashMap<String, PathFallbacks>;
+
 #[derive(Debug, Clone, Default)]
 pub struct FallbackConfig {
-    default: Option<FallbackTarget>,
-    by_alpn: HashMap<String, FallbackTarget>,
+    by_name: HashMap<String, AlpnFallbacks>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct FallbackTarget {
     #[serde(default)]
     server: String,
+    #[serde(deserialize_with = "crate::panel::deserialize_u16_from_number_or_string")]
     server_port: u16,
+    #[serde(default)]
+    xver: u8,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFallbackEntry {
+    name: Option<String>,
+    alpn: Option<String>,
+    path: Option<String>,
+    target: FallbackTarget,
 }
 
 impl FallbackConfig {
     fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
+        let mut config = Self::default();
+
+        if let Some(value) = remote.fallbacks.as_ref() {
+            config.merge_xboard_fallbacks(value)?;
+        }
+
         let default = match remote.fallback.as_ref() {
             Some(value) => Some(parse_fallback_target(value).context("decode Trojan fallback")?),
             None => None,
         };
+        if let Some(default) = default {
+            config.insert_entry(ParsedFallbackEntry {
+                name: None,
+                alpn: None,
+                path: None,
+                target: default,
+            });
+        }
 
         let by_alpn = match remote.fallback_for_alpn.as_ref() {
             Some(value) => parse_fallback_map(value).context("decode Trojan fallback_for_alpn")?,
             None => HashMap::new(),
         };
+        for (alpn, target) in by_alpn {
+            config.insert_entry(ParsedFallbackEntry {
+                name: None,
+                alpn: Some(alpn),
+                path: None,
+                target,
+            });
+        }
 
-        Ok(Self { default, by_alpn })
+        config.finalize();
+
+        Ok(config)
     }
 
-    fn select<'a>(&'a self, alpn: Option<&[u8]>) -> Option<&'a FallbackTarget> {
-        if !self.by_alpn.is_empty() {
-            return alpn
-                .and_then(|value| std::str::from_utf8(value).ok())
-                .and_then(|value| self.by_alpn.get(value));
+    fn select<'a>(
+        &'a self,
+        server_name: Option<&str>,
+        alpn: Option<&[u8]>,
+        first_packet: &[u8],
+    ) -> Option<&'a FallbackTarget> {
+        let name = server_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let apfb = self
+            .select_name(&name)
+            .and_then(|matched| self.by_name.get(matched))?;
+        let pfb = alpn
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+            .and_then(|value| apfb.get(value))
+            .or_else(|| apfb.get(""))?;
+        if (pfb.len() > 1 || !pfb.contains_key(""))
+            && let Some(path) = detect_http_path(first_packet)
+            && let Some(target) = pfb.get(path.as_str())
+        {
+            return Some(target);
         }
-        self.default.as_ref()
+        pfb.get("")
+    }
+
+    fn merge_xboard_fallbacks(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
+        let entries = value
+            .as_array()
+            .ok_or_else(|| anyhow!("Xboard Trojan fallbacks must be an array"))?;
+        for entry in entries {
+            self.insert_entry(parse_xboard_fallback_entry(entry)?);
+        }
+        Ok(())
+    }
+
+    fn insert_entry(&mut self, entry: ParsedFallbackEntry) {
+        let name = entry.name.unwrap_or_default();
+        let alpn = entry.alpn.unwrap_or_default();
+        let path = entry.path.unwrap_or_default();
+        self.by_name
+            .entry(name)
+            .or_default()
+            .entry(alpn)
+            .or_default()
+            .insert(path, entry.target);
+    }
+
+    fn finalize(&mut self) {
+        let default_name = self.by_name.get("").cloned();
+        if let Some(default_name_entries) = default_name.as_ref() {
+            let default_alpns = default_name_entries.keys().cloned().collect::<Vec<_>>();
+            for (name, apfb) in &mut self.by_name {
+                if name.is_empty() {
+                    continue;
+                }
+                for alpn in &default_alpns {
+                    apfb.entry(alpn.clone()).or_default();
+                }
+            }
+        }
+
+        for apfb in self.by_name.values_mut() {
+            let default_paths = apfb.get("").cloned();
+            if let Some(default_paths) = default_paths {
+                for (alpn, pfb) in apfb.iter_mut() {
+                    if alpn.is_empty() {
+                        continue;
+                    }
+                    for (path, target) in &default_paths {
+                        pfb.entry(path.clone()).or_insert_with(|| target.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(default_name_entries) = default_name {
+            for (name, apfb) in &mut self.by_name {
+                if name.is_empty() {
+                    continue;
+                }
+                for (alpn, default_paths) in &default_name_entries {
+                    let pfb = apfb.entry(alpn.clone()).or_default();
+                    for (path, target) in default_paths {
+                        pfb.entry(path.clone()).or_insert_with(|| target.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn select_name<'a>(&'a self, server_name: &str) -> Option<&'a str> {
+        if self.by_name.is_empty() {
+            return None;
+        }
+        if let Some((name, _)) = self.by_name.get_key_value(server_name) {
+            return Some(name.as_str());
+        }
+
+        let mut matched = None;
+        for name in self.by_name.keys() {
+            if name.is_empty() {
+                continue;
+            }
+            if !server_name.is_empty()
+                && server_name.contains(name.as_str())
+                && matched.is_none_or(|current: &str| name.len() > current.len())
+            {
+                matched = Some(name.as_str());
+            }
+        }
+        matched.or_else(|| self.by_name.contains_key("").then_some(""))
     }
 }
 
@@ -131,6 +277,7 @@ pub struct ServerController {
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
     tls_materials: AsyncMutex<Option<tls::LoadedTlsMaterials>>,
     accounting: Arc<Accounting>,
+    panel_users: Arc<RwLock<Vec<PanelUser>>>,
     users: Arc<RwLock<UserValidator>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
@@ -149,6 +296,7 @@ impl ServerController {
             tls_config: Arc::new(RwLock::new(None)),
             tls_materials: AsyncMutex::new(None),
             accounting,
+            panel_users: Arc::new(RwLock::new(Vec::new())),
             users: Arc::new(RwLock::new(UserValidator::default())),
             routing: Arc::new(RwLock::new(routing::RoutingTable::default())),
             fallbacks: Arc::new(RwLock::new(FallbackConfig::default())),
@@ -158,8 +306,30 @@ impl ServerController {
 
     pub fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
         let validator = UserValidator::from_users(users)?;
-        self.accounting.replace_users(users);
+        let previous = self
+            .panel_users
+            .read()
+            .expect("trojan panel users lock poisoned")
+            .iter()
+            .map(|user| (user.id, effective_password(user).map(str::to_string)))
+            .collect::<HashMap<_, _>>();
+        let rotated_ids = users
+            .iter()
+            .filter_map(|user| {
+                let current = effective_password(user).map(str::to_string);
+                previous
+                    .get(&user.id)
+                    .filter(|previous| **previous != current)
+                    .map(|_| user.id)
+            })
+            .collect::<HashSet<_>>();
+        *self
+            .panel_users
+            .write()
+            .expect("trojan panel users lock poisoned") = users.to_vec();
         *self.users.write().expect("trojan users lock poisoned") = validator;
+        self.accounting.replace_users(users);
+        self.accounting.cancel_sessions_for_ids(&rotated_ids);
         Ok(())
     }
 
@@ -364,6 +534,10 @@ async fn serve_connection(
     routing: routing::RoutingTable,
     fallbacks: FallbackConfig,
 ) -> anyhow::Result<()> {
+    let server_name = stream
+        .ssl()
+        .servername(NameType::HOST_NAME)
+        .map(str::to_string);
     let negotiated_alpn = stream
         .ssl()
         .selected_alpn_protocol()
@@ -378,13 +552,25 @@ async fn serve_connection(
     let (user, command) = match handshake {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
-            if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
-                proxy_fallback(stream, target, consumed).await?;
+            if let Some(target) = fallbacks.select(
+                server_name.as_deref(),
+                negotiated_alpn.as_deref(),
+                &consumed,
+            ) {
+                proxy_fallback(stream, source, target, consumed).await?;
                 return Ok(());
             }
             return Err(error);
         }
         Err(_) => {
+            if let Some(target) = fallbacks.select(
+                server_name.as_deref(),
+                negotiated_alpn.as_deref(),
+                &consumed,
+            ) {
+                proxy_fallback(stream, source, target, consumed).await?;
+                return Ok(());
+            }
             return Err(anyhow!("Trojan authentication timed out"));
         }
     };
@@ -476,9 +662,14 @@ async fn serve_udp_associate(
 
 async fn proxy_fallback(
     stream: TlsStream,
+    source: SocketAddr,
     target: &FallbackTarget,
     consumed: Vec<u8>,
 ) -> anyhow::Result<()> {
+    let local = stream
+        .get_ref()
+        .local_addr()
+        .context("read Trojan fallback local address")?;
     let fallback = TcpStream::connect((target.server.as_str(), target.server_port))
         .await
         .with_context(|| {
@@ -491,6 +682,13 @@ async fn proxy_fallback(
     let control = SessionControl::new();
     let (mut client_reader, mut client_writer) = split(stream);
     let (mut fallback_reader, mut fallback_writer) = split(fallback);
+    if target.xver != 0 {
+        let header = encode_proxy_header(source, local, target.xver)?;
+        fallback_writer
+            .write_all(&header)
+            .await
+            .context("write Trojan fallback proxy protocol header")?;
+    }
     if !consumed.is_empty() {
         fallback_writer
             .write_all(&consumed)
@@ -926,11 +1124,19 @@ async fn read_exact_recorded<R>(
 where
     R: AsyncRead + Unpin,
 {
-    reader
-        .read_exact(buffer)
-        .await
-        .with_context(|| context.to_string())?;
-    consumed.extend_from_slice(buffer);
+    let mut read_total = 0;
+    while read_total < buffer.len() {
+        let read = reader
+            .read(&mut buffer[read_total..])
+            .await
+            .with_context(|| context.to_string())?;
+        if read == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                .with_context(|| context.to_string());
+        }
+        consumed.extend_from_slice(&buffer[read_total..read_total + read]);
+        read_total += read;
+    }
     Ok(())
 }
 
@@ -944,19 +1150,135 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             remote.tls_mode()
         );
     }
-    if remote.network_settings.is_some() {
+    if remote
+        .network_settings
+        .as_ref()
+        .is_some_and(json_value_effectively_enabled)
+    {
         anyhow::bail!("Xboard networkSettings is not supported by NodeRS Trojan server yet");
     }
-    if remote.transport.is_some() {
-        anyhow::bail!("Xboard transport is not supported by NodeRS Trojan server yet");
+    if let Some(transport) = remote.transport.as_ref() {
+        validate_transport_field(transport)?;
     }
     if remote.multiplex_enabled() {
         anyhow::bail!("Xboard multiplex is not supported by NodeRS Trojan server yet");
     }
-    if remote.fallbacks.is_some() {
-        anyhow::bail!("Xboard fallbacks is not supported by NodeRS Trojan server yet");
-    }
     Ok(())
+}
+
+fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(object) = value.as_object() else {
+        bail!("Xboard transport must be an object when provided");
+    };
+    let transport_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if transport_type.is_empty() || transport_type.eq_ignore_ascii_case("tcp") {
+        return Ok(());
+    }
+    bail!("Xboard transport is not supported by NodeRS Trojan server yet")
+}
+
+fn json_value_effectively_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(number) => {
+            number.as_i64().is_some_and(|value| value != 0)
+                || number.as_u64().is_some_and(|value| value != 0)
+                || number.as_f64().is_some_and(|value| value != 0.0)
+        }
+        serde_json::Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            !matches!(
+                normalized.as_str(),
+                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
+            )
+        }
+        serde_json::Value::Array(items) => items.iter().any(json_value_effectively_enabled),
+        serde_json::Value::Object(object) => object.values().any(json_value_effectively_enabled),
+    }
+}
+
+fn detect_http_path(first_packet: &[u8]) -> Option<String> {
+    if first_packet.len() < 18 || first_packet.get(4).copied() == Some(b'*') {
+        return None;
+    }
+    for index in 4..=8.min(first_packet.len().saturating_sub(1)) {
+        if first_packet[index] == b'/' && first_packet[index - 1] == b' ' {
+            let search_end = first_packet.len().min(64);
+            for end in (index + 1)..search_end {
+                match first_packet[end] {
+                    b'\r' | b'\n' => break,
+                    b'?' | b' ' => {
+                        return Some(String::from_utf8_lossy(&first_packet[index..end]).into());
+                    }
+                    _ => {}
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn normalize_proxy_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(value) => value
+            .ip()
+            .to_ipv4()
+            .map(|ip| SocketAddr::new(IpAddr::V4(ip), value.port()))
+            .unwrap_or(SocketAddr::V6(value)),
+        other => other,
+    }
+}
+
+fn encode_proxy_header(source: SocketAddr, local: SocketAddr, xver: u8) -> anyhow::Result<Vec<u8>> {
+    let source = normalize_proxy_addr(source);
+    let local = normalize_proxy_addr(local);
+    match xver {
+        1 => Ok(match (source.ip(), local.ip()) {
+            (IpAddr::V4(source_ip), IpAddr::V4(local_ip)) => format!(
+                "PROXY TCP4 {source_ip} {local_ip} {} {}\r\n",
+                source.port(),
+                local.port()
+            )
+            .into_bytes(),
+            (IpAddr::V6(source_ip), IpAddr::V6(local_ip)) => format!(
+                "PROXY TCP6 {source_ip} {local_ip} {} {}\r\n",
+                source.port(),
+                local.port()
+            )
+            .into_bytes(),
+            _ => b"PROXY UNKNOWN\r\n".to_vec(),
+        }),
+        2 => {
+            let mut header = Vec::with_capacity(28);
+            header.extend_from_slice(b"\x0D\x0A\x0D\x0A\x00\x0D\x0AQUIT\x0A");
+            match (source.ip(), local.ip()) {
+                (IpAddr::V4(source_ip), IpAddr::V4(local_ip)) => {
+                    header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0C]);
+                    header.extend_from_slice(&source_ip.octets());
+                    header.extend_from_slice(&local_ip.octets());
+                }
+                (IpAddr::V6(source_ip), IpAddr::V6(local_ip)) => {
+                    header.extend_from_slice(&[0x21, 0x21, 0x00, 0x24]);
+                    header.extend_from_slice(&source_ip.octets());
+                    header.extend_from_slice(&local_ip.octets());
+                }
+                _ => {
+                    header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+                    return Ok(header);
+                }
+            }
+            header.extend_from_slice(&source.port().to_be_bytes());
+            header.extend_from_slice(&local.port().to_be_bytes());
+            Ok(header)
+        }
+        other => bail!("unsupported Trojan fallback xver {other}"),
+    }
 }
 
 fn parse_fallback_map(
@@ -967,14 +1289,14 @@ fn parse_fallback_map(
         .ok_or_else(|| anyhow!("Trojan fallback_for_alpn must be an object"))?;
     let mut targets = HashMap::new();
     for (alpn, value) in object {
-        let key = alpn.trim();
+        let key = alpn.trim().to_ascii_lowercase();
         ensure!(
             !key.is_empty(),
             "Trojan fallback_for_alpn contains empty ALPN"
         );
         ensure!(
             targets
-                .insert(key.to_string(), parse_fallback_target(value)?)
+                .insert(key.clone(), parse_fallback_target(value)?)
                 .is_none(),
             "duplicate Trojan fallback_for_alpn entry {key}"
         );
@@ -989,7 +1311,145 @@ fn parse_fallback_target(value: &serde_json::Value) -> anyhow::Result<FallbackTa
         !target.server.trim().is_empty() && target.server_port > 0,
         "Trojan fallback target requires server and server_port"
     );
+    ensure!(target.xver <= 2, "Trojan fallback xver must be 0, 1 or 2");
     Ok(target)
+}
+
+fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<ParsedFallbackEntry> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Xboard Trojan fallback entry must be an object"))?;
+
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let path = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    ensure!(
+        path.is_empty() || path.starts_with('/'),
+        "Xboard Trojan fallback path must start with /"
+    );
+
+    let xver = object
+        .get("xver")
+        .map(parse_u8_json)
+        .transpose()?
+        .unwrap_or(0);
+    ensure!(xver <= 2, "Xboard Trojan fallback xver must be 0, 1 or 2");
+
+    let fallback_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    ensure!(
+        fallback_type.is_empty() || fallback_type.eq_ignore_ascii_case("tcp"),
+        "Xboard Trojan fallback type is not supported yet"
+    );
+
+    let dest = object
+        .get("dest")
+        .ok_or_else(|| anyhow!("Xboard Trojan fallback entry requires dest"))?;
+    let mut target = parse_xboard_fallback_dest(dest)?;
+    target.xver = xver;
+
+    let alpn = object
+        .get("alpn")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+
+    Ok(ParsedFallbackEntry {
+        name: (!name.is_empty()).then_some(name),
+        alpn,
+        path: (!path.is_empty()).then_some(path.to_string()),
+        target,
+    })
+}
+
+fn parse_u8_json(value: &serde_json::Value) -> anyhow::Result<u8> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| anyhow!("expected u8 number, got {value}")),
+        serde_json::Value::String(text) => {
+            text.trim().parse::<u8>().context("parse u8 string value")
+        }
+        _ => bail!("expected u8 number or decimal string, got {value}"),
+    }
+}
+
+fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<FallbackTarget> {
+    match value {
+        serde_json::Value::Number(number) => {
+            let port = number
+                .as_u64()
+                .ok_or_else(|| anyhow!("Xboard Trojan fallback dest must be a TCP port"))?;
+            let server_port =
+                u16::try_from(port).context("Xboard Trojan fallback port does not fit u16")?;
+            ensure!(
+                server_port > 0,
+                "Xboard Trojan fallback port must be non-zero"
+            );
+            Ok(FallbackTarget {
+                server: "127.0.0.1".to_string(),
+                server_port,
+                xver: 0,
+            })
+        }
+        serde_json::Value::String(text) => {
+            let compact = text.trim();
+            ensure!(
+                !compact.is_empty() && !compact.starts_with('/') && !compact.starts_with('@'),
+                "Xboard Trojan fallback dest must be tcp host:port or port"
+            );
+            if compact.chars().all(|ch| ch.is_ascii_digit()) {
+                let server_port = compact
+                    .parse::<u16>()
+                    .context("parse Xboard Trojan fallback port")?;
+                ensure!(
+                    server_port > 0,
+                    "Xboard Trojan fallback port must be non-zero"
+                );
+                return Ok(FallbackTarget {
+                    server: "127.0.0.1".to_string(),
+                    server_port,
+                    xver: 0,
+                });
+            }
+
+            let (server, port) = compact
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow!("Xboard Trojan fallback dest must be tcp host:port"))?;
+            ensure!(
+                !server.trim().is_empty(),
+                "Xboard Trojan fallback host is required"
+            );
+            let server_port = port
+                .trim()
+                .parse::<u16>()
+                .context("parse Xboard Trojan fallback port")?;
+            ensure!(
+                server_port > 0,
+                "Xboard Trojan fallback port must be non-zero"
+            );
+            Ok(FallbackTarget {
+                server: server.trim().to_string(),
+                server_port,
+                xver: 0,
+            })
+        }
+        _ => bail!("Xboard Trojan fallback dest must be a string or number"),
+    }
 }
 
 fn effective_password(user: &PanelUser) -> Option<&str> {
@@ -1060,25 +1520,211 @@ mod tests {
 
     #[test]
     fn fallback_selection_prefers_alpn_map_over_default() {
-        let config = FallbackConfig {
-            default: Some(FallbackTarget {
-                server: "127.0.0.1".to_string(),
-                server_port: 80,
-            }),
-            by_alpn: HashMap::from([(
-                "h2".to_string(),
-                FallbackTarget {
-                    server: "127.0.0.1".to_string(),
-                    server_port: 443,
-                },
-            )]),
-        };
+        let config = FallbackConfig::from_remote(&NodeConfigResponse {
+            fallback: Some(serde_json::json!({
+                "server": "127.0.0.1",
+                "server_port": 80
+            })),
+            fallback_for_alpn: Some(serde_json::json!({
+                "h2": {
+                    "server": "127.0.0.1",
+                    "server_port": 443
+                }
+            })),
+            ..base_remote()
+        })
+        .expect("fallback config");
 
         assert_eq!(
-            config.select(Some(b"h2")).map(|target| target.server_port),
+            config
+                .select(None, Some(b"h2"), b"GET / HTTP/1.1\r\n\r\n")
+                .map(|target| target.server_port),
             Some(443)
         );
-        assert!(config.select(Some(b"http/1.1")).is_none());
+        assert_eq!(
+            config
+                .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn fallback_selection_rejects_unmatched_alpn_without_default() {
+        let config = FallbackConfig::from_remote(&NodeConfigResponse {
+            fallback_for_alpn: Some(serde_json::json!({
+                "h2": {
+                    "server": "127.0.0.1",
+                    "server_port": 443
+                }
+            })),
+            ..base_remote()
+        })
+        .expect("fallback config");
+
+        assert!(
+            config
+                .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_fallback_string_port() {
+        let target = parse_fallback_target(&serde_json::json!({
+            "server": "127.0.0.1",
+            "server_port": "8080"
+        }))
+        .expect("parse fallback");
+
+        assert_eq!(target.server, "127.0.0.1");
+        assert_eq!(target.server_port, 8080);
+    }
+
+    #[test]
+    fn parses_fallback_xver() {
+        let target = parse_fallback_target(&serde_json::json!({
+            "server": "127.0.0.1",
+            "server_port": 8080,
+            "xver": 2
+        }))
+        .expect("parse fallback");
+
+        assert_eq!(target.xver, 2);
+    }
+
+    #[test]
+    fn parses_xboard_fallbacks_subset() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": 80 },
+                { "alpn": "h2", "dest": "127.0.0.1:8443" }
+            ])),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        assert_eq!(
+            config
+                .select(None, Some(b"h2"), b"GET / HTTP/1.1\r\n\r\n")
+                .map(|target| target.server_port),
+            Some(8443)
+        );
+        assert_eq!(
+            config
+                .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn parses_xboard_fallbacks_with_path_name_and_xver() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": 80 },
+                { "name": "example.com", "alpn": "h2", "path": "/ws", "dest": "127.0.0.1:8443", "xver": 1 }
+            ])),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        let target = config
+            .select(
+                Some("api.example.com"),
+                Some(b"h2"),
+                b"GET /ws?ed=2048 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            )
+            .expect("path-specific fallback");
+        assert_eq!(target.server, "127.0.0.1");
+        assert_eq!(target.server_port, 8443);
+        assert_eq!(target.xver, 1);
+
+        assert_eq!(
+            config
+                .select(
+                    Some("other.example.com"),
+                    Some(b"http/1.1"),
+                    b"GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn fallback_selection_uses_default_path_when_http_path_misses() {
+        let config = FallbackConfig::from_remote(&NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": 80 },
+                { "path": "/ws", "dest": 8080 }
+            ])),
+            ..base_remote()
+        })
+        .expect("fallback config");
+
+        assert_eq!(
+            config
+                .select(
+                    None,
+                    None,
+                    b"GET /other HTTP/1.1\r\nHost: example.com\r\n\r\n"
+                )
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn rejects_xboard_fallback_path_without_leading_slash() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "path": "ws", "dest": 80 }
+            ])),
+            ..base_remote()
+        };
+
+        let error = FallbackConfig::from_remote(&remote).expect_err("unsupported fallback path");
+        assert!(error.to_string().contains("must start with /"));
+    }
+
+    #[test]
+    fn encodes_proxy_protocol_headers() {
+        let v1 = encode_proxy_header(
+            SocketAddr::from(([1, 2, 3, 4], 1234)),
+            SocketAddr::from(([5, 6, 7, 8], 443)),
+            1,
+        )
+        .expect("v1");
+        assert_eq!(v1, b"PROXY TCP4 1.2.3.4 5.6.7.8 1234 443\r\n");
+
+        let v2 = encode_proxy_header(
+            SocketAddr::from(([1, 2, 3, 4], 1234)),
+            SocketAddr::from(([5, 6, 7, 8], 443)),
+            2,
+        )
+        .expect("v2");
+        assert_eq!(
+            &v2[..16],
+            b"\x0D\x0A\x0D\x0A\x00\x0D\x0AQUIT\x0A\x21\x11\x00\x0C"
+        );
+        assert_eq!(&v2[16..20], &[1, 2, 3, 4]);
+        assert_eq!(&v2[20..24], &[5, 6, 7, 8]);
+        assert_eq!(&v2[24..26], &1234u16.to_be_bytes());
+        assert_eq!(&v2[26..28], &443u16.to_be_bytes());
+    }
+
+    #[test]
+    fn detects_http_path_from_first_packet() {
+        assert_eq!(
+            detect_http_path(b"GET /ws?ed=2048 HTTP/1.1\r\nHost: example.com\r\n\r\n").as_deref(),
+            Some("/ws")
+        );
+        assert_eq!(
+            detect_http_path(b"POST /api HTTP/1.1\r\nHost: example.com\r\n\r\n").as_deref(),
+            Some("/api")
+        );
+        assert!(detect_http_path(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").is_none());
     }
 
     #[tokio::test]
@@ -1147,6 +1793,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_disabled_network_settings_and_tcp_transport_field() {
+        let remote = NodeConfigResponse {
+            network_settings: Some(serde_json::json!({
+                "ws": false,
+                "headers": {},
+                "path": ""
+            })),
+            transport: Some(serde_json::json!({
+                "type": "tcp"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 443);
+    }
+
+    #[test]
     fn accepts_disabled_multiplex_but_rejects_non_tls_mode() {
         let remote = NodeConfigResponse {
             tls: Some(serde_json::json!(1)),
@@ -1165,5 +1829,41 @@ mod tests {
         };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
         assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
+    fn replace_users_cancels_active_session_when_password_rotates() {
+        let accounting = Accounting::new();
+        let controller = ServerController::new(accounting.clone());
+        controller
+            .replace_users(&[PanelUser {
+                id: 1,
+                uuid: "stable-uuid".to_string(),
+                password: "old-password".to_string(),
+                ..Default::default()
+            }])
+            .expect("initial users");
+
+        let user = controller
+            .users
+            .read()
+            .expect("trojan users lock poisoned")
+            .get(&trojan_auth("old-password"))
+            .expect("user exists");
+        let lease = accounting
+            .open_session(&user, "1.1.1.1:1234".parse().expect("socket addr"))
+            .expect("session should open");
+        let control = lease.control();
+
+        controller
+            .replace_users(&[PanelUser {
+                id: 1,
+                uuid: "stable-uuid".to_string(),
+                password: "new-password".to_string(),
+                ..Default::default()
+            }])
+            .expect("rotated users");
+
+        assert!(control.is_cancelled());
     }
 }
