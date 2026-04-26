@@ -790,7 +790,18 @@ where
         }
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            result = writer.write_all(&buffer[..read]) => result.context("write Trojan proxied chunk")?,
+            result = writer.write_all(&buffer[..read]) => match result {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return Ok(total);
+                }
+                Err(error) => return Err(error).context("write Trojan proxied chunk"),
+            },
         }
         let transferred = read as u64;
         total += transferred;

@@ -867,7 +867,7 @@ impl CloudflareDnsProvider {
         record: &DnsChallengeRecord,
     ) -> anyhow::Result<DnsRecordHandle> {
         let zone_id = self.resolve_zone_id(&record.fqdn).await?;
-        let response: CloudflareDnsRecord = self
+        let response: anyhow::Result<CloudflareDnsRecord> = self
             .cloudflare_json(
                 self.client
                     .post(format!("{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records"))
@@ -879,11 +879,47 @@ impl CloudflareDnsProvider {
                     })),
                 "create DNS record",
             )
-            .await?;
+            .await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if is_cloudflare_duplicate_record_error(&error) => {
+                let record_id = self
+                    .find_existing_txt_record_id(&zone_id, record)
+                    .await?
+                    .ok_or(error)?;
+                return Ok(DnsRecordHandle::Cloudflare { zone_id, record_id });
+            }
+            Err(error) => return Err(error),
+        };
         Ok(DnsRecordHandle::Cloudflare {
             zone_id,
             record_id: response.id,
         })
+    }
+
+    async fn find_existing_txt_record_id(
+        &self,
+        zone_id: &str,
+        record: &DnsChallengeRecord,
+    ) -> anyhow::Result<Option<String>> {
+        let records: Vec<CloudflareDnsRecordDetail> = self
+            .cloudflare_json(
+                self.client
+                    .get(format!("{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records"))
+                    .query(&[
+                        ("type", "TXT"),
+                        ("name", record.fqdn.trim_end_matches('.')),
+                        ("page", "1"),
+                        ("per_page", "100"),
+                    ]),
+                "lookup DNS record",
+            )
+            .await?;
+        Ok(records
+            .into_iter()
+            .find(|item| item.content == record.value)
+            .map(|item| item.id))
     }
 
     async fn delete_record(&self, zone_id: &str, record_id: &str) -> anyhow::Result<()> {
@@ -992,6 +1028,18 @@ struct CloudflareZone {
 #[derive(Debug, Deserialize)]
 struct CloudflareDnsRecord {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareDnsRecordDetail {
+    id: String,
+    #[serde(default)]
+    content: String,
+}
+
+fn is_cloudflare_duplicate_record_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("81058") || message.contains("An identical record already exists")
 }
 
 #[derive(Debug, Clone)]
