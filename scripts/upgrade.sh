@@ -608,7 +608,7 @@ main() {
   ensure_existing_installation
   if legacy_layout_detected; then
     echo "Legacy noders-anytls install layout detected." >&2
-    echo "Run ${PREFIX%/}/lib/noders/migrate-legacy-install.sh instead of upgrade.sh." >&2
+    echo "Back up $CONFIG_DIR and your existing state directory, then reinstall with scripts/install.sh or scripts/install-openrc.sh." >&2
     exit 1
   fi
   discover_units
