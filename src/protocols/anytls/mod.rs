@@ -60,7 +60,7 @@ pub(crate) struct RealityConfig {
     pub allow_insecure: bool,
     pub public_key: [u8; 32],
     pub private_key: [u8; 32],
-    pub short_id: [u8; 8],
+    pub short_ids: Vec<[u8; 8]>,
 }
 
 impl EffectiveNodeConfig {
@@ -425,6 +425,9 @@ fn effective_reality_config(remote: &NodeConfigResponse) -> anyhow::Result<Optio
         "Xboard reality_settings.private_key is required for tls mode 2"
     );
 
+    let short_ids =
+        decode_reality_short_ids(&settings).context("decode Xboard reality_settings.short_id")?;
+
     Ok(Some(RealityConfig {
         server_name: server_name.to_string(),
         server_port: if settings.server_port == 0 {
@@ -437,8 +440,7 @@ fn effective_reality_config(remote: &NodeConfigResponse) -> anyhow::Result<Optio
             .context("decode Xboard reality_settings.public_key")?,
         private_key: decode_reality_key(private_key)
             .context("decode Xboard reality_settings.private_key")?,
-        short_id: decode_reality_short_id(settings.short_id.trim())
-            .context("decode Xboard reality_settings.short_id")?,
+        short_ids,
     }))
 }
 
@@ -452,14 +454,40 @@ fn decode_reality_key(encoded: &str) -> anyhow::Result<[u8; 32]> {
     Ok(key)
 }
 
+fn decode_reality_short_ids(
+    settings: &crate::panel::NodeRealitySettings,
+) -> anyhow::Result<Vec<[u8; 8]>> {
+    let mut values = settings
+        .short_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !settings.short_id.trim().is_empty() || values.is_empty() {
+        values.insert(0, settings.short_id.as_str());
+    }
+
+    let mut short_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let short_id = decode_reality_short_id(value.trim())?;
+        if !short_ids.contains(&short_id) {
+            short_ids.push(short_id);
+        }
+    }
+    Ok(short_ids)
+}
+
 fn decode_reality_short_id(hex: &str) -> anyhow::Result<[u8; 8]> {
     ensure!(
         hex.len() <= 16,
         "REALITY short_id must be at most 16 hex characters"
     );
-    let padded = format!("{:0>16}", hex);
+    ensure!(
+        hex.len() % 2 == 0,
+        "REALITY short_id must contain an even number of hex characters"
+    );
     let mut short_id = [0u8; 8];
-    hex::decode_to_slice(padded.as_bytes(), &mut short_id)
+    let decoded_len = hex.len() / 2;
+    hex::decode_to_slice(hex.as_bytes(), &mut short_id[..decoded_len])
         .with_context(|| format!("invalid REALITY short_id {hex}"))?;
     Ok(short_id)
 }
@@ -1112,7 +1140,7 @@ mod tests {
         assert!(reality.allow_insecure);
         assert_eq!(reality.public_key, [0u8; 32]);
         assert_eq!(reality.private_key, [0u8; 32]);
-        assert_eq!(reality.short_id, [0, 0, 0, 0, 0, 0, 0xa1, 0xb2]);
+        assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
     }
 
     #[test]
@@ -1143,7 +1171,43 @@ mod tests {
             .expect("reality config")
             .expect("reality config present");
         assert_eq!(reality.server_port, 2443);
-        assert_eq!(reality.short_id, [0u8; 8]);
+        assert_eq!(reality.short_ids, vec![[0u8; 8]]);
+    }
+
+    #[test]
+    fn parses_reality_short_ids_array() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "listen_ip": "0.0.0.0",
+            "server_port": 2443,
+            "server_name": "node.example.com",
+            "tls": 2,
+            "realitySettings": {
+                "serverName": "reality.example.com",
+                "publicKey": REALITY_KEY_B64,
+                "privateKey": REALITY_KEY_B64,
+                "shortIds": ["a1b2", "c3d4"]
+            },
+            "padding_scheme": [],
+            "routes": [],
+            "cert_config": {
+                "cert_mode": "file",
+                "cert_path": "/etc/ssl/private/fullchain.pem",
+                "key_path": "/etc/ssl/private/privkey.pem"
+            }
+        }))
+        .expect("parse remote");
+
+        let reality = effective_reality_config(&remote)
+            .expect("reality config")
+            .expect("reality config present");
+        assert_eq!(
+            reality.short_ids,
+            vec![
+                [0xa1, 0xb2, 0, 0, 0, 0, 0, 0],
+                [0xc3, 0xd4, 0, 0, 0, 0, 0, 0]
+            ]
+        );
     }
 
     #[test]
@@ -1342,7 +1406,7 @@ impl ServerController {
         let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
             server_name: reality.server_name.clone(),
             private_key: reality.private_key,
-            short_id: reality.short_id,
+            short_ids: reality.short_ids.clone(),
         });
         let should_reload = tls_materials.as_ref().is_none_or(|current| {
             !current.matches_source(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
@@ -1352,10 +1416,15 @@ impl ServerController {
         }
 
         if let Some(reality) = tls.reality.as_ref() {
-            let short_id_hex = hex::encode(reality.short_id);
+            let short_id_hex = reality
+                .short_ids
+                .first()
+                .map(hex::encode)
+                .unwrap_or_default();
             let short_id_tail = &short_id_hex[short_id_hex.len().saturating_sub(4)..];
             info!(
                 reality_server_name = %reality.server_name,
+                reality_short_id_count = reality.short_ids.len(),
                 reality_short_id_tail = %short_id_tail,
                 "applying AnyTLS REALITY TLS config"
             );

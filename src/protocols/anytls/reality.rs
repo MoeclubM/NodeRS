@@ -15,7 +15,7 @@ use sha2::{Sha256, Sha512};
 pub struct RealityTlsConfig {
     pub server_name: String,
     pub private_key: [u8; 32],
-    pub short_id: [u8; 8],
+    pub short_ids: Vec<[u8; 8]>,
 }
 
 pub(super) struct RealityCertificateState {
@@ -154,9 +154,12 @@ fn derive_auth_key(
         plain.len() == 16,
         "REALITY decrypted session id prefix must be 16 bytes"
     );
+    let mut received_short_id = [0u8; 8];
+    received_short_id.copy_from_slice(&plain[8..16]);
     ensure!(
-        plain[8..16] == config.short_id[..],
-        "REALITY ClientHello short_id does not match configured short_id"
+        config.short_ids.contains(&received_short_id),
+        "REALITY ClientHello short_id {} does not match configured short_id",
+        hex::encode(received_short_id)
     );
 
     Ok(auth_key)

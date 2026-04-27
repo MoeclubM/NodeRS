@@ -674,12 +674,10 @@ where
 
 fn is_broken_pipe(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| {
-                error.kind() == std::io::ErrorKind::BrokenPipe
-                    || error.kind() == std::io::ErrorKind::ConnectionReset
-            })
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::BrokenPipe
+                || error.kind() == std::io::ErrorKind::ConnectionReset
+        })
     })
 }
 

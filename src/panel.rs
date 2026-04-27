@@ -262,6 +262,9 @@ impl NodeConfigResponse {
         if !reality.short_id.trim().is_empty() {
             settings.short_id = reality.short_id.clone();
         }
+        if !reality.short_ids.is_empty() {
+            settings.short_ids = reality.short_ids.clone();
+        }
 
         settings
     }
@@ -308,6 +311,13 @@ pub struct NodeTlsSettings {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub short_id: String,
+    #[serde(
+        default,
+        alias = "shortIds",
+        alias = "shortids",
+        deserialize_with = "deserialize_string_list_on_null"
+    )]
+    pub short_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -349,6 +359,13 @@ pub struct NodeRealitySettings {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub short_id: String,
+    #[serde(
+        default,
+        alias = "shortIds",
+        alias = "shortids",
+        deserialize_with = "deserialize_string_list_on_null"
+    )]
+    pub short_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -399,6 +416,7 @@ impl NodeTlsSettings {
         !self.public_key.trim().is_empty()
             || !self.private_key.trim().is_empty()
             || !self.short_id.trim().is_empty()
+            || !self.short_ids.is_empty()
     }
 
     pub fn reality_settings(&self) -> NodeRealitySettings {
@@ -409,6 +427,7 @@ impl NodeTlsSettings {
             public_key: self.public_key.clone(),
             private_key: self.private_key.clone(),
             short_id: self.short_id.clone(),
+            short_ids: self.short_ids.clone(),
         }
     }
 }
@@ -421,6 +440,7 @@ impl NodeRealitySettings {
             || !self.public_key.trim().is_empty()
             || !self.private_key.trim().is_empty()
             || !self.short_id.trim().is_empty()
+            || !self.short_ids.is_empty()
     }
 }
 
