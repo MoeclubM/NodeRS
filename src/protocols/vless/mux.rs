@@ -12,7 +12,7 @@ use tokio::task::AbortHandle;
 
 use crate::accounting::SessionControl;
 
-use super::super::anytls::{
+use super::super::shared::{
     routing::RoutingTable, socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
 };
 

@@ -22,7 +22,7 @@ use self::crypto::{
     BodyReader, BodyWriter, SecurityType, auth_id_is_fresh, cmd_key, decode_auth_id,
     encode_response_header, parse_uuid,
 };
-use super::anytls::{
+use super::shared::{
     EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing, tls,
     traffic::TrafficRecorder, transport,
 };
@@ -753,14 +753,14 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if remote
         .network_settings
         .as_ref()
-        .is_some_and(json_has_meaningful_config)
+        .is_some_and(crate::panel::json_value_is_enabled)
     {
         bail!("Xboard networkSettings is not supported by NodeRS VMess server yet");
     }
     if remote
         .transport
         .as_ref()
-        .is_some_and(json_has_meaningful_config)
+        .is_some_and(crate::panel::json_value_is_enabled)
     {
         bail!("Xboard transport is not supported by NodeRS VMess server yet");
     }
@@ -773,9 +773,10 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             remote.tls_mode()
         );
     }
-    if remote.tls_mode() == 0
-        && (remote.tls_settings.is_configured() || remote.tls_settings.has_reality_key_material())
-    {
+    if remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material() {
+        bail!("REALITY settings are not supported for VMess nodes");
+    }
+    if remote.tls_mode() == 0 && remote.tls_settings.is_configured() {
         bail!("Xboard tls_settings requires tls mode 1 for VMess nodes");
     }
     let packet_encoding = remote.packet_encoding.trim();
@@ -791,26 +792,11 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn json_has_meaningful_config(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::Bool(value) => *value,
-        serde_json::Value::Number(number) => {
-            number.as_i64().is_some_and(|value| value != 0)
-                || number.as_u64().is_some_and(|value| value != 0)
-                || number.as_f64().is_some_and(|value| value != 0.0)
-        }
-        serde_json::Value::String(value) => !value.trim().is_empty(),
-        serde_json::Value::Array(values) => values.iter().any(json_has_meaningful_config),
-        serde_json::Value::Object(values) => values.values().any(json_has_meaningful_config),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::panel::CertConfig;
-    use crate::protocols::anytls::socksaddr::SocksAddr;
+    use crate::protocols::shared::socksaddr::SocksAddr;
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -853,6 +839,20 @@ mod tests {
         };
         let error = EffectiveNodeConfig::from_remote(&remote).unwrap_err();
         assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
+    fn rejects_reality_settings() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            tls_settings: crate::panel::NodeTlsSettings {
+                private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).unwrap_err();
+        assert!(error.to_string().contains("REALITY"));
     }
 
     #[test]

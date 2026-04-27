@@ -14,10 +14,15 @@ const OUTBOUND_ALLOWED_FIELDS: &[&str] = &[
     "tag",
     "type",
     "dns_resolver",
+    "dnsResolver",
     "domain_resolver",
+    "domainResolver",
     "address_resolver",
+    "addressResolver",
     "ip_strategy",
+    "ipStrategy",
     "domain_strategy",
+    "domainStrategy",
     "strategy",
     "server",
     "address",
@@ -30,12 +35,18 @@ const ROUTE_ALLOWED_FIELDS: &[&str] = &[
     "protocol",
     "domain",
     "domain_suffix",
+    "domainSuffix",
     "domain_keyword",
+    "domainKeyword",
     "domain_regex",
+    "domainRegex",
     "ip_cidr",
+    "ipCidr",
     "ip_is_private",
+    "ipIsPrivate",
     "port",
     "port_range",
+    "portRange",
 ];
 
 #[derive(Debug, Clone)]
@@ -92,12 +103,21 @@ struct RawCustomOutbound {
     kind: String,
     #[serde(
         default,
+        alias = "dnsResolver",
         alias = "domain_resolver",
+        alias = "domainResolver",
         alias = "address_resolver",
+        alias = "addressResolver",
         deserialize_with = "deserialize_default_on_null"
     )]
     dns_resolver: String,
-    #[serde(default, alias = "domain_strategy", alias = "strategy")]
+    #[serde(
+        default,
+        alias = "ipStrategy",
+        alias = "domain_strategy",
+        alias = "domainStrategy",
+        alias = "strategy"
+    )]
     ip_strategy: IpStrategy,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     server: String,
@@ -117,19 +137,43 @@ struct RawCustomRoute {
     protocol: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     domain: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "domainSuffix",
+        deserialize_with = "deserialize_string_list"
+    )]
     domain_suffix: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "domainKeyword",
+        deserialize_with = "deserialize_string_list"
+    )]
     domain_keyword: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "domainRegex",
+        deserialize_with = "deserialize_string_list"
+    )]
     domain_regex: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "ipCidr",
+        deserialize_with = "deserialize_string_list"
+    )]
     ip_cidr: Vec<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "ipIsPrivate",
+        deserialize_with = "crate::panel::deserialize_bool_from_any_on_null"
+    )]
     ip_is_private: bool,
     #[serde(default, deserialize_with = "deserialize_port_ranges")]
     port: Vec<PortRange>,
-    #[serde(default, deserialize_with = "deserialize_string_list")]
+    #[serde(
+        default,
+        alias = "portRange",
+        deserialize_with = "deserialize_string_list"
+    )]
     port_range: Vec<String>,
 }
 
@@ -659,6 +703,34 @@ mod tests {
             .expect("outbound");
 
         assert_eq!(outbound.ip_strategy, IpStrategy::PreferIpv6);
+    }
+
+    #[test]
+    fn custom_routes_accept_camel_case_aliases() {
+        let routing = RoutingTable::from_remote(
+            &[],
+            &[serde_json::json!({
+                "tag": "ipv4-first",
+                "type": "direct",
+                "ipStrategy": "prefer_ipv4"
+            })],
+            &[serde_json::json!({
+                "domainSuffix": ["example.com"],
+                "ipIsPrivate": "false",
+                "portRange": "443-443",
+                "outbound": "ipv4-first"
+            })],
+        )
+        .expect("routing");
+
+        let outbound = routing
+            .outbound_for(
+                &SocksAddr::Domain("api.example.com".to_string(), 443),
+                "tcp",
+            )
+            .expect("outbound");
+
+        assert_eq!(outbound.ip_strategy, IpStrategy::PreferIpv4);
     }
 
     #[test]

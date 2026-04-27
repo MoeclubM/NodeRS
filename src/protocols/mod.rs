@@ -2,6 +2,7 @@ pub mod anytls;
 pub mod hysteria2;
 pub mod mieru;
 pub mod shadowsocks;
+pub(crate) mod shared;
 pub mod trojan;
 pub mod vless;
 pub mod vmess;

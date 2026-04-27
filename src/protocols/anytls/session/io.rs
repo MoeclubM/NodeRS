@@ -9,9 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::accounting::SessionControl;
+use crate::protocols::shared::traffic::TrafficRecorder;
 
 use super::super::activity::ActivityTracker;
-use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
 use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;

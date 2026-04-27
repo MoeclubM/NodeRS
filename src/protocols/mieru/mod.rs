@@ -21,7 +21,7 @@ use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser};
 
 use self::codec::{Metadata, ProtocolType, SocksCommand};
-use super::anytls::{
+use super::shared::{
     bind_listeners, configure_tcp_stream, effective_listen_ip, routing, socksaddr::SocksAddr,
     traffic::TrafficRecorder, transport,
 };
@@ -901,7 +901,7 @@ async fn cancel_all_sessions(sessions: &Arc<AsyncMutex<HashMap<u32, Arc<SessionS
 }
 
 fn parse_transport(value: Option<&Value>) -> anyhow::Result<()> {
-    if value.is_some_and(|value| !json_value_effectively_enabled(value)) {
+    if value.is_some_and(|value| !crate::panel::json_value_is_enabled(value)) {
         return Ok(());
     }
 
@@ -942,7 +942,7 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if remote
         .network_settings
         .as_ref()
-        .is_some_and(json_value_effectively_enabled)
+        .is_some_and(crate::panel::json_value_is_enabled)
     {
         bail!("Xboard networkSettings is not supported by NodeRS Mieru server yet");
     }
@@ -950,7 +950,12 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS Mieru server yet");
     }
-    if remote.tls.is_some() || remote.tls_settings.is_configured() || remote.cert_config.is_some() {
+    if remote.tls.is_some()
+        || remote.tls_settings.is_configured()
+        || remote.tls_settings.has_reality_key_material()
+        || remote.reality_settings.is_configured()
+        || remote.cert_config.is_some()
+    {
         bail!("Xboard tls is not supported by NodeRS Mieru server");
     }
     if !remote.packet_encoding.trim().is_empty()
@@ -960,30 +965,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         bail!("unsupported Mieru extension fields in Xboard config");
     }
     Ok(())
-}
-
-fn json_value_effectively_enabled(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(number) => {
-            number.as_i64().is_some_and(|value| value != 0)
-                || number.as_u64().is_some_and(|value| value != 0)
-                || number.as_f64().is_some_and(|value| value != 0.0)
-        }
-        Value::String(text) => {
-            let normalized = text.trim().to_ascii_lowercase();
-            !matches!(
-                normalized.as_str(),
-                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
-            )
-        }
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(object) => object
-            .get("enabled")
-            .map(json_value_effectively_enabled)
-            .unwrap_or(!object.is_empty()),
-    }
 }
 
 fn effective_identity(user: &PanelUser) -> Option<&str> {

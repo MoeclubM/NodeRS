@@ -2,7 +2,7 @@ use anyhow::{Context, bail, ensure};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocols::anytls::socksaddr::SocksAddr;
+use crate::protocols::shared::socksaddr::SocksAddr;
 
 pub const METADATA_LEN: usize = 32;
 pub const MAX_SESSION_PAYLOAD_LEN: usize = 1024;

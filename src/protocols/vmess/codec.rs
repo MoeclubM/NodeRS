@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, bail, ensure};
 
-use crate::protocols::anytls::socksaddr::SocksAddr;
+use crate::protocols::shared::socksaddr::SocksAddr;
 
 use super::crypto::{BodyConfig, RequestOptions, SecurityType};
 

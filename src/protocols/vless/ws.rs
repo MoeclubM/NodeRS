@@ -50,7 +50,7 @@ impl WsConfig {
                 .trim(),
         );
         let hosts = match object.get("headers").and_then(Value::as_object) {
-            Some(headers) => parse_hosts(headers.get("Host"))?,
+            Some(headers) => parse_hosts(header_value(headers, "Host"))?,
             None => parse_hosts(object.get("host"))?,
         };
         Ok(Self { path, hosts })
@@ -68,6 +68,14 @@ impl WsConfig {
                 .iter()
                 .any(|expected| expected == &super::http1::normalize_host(request_host))
     }
+}
+
+fn header_value<'a>(headers: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a Value> {
+    headers.get(name).or_else(|| {
+        headers
+            .iter()
+            .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value))
+    })
 }
 
 pub struct WsStream {
@@ -295,6 +303,15 @@ mod tests {
             config.hosts,
             vec!["example.com".to_string(), "cdn.example.com".to_string()]
         );
+
+        let config = WsConfig::from_network_settings(Some(&serde_json::json!({
+            "path": "ws",
+            "headers": {
+                "host": "lower.example.com:443"
+            }
+        })))
+        .expect("parse lowercase host header");
+        assert_eq!(config.hosts, vec!["lower.example.com".to_string()]);
     }
 
     #[tokio::test]

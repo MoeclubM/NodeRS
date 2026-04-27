@@ -23,7 +23,7 @@ use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser};
 
 use self::codec::Command;
-use super::anytls::{
+use super::shared::{
     EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing,
     socksaddr::SocksAddr, tls, traffic::TrafficRecorder, transport,
 };
@@ -103,7 +103,10 @@ pub struct FallbackConfig {
 struct FallbackTarget {
     #[serde(default)]
     server: String,
-    #[serde(deserialize_with = "crate::panel::deserialize_u16_from_number_or_string")]
+    #[serde(
+        alias = "serverPort",
+        deserialize_with = "crate::panel::deserialize_u16_from_number_or_string"
+    )]
     server_port: u16,
 }
 
@@ -347,7 +350,7 @@ impl ServerController {
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
         let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
-            server_name: reality.server_name.clone(),
+            server_names: reality.server_names.clone(),
             private_key: reality.private_key,
             short_ids: reality.short_ids.clone(),
         });
@@ -366,7 +369,7 @@ impl ServerController {
                 .unwrap_or_default();
             let short_id_tail = &short_id_hex[short_id_hex.len().saturating_sub(4)..];
             info!(
-                reality_server_name = %reality.server_name,
+                reality_server_names = %reality.server_names.join(","),
                 reality_short_id_count = reality.short_ids.len(),
                 reality_short_id_tail = %short_id_tail,
                 "applying VLESS REALITY TLS config"
@@ -1196,7 +1199,7 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
             remote
                 .network_settings
                 .as_ref()
-                .is_none_or(|value| !json_value_effectively_enabled(value)),
+                .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
             "Xboard networkSettings is only supported for VLESS grpc/ws/httpupgrade/xhttp nodes"
         );
         return Ok(TransportMode::Tcp);
@@ -1228,7 +1231,7 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
 
 fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEncoding> {
     let packet_encoding = remote.packet_encoding.trim();
-    if packet_encoding.is_empty() {
+    if packet_encoding.is_empty() || packet_encoding.eq_ignore_ascii_case("none") {
         return Ok(PacketEncoding::None);
     }
     if packet_encoding.eq_ignore_ascii_case("xudp") {
@@ -1245,6 +1248,12 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             "Xboard tls mode {} is not supported by NodeRS VLESS server yet",
             remote.tls_mode()
         );
+    }
+    if remote.tls_mode() != 2
+        && (remote.reality_settings.is_configured()
+            || remote.tls_settings.has_reality_key_material())
+    {
+        bail!("REALITY settings require tls mode 2 for VLESS nodes");
     }
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
@@ -1264,7 +1273,7 @@ fn validate_transport_field(
     value: &serde_json::Value,
     transport_mode: &TransportMode,
 ) -> anyhow::Result<()> {
-    if !json_value_effectively_enabled(value) {
+    if !crate::panel::json_value_is_enabled(value) {
         return Ok(());
     }
 
@@ -1293,30 +1302,6 @@ fn validate_transport_field(
     }
 
     bail!("Xboard transport is not supported by NodeRS VLESS server yet");
-}
-
-fn json_value_effectively_enabled(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::Bool(value) => *value,
-        serde_json::Value::Number(number) => {
-            number.as_i64().is_some_and(|value| value != 0)
-                || number.as_u64().is_some_and(|value| value != 0)
-                || number.as_f64().is_some_and(|value| value != 0.0)
-        }
-        serde_json::Value::String(text) => {
-            let normalized = text.trim().to_ascii_lowercase();
-            !matches!(
-                normalized.as_str(),
-                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
-            )
-        }
-        serde_json::Value::Array(items) => !items.is_empty(),
-        serde_json::Value::Object(object) => object
-            .get("enabled")
-            .map(json_value_effectively_enabled)
-            .unwrap_or(!object.is_empty()),
-    }
 }
 
 fn parse_fallback_map(
@@ -1590,6 +1575,14 @@ mod tests {
         .expect("parse fallback");
 
         assert_eq!(target.server_port, 8080);
+
+        let target = parse_fallback_target(&serde_json::json!({
+            "server": "127.0.0.1",
+            "serverPort": "8081"
+        }))
+        .expect("parse fallback camel port");
+
+        assert_eq!(target.server_port, 8081);
     }
 
     #[test]
@@ -1616,6 +1609,13 @@ mod tests {
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("packet encoding");
         assert_eq!(config.packet_encoding, PacketEncoding::Xudp);
+
+        let remote = NodeConfigResponse {
+            packet_encoding: "none".to_string(),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("packet encoding none");
+        assert_eq!(config.packet_encoding, PacketEncoding::None);
     }
 
     #[test]
@@ -1666,6 +1666,10 @@ mod tests {
         let config = EffectiveNodeConfig::from_remote(&remote).expect("reality config");
         let reality = config.tls.reality.expect("reality config");
         assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(
+            reality.server_names,
+            vec!["reality.example.com".to_string()]
+        );
         assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
     }
 
