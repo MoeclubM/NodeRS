@@ -73,7 +73,18 @@ impl LoadedTlsMaterials {
         self.source == *source
             && self.ech_source.as_ref() == ech_source
             && self.reality.as_ref() == reality
-            && self.alpn_protocols == alpn_protocols
+            && self.alpn_protocols == normalized_alpn_protocols(reality, alpn_protocols)
+    }
+}
+
+fn normalized_alpn_protocols(
+    reality: Option<&RealityTlsConfig>,
+    alpn_protocols: &[String],
+) -> Vec<String> {
+    if reality.is_some() {
+        Vec::new()
+    } else {
+        alpn_protocols.to_vec()
     }
 }
 
@@ -86,7 +97,7 @@ pub async fn load_tls_materials(
     let source = source.clone();
     let ech_source = ech_source.cloned();
     let reality = reality.cloned();
-    let alpn_protocols = alpn_protocols.to_vec();
+    let alpn_protocols = normalized_alpn_protocols(reality.as_ref(), alpn_protocols);
     let (cert_pem, key_pem) = if reality.is_some() {
         (Vec::new(), Vec::new())
     } else {
@@ -253,7 +264,11 @@ async fn build_acceptor(
 ) -> anyhow::Result<Arc<SslAcceptor>> {
     let ech_materials = ech_materials.cloned();
     let reality = reality.cloned();
-    let alpn_wire = encode_alpn_protocols(alpn_protocols)?;
+    let alpn_wire = if reality.is_some() {
+        Vec::new()
+    } else {
+        encode_alpn_protocols(alpn_protocols)?
+    };
     tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<SslAcceptor>> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .context("build BoringSSL acceptor")?;
@@ -335,7 +350,7 @@ async fn build_acceptor(
     .context("join BoringSSL builder")?
 }
 
-fn encode_alpn_protocols(protocols: &[String]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn encode_alpn_protocols(protocols: &[String]) -> anyhow::Result<Vec<u8>> {
     let mut encoded = Vec::new();
     for protocol in protocols {
         let protocol = protocol.trim();
@@ -626,6 +641,37 @@ mod tests {
                 .expect("reload")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn reality_materials_ignore_alpn_when_matching_source() {
+        let reality = RealityTlsConfig {
+            server_name: "reality.example.com".to_string(),
+            server_port: 443,
+            server_names: vec!["reality.example.com".to_string()],
+            private_key: [7; 32],
+            short_ids: vec![[0; 8]],
+        };
+        let materials = load_tls_materials(
+            &TlsMaterialSource::SelfSigned {
+                subject_alt_names: vec!["node.example.com".to_string()],
+            },
+            None,
+            Some(&reality),
+            &["h2".to_string()],
+        )
+        .await
+        .expect("reality materials");
+
+        let other_alpn = vec!["http/1.1".to_string()];
+        assert!(materials.matches_source(
+            &TlsMaterialSource::SelfSigned {
+                subject_alt_names: vec!["node.example.com".to_string()],
+            },
+            None,
+            Some(&reality),
+            &other_alpn,
+        ));
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ mod xhttp;
 mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
-use boring::ssl::{Ssl, SslOptions, SslVersion};
+use boring::ssl::{SslOptions, SslVersion};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -39,6 +39,16 @@ type TlsStream = tokio_boring::SslStream<http1::PrefixedIo<TcpStream>>;
 struct RealityServerState {
     config: tls::RealityTlsConfig,
     cert_state: Arc<super::shared::reality::RealityCertificateState>,
+}
+
+struct ObservedRealityTarget {
+    stream: TcpStream,
+    server_hello: super::shared::reality::ObservedServerHello,
+}
+
+struct RealityHandshakeProfile {
+    cipher_list: &'static str,
+    curves_list: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -570,7 +580,7 @@ async fn accept_loop(
 }
 
 async fn accept_reality_tls(
-    acceptor: &boring::ssl::SslAcceptor,
+    _acceptor: &boring::ssl::SslAcceptor,
     mut stream: TcpStream,
     source: SocketAddr,
     reality: &RealityServerState,
@@ -592,30 +602,50 @@ async fn accept_reality_tls(
             }
         };
 
+    let observed_target = match observe_reality_target(&client_hello.prefix, reality, source).await
+    {
+        Ok(observed) => observed,
+        Err(error) => {
+            warn!(
+                %error,
+                %source,
+                "VLESS REALITY target handshake observation failed; forwarding to target"
+            );
+            proxy_reality_fallback(stream, reality, client_hello.prefix).await?;
+            return Ok(None);
+        }
+    };
+
+    let handshake_profile = match reality_handshake_profile(&observed_target.server_hello) {
+        Ok(profile) => profile,
+        Err(error) => {
+            warn!(
+                %error,
+                %source,
+                "VLESS REALITY target handshake profile is unsupported; forwarding to target"
+            );
+            proxy_observed_reality_fallback(stream, observed_target, Vec::new()).await?;
+            return Ok(None);
+        }
+    };
+
     let certificate = super::shared::reality::build_server_certificate(
         &reality.cert_state,
         &authenticated.auth_key,
     )
     .context("build REALITY server certificate")?;
-    let fallback_prefix = client_hello.prefix.clone();
-    let mut ssl = Ssl::new(acceptor.context()).context("create REALITY TLS session")?;
-    ssl.set_options(SslOptions::NO_TICKET);
-    ssl.set_min_proto_version(Some(SslVersion::TLS1_3))
-        .context("set REALITY TLS minimum version")?;
-    ssl.set_max_proto_version(Some(SslVersion::TLS1_3))
-        .context("set REALITY TLS maximum version")?;
-    ssl.set_certificate(&certificate)
-        .context("set REALITY TLS certificate")?;
-    ssl.set_private_key(reality.cert_state.private_key())
-        .context("set REALITY TLS private key")?;
+    let reality_acceptor = build_reality_acceptor(
+        &certificate,
+        reality.cert_state.private_key(),
+        &handshake_profile,
+    );
 
     let tls_stream = match timeout(
         TLS_HANDSHAKE_TIMEOUT,
-        tokio_boring::SslStreamBuilder::new(
-            ssl,
+        tokio_boring::accept(
+            &reality_acceptor?,
             http1::PrefixedIo::new(stream, client_hello.prefix).capture_inner_reads(),
-        )
-        .accept(),
+        ),
     )
     .await
     {
@@ -633,14 +663,155 @@ async fn accept_reality_tls(
                 .into_source_stream()
                 .context("extract REALITY source stream after handshake failure")?
                 .into_parts();
-            let mut consumed = fallback_prefix;
-            consumed.extend_from_slice(&consumed_after_client_hello);
-            proxy_reality_fallback(stream, reality, consumed).await?;
+            proxy_observed_reality_fallback(stream, observed_target, consumed_after_client_hello)
+                .await?;
             return Ok(None);
         }
         Err(_) => return Err(anyhow!("REALITY TLS handshake timed out")),
     };
     Ok(Some(tls_stream))
+}
+
+fn reality_handshake_profile(
+    server_hello: &super::shared::reality::ObservedServerHello,
+) -> anyhow::Result<RealityHandshakeProfile> {
+    let Some(curves_list) = server_hello.curves_list() else {
+        bail!(
+            "unsupported REALITY target key share group 0x{:04x}",
+            server_hello.key_share_group
+        );
+    };
+    let cipher_list = match server_hello.cipher_suite {
+        0x1301 => "TLS_AES_128_GCM_SHA256",
+        0x1302 => "TLS_AES_256_GCM_SHA384",
+        0x1303 => "TLS_CHACHA20_POLY1305_SHA256",
+        _ => {
+            bail!(
+                "unsupported REALITY target cipher suite 0x{:04x}",
+                server_hello.cipher_suite
+            )
+        }
+    };
+
+    Ok(RealityHandshakeProfile {
+        cipher_list,
+        curves_list,
+    })
+}
+
+fn build_reality_acceptor(
+    certificate: &boring::x509::X509Ref,
+    private_key: &boring::pkey::PKeyRef<boring::pkey::Private>,
+    profile: &RealityHandshakeProfile,
+) -> anyhow::Result<boring::ssl::SslAcceptor> {
+    let mut builder =
+        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+            .context("build per-connection REALITY acceptor")?;
+    builder.set_options(SslOptions::NO_TICKET);
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .context("set REALITY TLS minimum version")?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .context("set REALITY TLS maximum version")?;
+    builder
+        .set_sigalgs_list("ed25519")
+        .context("set REALITY TLS signature algorithms")?;
+    builder
+        .set_certificate(certificate)
+        .context("set REALITY TLS certificate")?;
+    builder
+        .set_private_key(private_key)
+        .context("set REALITY TLS private key")?;
+    builder
+        .check_private_key()
+        .context("check REALITY TLS private key")?;
+    builder
+        .set_curves_list(profile.curves_list)
+        .context("set REALITY TLS key share group")?;
+    builder
+        .set_strict_cipher_list(profile.cipher_list)
+        .context("set REALITY TLS cipher suite")?;
+
+    Ok(builder.build())
+}
+
+async fn observe_reality_target(
+    client_hello_prefix: &[u8],
+    reality: &RealityServerState,
+    source: SocketAddr,
+) -> anyhow::Result<ObservedRealityTarget> {
+    let mut target = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        TcpStream::connect((
+            reality.config.server_name.as_str(),
+            reality.config.server_port,
+        )),
+    )
+    .await
+    .map_err(|_| anyhow!("connect REALITY target timed out"))?
+    .with_context(|| {
+        format!(
+            "connect REALITY target {}:{}",
+            reality.config.server_name, reality.config.server_port
+        )
+    })?;
+    configure_tcp_stream(&target);
+    target
+        .write_all(client_hello_prefix)
+        .await
+        .context("write REALITY target ClientHello")?;
+
+    let observed = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        super::shared::reality::read_server_hello(&mut target),
+    )
+    .await
+    .map_err(|_| anyhow!("read REALITY target ServerHello timed out"))??;
+
+    info!(
+        %source,
+        cipher_suite = format_args!("0x{:04x}", observed.cipher_suite),
+        key_share_group = format_args!("0x{:04x}", observed.key_share_group),
+        "observed REALITY target TLS 1.3 ServerHello"
+    );
+
+    Ok(ObservedRealityTarget {
+        stream: target,
+        server_hello: observed,
+    })
+}
+
+async fn proxy_observed_reality_fallback(
+    stream: TcpStream,
+    observed_target: ObservedRealityTarget,
+    consumed_after_client_hello: Vec<u8>,
+) -> anyhow::Result<()> {
+    let control = SessionControl::new();
+    let (mut client_reader, mut client_writer) = split(stream);
+    let (mut target_reader, mut target_writer) = split(observed_target.stream);
+    if !observed_target.server_hello.prefix.is_empty() {
+        client_writer
+            .write_all(&observed_target.server_hello.prefix)
+            .await
+            .context("write observed REALITY target ServerHello")?;
+    }
+    if !consumed_after_client_hello.is_empty() {
+        target_writer
+            .write_all(&consumed_after_client_hello)
+            .await
+            .context("write observed REALITY fallback client flight")?;
+    }
+
+    let client_to_target = copy_with_traffic(
+        &mut client_reader,
+        &mut target_writer,
+        control.clone(),
+        None,
+    );
+    let target_to_client = copy_with_traffic(&mut target_reader, &mut client_writer, control, None);
+    let _ = tokio::try_join!(client_to_target, target_to_client)?;
+    Ok(())
 }
 
 async fn proxy_reality_fallback(
@@ -1413,6 +1584,9 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     {
         bail!("REALITY settings require tls mode 2 for VLESS nodes");
     }
+    if remote.tls_mode() == 2 && !matches!(transport_mode, TransportMode::Tcp) {
+        bail!("REALITY currently only supports VLESS tcp transport in NodeRS");
+    }
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
     }
@@ -1829,6 +2003,31 @@ mod tests {
             vec!["reality.example.com".to_string()]
         );
         assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn rejects_reality_with_non_tcp_transport() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            network: "ws".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/ws"
+            })),
+            reality_settings: NodeRealitySettings {
+                server_name: "reality.example.com".to_string(),
+                private_key: REALITY_KEY_B64.to_string(),
+                short_id: "a1b2".to_string(),
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("REALITY ws transport");
+        assert!(
+            error
+                .to_string()
+                .contains("only supports VLESS tcp transport")
+        );
     }
 
     #[test]

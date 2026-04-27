@@ -48,6 +48,24 @@ pub struct AuthenticatedClientHello {
     pub auth_key: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedServerHello {
+    pub prefix: Vec<u8>,
+    pub cipher_suite: u16,
+    pub key_share_group: u16,
+}
+
+impl ObservedServerHello {
+    pub fn curves_list(&self) -> Option<&'static str> {
+        match self.key_share_group {
+            29 => Some("X25519"),
+            0x6399 => Some("X25519Kyber768Draft00"),
+            0x11ec => Some("X25519MLKEM768"),
+            _ => None,
+        }
+    }
+}
+
 pub async fn read_client_hello<R>(reader: &mut R) -> anyhow::Result<RawClientHello>
 where
     R: AsyncRead + Unpin,
@@ -106,6 +124,70 @@ where
 
             if handshake.len() == expected_len {
                 return Ok(RawClientHello { prefix, handshake });
+            }
+        }
+    }
+}
+
+pub async fn read_server_hello<R>(reader: &mut R) -> anyhow::Result<ObservedServerHello>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut prefix = Vec::new();
+    let mut handshake = Vec::new();
+    let mut total_handshake_len = None;
+
+    loop {
+        let mut record_header = [0u8; 5];
+        reader
+            .read_exact(&mut record_header)
+            .await
+            .context("read REALITY target TLS record header")?;
+        let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+        let mut record_payload = vec![0u8; record_len];
+        reader
+            .read_exact(&mut record_payload)
+            .await
+            .context("read REALITY target TLS record payload")?;
+
+        prefix.extend_from_slice(&record_header);
+        prefix.extend_from_slice(&record_payload);
+
+        ensure!(
+            record_header[0] == 22,
+            "REALITY target expected initial TLS handshake record"
+        );
+
+        let mut payload = record_payload.as_slice();
+        while !payload.is_empty() {
+            let expected_len = match total_handshake_len {
+                Some(expected_len) => expected_len,
+                None => {
+                    ensure!(
+                        payload.len() >= 4,
+                        "truncated REALITY target ServerHello handshake header"
+                    );
+                    ensure!(
+                        payload[0] == 2,
+                        "REALITY target expected ServerHello handshake message"
+                    );
+                    let declared_len =
+                        read_be_u24(payload, 1, "REALITY target ServerHello length")?;
+                    handshake.extend_from_slice(&payload[..4]);
+                    payload = &payload[4..];
+                    let expected_len = declared_len as usize + 4;
+                    total_handshake_len = Some(expected_len);
+                    expected_len
+                }
+            };
+
+            let missing = expected_len.saturating_sub(handshake.len());
+            let take = missing.min(payload.len());
+            handshake.extend_from_slice(&payload[..take]);
+            payload = &payload[take..];
+
+            if handshake.len() == expected_len {
+                return parse_server_hello(prefix, &handshake);
             }
         }
     }
@@ -240,6 +322,115 @@ pub fn build_server_certificate(
     certificate[cert_state.signature_offset..cert_state.signature_offset + signature.len()]
         .copy_from_slice(&signature);
     X509::from_der(&certificate).context("parse REALITY certificate")
+}
+
+fn parse_server_hello(prefix: Vec<u8>, raw: &[u8]) -> anyhow::Result<ObservedServerHello> {
+    ensure!(
+        raw.len() >= 4 + 2 + 32 + 1,
+        "truncated REALITY target ServerHello"
+    );
+    ensure!(
+        raw[0] == 2,
+        "REALITY target expected ServerHello handshake message"
+    );
+    let declared_len = read_be_u24(raw, 1, "REALITY target ServerHello length")? as usize;
+    ensure!(
+        declared_len + 4 == raw.len(),
+        "REALITY target ServerHello length does not match payload"
+    );
+
+    let mut offset = 4;
+    let legacy_version = read_be_u16(raw, offset, "REALITY target ServerHello legacy_version")?;
+    ensure!(
+        legacy_version == 0x0303,
+        "REALITY target ServerHello legacy_version must be TLS 1.2"
+    );
+    offset += 2;
+
+    ensure!(
+        offset + 32 <= raw.len(),
+        "truncated REALITY target ServerHello random"
+    );
+    offset += 32;
+
+    ensure!(
+        offset < raw.len(),
+        "truncated REALITY target ServerHello session id length"
+    );
+    let session_len = raw[offset] as usize;
+    offset += 1;
+    ensure!(
+        offset + session_len <= raw.len(),
+        "truncated REALITY target ServerHello session id"
+    );
+    offset += session_len;
+
+    let cipher_suite = read_be_u16(raw, offset, "REALITY target ServerHello cipher suite")?;
+    ensure!(
+        matches!(cipher_suite, 0x1301 | 0x1302 | 0x1303),
+        "REALITY target selected unsupported TLS 1.3 cipher suite 0x{cipher_suite:04x}"
+    );
+    offset += 2;
+
+    ensure!(
+        offset < raw.len(),
+        "truncated REALITY target ServerHello compression method"
+    );
+    ensure!(
+        raw[offset] == 0,
+        "REALITY target ServerHello compression method must be null"
+    );
+    offset += 1;
+
+    let extensions_len =
+        read_be_u16(raw, offset, "REALITY target ServerHello extensions length")? as usize;
+    offset += 2;
+    let extensions_end = offset + extensions_len;
+    ensure!(
+        extensions_end == raw.len(),
+        "REALITY target ServerHello extensions length does not match payload"
+    );
+
+    let mut supports_tls13 = false;
+    let mut key_share_group = None;
+    while offset < extensions_end {
+        let extension_type = read_be_u16(raw, offset, "REALITY target ServerHello extension type")?;
+        let extension_len = read_be_u16(
+            raw,
+            offset + 2,
+            "REALITY target ServerHello extension length",
+        )? as usize;
+        let data_start = offset + 4;
+        let data_end = data_start + extension_len;
+        ensure!(
+            data_end <= extensions_end,
+            "truncated REALITY target ServerHello extension"
+        );
+        let data = &raw[data_start..data_end];
+
+        match extension_type {
+            43 => {
+                supports_tls13 = parse_server_supported_versions_extension(data)?;
+            }
+            51 => {
+                key_share_group = Some(parse_server_key_share_extension(data)?);
+            }
+            _ => {}
+        }
+
+        offset = data_end;
+    }
+
+    ensure!(
+        supports_tls13,
+        "REALITY target ServerHello must negotiate TLS 1.3"
+    );
+
+    Ok(ObservedServerHello {
+        prefix,
+        cipher_suite,
+        key_share_group: key_share_group.context("REALITY target ServerHello missing key_share")?,
+    })
 }
 
 struct ParsedClientHello<'a> {
@@ -439,6 +630,25 @@ fn parse_signature_algorithms_extension(bytes: &[u8]) -> anyhow::Result<bool> {
     Ok(bytes[2..]
         .chunks_exact(2)
         .any(|scheme| scheme == [0x08, 0x07]))
+}
+
+fn parse_server_supported_versions_extension(bytes: &[u8]) -> anyhow::Result<bool> {
+    ensure!(
+        bytes.len() == 2,
+        "REALITY target supported_versions must be 2 bytes"
+    );
+    Ok(bytes == [0x03, 0x04])
+}
+
+fn parse_server_key_share_extension(bytes: &[u8]) -> anyhow::Result<u16> {
+    let group = read_be_u16(bytes, 0, "REALITY target key_share group")?;
+    let key_len = read_be_u16(bytes, 2, "REALITY target key_share length")? as usize;
+    ensure!(
+        key_len + 4 == bytes.len(),
+        "REALITY target key_share length does not match payload"
+    );
+    ensure!(key_len > 0, "REALITY target key_share cannot be empty");
+    Ok(group)
 }
 
 fn server_name_allowed(config: &RealityTlsConfig, server_name: &str) -> bool {
@@ -727,6 +937,55 @@ mod tests {
         assert_eq!(raw.prefix, expected_record);
     }
 
+    #[tokio::test]
+    async fn reads_server_hello_from_tls_record_prefix() {
+        let handshake = build_test_server_hello(0x1301, 29);
+
+        let mut record = Vec::new();
+        record.push(22);
+        record.extend_from_slice(&0x0303u16.to_be_bytes());
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        let expected_record = record.clone();
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let write_task = tokio::spawn(async move {
+            client.write_all(&record).await.expect("write server hello");
+        });
+
+        let observed = read_server_hello(&mut server)
+            .await
+            .expect("read REALITY target server hello");
+        write_task.await.expect("join write task");
+
+        assert_eq!(observed.prefix, expected_record);
+        assert_eq!(observed.cipher_suite, 0x1301);
+        assert_eq!(observed.key_share_group, 29);
+        assert_eq!(observed.curves_list(), Some("X25519"));
+    }
+
+    #[test]
+    fn maps_hybrid_server_groups_to_boringssl_curve_names() {
+        assert_eq!(
+            ObservedServerHello {
+                prefix: Vec::new(),
+                cipher_suite: 0x1301,
+                key_share_group: 0x6399,
+            }
+            .curves_list(),
+            Some("X25519Kyber768Draft00")
+        );
+        assert_eq!(
+            ObservedServerHello {
+                prefix: Vec::new(),
+                cipher_suite: 0x1301,
+                key_share_group: 0x11ec,
+            }
+            .curves_list(),
+            Some("X25519MLKEM768")
+        );
+    }
+
     #[test]
     fn rejects_client_hello_without_ed25519_support() {
         let server_key = PKey::generate(Id::X25519).expect("server key");
@@ -881,6 +1140,59 @@ mod tests {
         payload.extend_from_slice(&29u16.to_be_bytes());
         payload.extend_from_slice(&32u16.to_be_bytes());
         payload.extend_from_slice(client_public);
+
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&51u16.to_be_bytes());
+        extension.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&payload);
+        extension
+    }
+
+    fn build_test_server_hello(cipher_suite: u16, group: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[
+            31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
+            9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+        ]);
+        body.push(32);
+        body.extend_from_slice(&[0x55; 32]);
+        body.extend_from_slice(&cipher_suite.to_be_bytes());
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&encode_server_supported_versions_extension());
+        extensions.extend_from_slice(&encode_server_key_share_extension(group));
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(2);
+        handshake.push(((body.len() >> 16) & 0xff) as u8);
+        handshake.push(((body.len() >> 8) & 0xff) as u8);
+        handshake.push((body.len() & 0xff) as u8);
+        handshake.extend_from_slice(&body);
+        handshake
+    }
+
+    fn encode_server_supported_versions_extension() -> Vec<u8> {
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&43u16.to_be_bytes());
+        extension.extend_from_slice(&2u16.to_be_bytes());
+        extension.extend_from_slice(&0x0304u16.to_be_bytes());
+        extension
+    }
+
+    fn encode_server_key_share_extension(group: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let key_share = match group {
+            29 => vec![0x44; 32],
+            0x11ec => vec![0x33; 32 + 1088],
+            _ => vec![0x22; 32],
+        };
+        payload.extend_from_slice(&group.to_be_bytes());
+        payload.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&key_share);
 
         let mut extension = Vec::new();
         extension.extend_from_slice(&51u16.to_be_bytes());
