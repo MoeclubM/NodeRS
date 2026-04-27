@@ -9,7 +9,7 @@ use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::accounting::Accounting;
-use crate::config::{AppConfig, HysteriaConfig};
+use crate::config::AppConfig;
 use crate::panel::{
     BaseConfig, FetchState, MachineNodeSummary, MachinePanelClient, NodeConfigResponse,
     NodePanelClient, PanelUser, StatusPayload, TrafficReportError,
@@ -37,7 +37,6 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
 
 pub(crate) struct MachineRuntime {
     panel: MachinePanelClient,
-    hysteria: HysteriaConfig,
     nodes: RwLock<HashMap<i64, Arc<ManagedNode>>>,
     machine_base_config: RwLock<Option<BaseConfig>>,
     machine_pull_interval: AtomicU64,
@@ -67,7 +66,6 @@ impl MachineRuntime {
     fn new(config: AppConfig) -> anyhow::Result<Self> {
         Ok(Self {
             panel: MachinePanelClient::new(&config.panel)?,
-            hysteria: config.hysteria,
             nodes: RwLock::new(HashMap::new()),
             machine_base_config: RwLock::new(None),
             machine_pull_interval: AtomicU64::new(DEFAULT_PANEL_PULL_INTERVAL_SECONDS),
@@ -328,7 +326,6 @@ impl MachineRuntime {
                 summary.id,
                 protocol,
                 self.panel.node_client(summary.id),
-                self.hysteria.clone(),
                 machine_base_config.clone(),
             ));
             node.initialize().await?;
@@ -387,11 +384,10 @@ impl ManagedNode {
         node_id: i64,
         protocol: ProtocolKind,
         panel: NodePanelClient,
-        hysteria: HysteriaConfig,
         machine_base_config: Option<BaseConfig>,
     ) -> Self {
         let accounting = Accounting::new();
-        let controller = ProtocolController::new(protocol, node_id, accounting.clone(), hysteria);
+        let controller = ProtocolController::new(protocol, accounting.clone());
         let (shutdown_tx, _) = watch::channel(false);
         Self {
             node_id,
