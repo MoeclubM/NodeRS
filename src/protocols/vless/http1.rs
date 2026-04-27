@@ -30,10 +30,13 @@ pub struct ParsedRequestHead {
     pub buffered_body: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct PrefixedIo<S> {
     inner: S,
     prefix: Vec<u8>,
     offset: usize,
+    capture_inner: bool,
+    captured_inner: Vec<u8>,
 }
 
 impl<S> PrefixedIo<S> {
@@ -42,7 +45,23 @@ impl<S> PrefixedIo<S> {
             inner,
             prefix,
             offset: 0,
+            capture_inner: false,
+            captured_inner: Vec::new(),
         }
+    }
+
+    pub fn capture_inner_reads(mut self) -> Self {
+        self.capture_inner = true;
+        self
+    }
+
+    pub fn disable_inner_capture(&mut self) {
+        self.capture_inner = false;
+        self.captured_inner.clear();
+    }
+
+    pub fn into_parts(self) -> (S, Vec<u8>) {
+        (self.inner, self.captured_inner)
     }
 
     pub fn prepend_prefix(mut self, prefix: Vec<u8>) -> Self {
@@ -76,7 +95,17 @@ where
             self.offset += take;
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let filled_len = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if self.capture_inner {
+                    self.captured_inner
+                        .extend_from_slice(&buf.filled()[filled_len..]);
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -343,5 +372,48 @@ mod tests {
             .await
             .expect("read prefixed stream");
         assert_eq!(&buffer, b"helloworld");
+    }
+
+    #[tokio::test]
+    async fn prefixed_io_into_parts_returns_underlying_stream_without_captured_bytes() {
+        let (mut client, server) = duplex(4096);
+        let mut stream = PrefixedIo::new(server, b"hello".to_vec());
+
+        let mut prefix = [0u8; 2];
+        stream.read_exact(&mut prefix).await.expect("read prefix");
+        assert_eq!(&prefix, b"he");
+
+        let (mut inner, captured_inner) = stream.into_parts();
+        assert!(captured_inner.is_empty());
+        client.write_all(b"world").await.expect("write");
+
+        let mut buffer = [0u8; 5];
+        inner.read_exact(&mut buffer).await.expect("read inner");
+        assert_eq!(&buffer, b"world");
+    }
+
+    #[tokio::test]
+    async fn prefixed_io_into_parts_preserves_consumed_inner_bytes() {
+        let (mut client, server) = duplex(4096);
+        let mut stream = PrefixedIo::new(server, b"hello".to_vec()).capture_inner_reads();
+
+        client.write_all(b"world").await.expect("write");
+
+        let mut buffer = [0u8; 7];
+        stream
+            .read_exact(&mut buffer)
+            .await
+            .expect("read prefixed stream with inner capture");
+        assert_eq!(&buffer, b"hellowo");
+
+        let (mut inner, captured_inner) = stream.into_parts();
+        assert_eq!(captured_inner, b"wo");
+
+        let mut remaining = [0u8; 3];
+        inner
+            .read_exact(&mut remaining)
+            .await
+            .expect("read remaining inner");
+        assert_eq!(&remaining, b"rld");
     }
 }

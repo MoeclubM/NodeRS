@@ -8,6 +8,7 @@ mod xhttp;
 mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use boring::ssl::{Ssl, SslOptions, SslVersion};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -32,7 +33,13 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const COPY_BUFFER_LEN: usize = 64 * 1024;
 
-type TlsStream = tokio_boring::SslStream<TcpStream>;
+type TlsStream = tokio_boring::SslStream<http1::PrefixedIo<TcpStream>>;
+
+#[derive(Clone)]
+struct RealityServerState {
+    config: tls::RealityTlsConfig,
+    cert_state: Arc<super::shared::reality::RealityCertificateState>,
+}
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNodeConfig {
@@ -194,6 +201,7 @@ impl UserValidator {
 
 pub struct ServerController {
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
+    reality: Arc<RwLock<Option<RealityServerState>>>,
     tls_materials: AsyncMutex<Option<tls::LoadedTlsMaterials>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
@@ -214,6 +222,7 @@ impl ServerController {
     pub fn new(accounting: Arc<Accounting>) -> Self {
         Self {
             tls_config: Arc::new(RwLock::new(None)),
+            reality: Arc::new(RwLock::new(None)),
             tls_materials: AsyncMutex::new(None),
             accounting,
             users: Arc::new(RwLock::new(UserValidator::default())),
@@ -270,6 +279,7 @@ impl ServerController {
             .map(|addr| addr.to_string())
             .collect::<Vec<_>>();
         let tls_config = self.tls_config.clone();
+        let reality = self.reality.clone();
         let accounting = self.accounting.clone();
         let users = self.users.clone();
         let transport = self.transport.clone();
@@ -281,6 +291,7 @@ impl ServerController {
             let mut accept_loops = JoinSet::new();
             for listener in listeners {
                 let tls_config = tls_config.clone();
+                let reality = reality.clone();
                 let accounting = accounting.clone();
                 let users = users.clone();
                 let transport = transport.clone();
@@ -291,6 +302,7 @@ impl ServerController {
                     accept_loop(
                         listener,
                         tls_config,
+                        reality,
                         accounting,
                         users,
                         transport,
@@ -350,6 +362,8 @@ impl ServerController {
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
         let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
+            server_name: reality.server_name.clone(),
+            server_port: reality.server_port,
             server_names: reality.server_names.clone(),
             private_key: reality.private_key,
             short_ids: reality.short_ids.clone(),
@@ -380,10 +394,21 @@ impl ServerController {
             tls::load_tls_materials(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
                 .await
                 .context("load VLESS TLS materials")?;
+        let reality_state = match reality {
+            Some(config) => Some(RealityServerState {
+                config,
+                cert_state: Arc::new(
+                    super::shared::reality::build_certificate_state()
+                        .context("build VLESS REALITY certificate state")?,
+                ),
+            }),
+            None => None,
+        };
         *self
             .tls_config
             .write()
             .expect("vless tls config lock poisoned") = Some(reloaded.acceptor());
+        *self.reality.write().expect("vless reality lock poisoned") = reality_state;
         *tls_materials = Some(reloaded);
         Ok(())
     }
@@ -392,6 +417,7 @@ impl ServerController {
 async fn accept_loop(
     listener: TcpListener,
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
+    reality: Arc<RwLock<Option<RealityServerState>>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
     transport: Arc<RwLock<TransportMode>>,
@@ -423,6 +449,7 @@ async fn accept_loop(
             };
             tls_config
         };
+        let reality = reality.read().expect("vless reality lock poisoned").clone();
         let accounting = accounting.clone();
         let users = users.clone();
         let transport = transport.clone();
@@ -430,20 +457,34 @@ async fn accept_loop(
         let routing = routing.clone();
         let fallbacks = fallbacks.clone();
         tokio::spawn(async move {
-            let tls_stream = match timeout(
-                TLS_HANDSHAKE_TIMEOUT,
-                tokio_boring::accept(acceptor.as_ref(), stream),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    warn!(%error, %source, "VLESS TLS handshake failed");
-                    return;
+            let tls_stream = if let Some(reality) = reality {
+                match accept_reality_tls(acceptor.as_ref(), stream, source, &reality).await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        warn!(%error, %source, "VLESS REALITY handshake failed");
+                        return;
+                    }
                 }
-                Err(_) => {
-                    warn!(%source, "VLESS TLS handshake timed out");
-                    return;
+            } else {
+                match timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    tokio_boring::accept(
+                        acceptor.as_ref(),
+                        http1::PrefixedIo::new(stream, Vec::new()),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        warn!(%error, %source, "VLESS TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(%source, "VLESS TLS handshake timed out");
+                        return;
+                    }
                 }
             };
             let users = users.read().expect("vless users lock poisoned").clone();
@@ -526,6 +567,123 @@ async fn accept_loop(
             }
         });
     }
+}
+
+async fn accept_reality_tls(
+    acceptor: &boring::ssl::SslAcceptor,
+    mut stream: TcpStream,
+    source: SocketAddr,
+    reality: &RealityServerState,
+) -> anyhow::Result<Option<TlsStream>> {
+    let client_hello = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        super::shared::reality::read_client_hello(&mut stream),
+    )
+    .await
+    .map_err(|_| anyhow!("REALITY ClientHello timed out"))??;
+
+    let authenticated =
+        match super::shared::reality::authenticate_client_hello(&client_hello, &reality.config) {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                warn!(%error, %source, "VLESS REALITY ClientHello rejected; forwarding to target");
+                proxy_reality_fallback(stream, reality, client_hello.prefix).await?;
+                return Ok(None);
+            }
+        };
+
+    let certificate = super::shared::reality::build_server_certificate(
+        &reality.cert_state,
+        &authenticated.auth_key,
+    )
+    .context("build REALITY server certificate")?;
+    let fallback_prefix = client_hello.prefix.clone();
+    let mut ssl = Ssl::new(acceptor.context()).context("create REALITY TLS session")?;
+    ssl.set_options(SslOptions::NO_TICKET);
+    ssl.set_min_proto_version(Some(SslVersion::TLS1_3))
+        .context("set REALITY TLS minimum version")?;
+    ssl.set_max_proto_version(Some(SslVersion::TLS1_3))
+        .context("set REALITY TLS maximum version")?;
+    ssl.set_certificate(&certificate)
+        .context("set REALITY TLS certificate")?;
+    ssl.set_private_key(reality.cert_state.private_key())
+        .context("set REALITY TLS private key")?;
+
+    let tls_stream = match timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        tokio_boring::SslStreamBuilder::new(
+            ssl,
+            http1::PrefixedIo::new(stream, client_hello.prefix).capture_inner_reads(),
+        )
+        .accept(),
+    )
+    .await
+    {
+        Ok(Ok(mut stream)) => {
+            stream.get_mut().disable_inner_capture();
+            stream
+        }
+        Ok(Err(error)) => {
+            warn!(
+                %error,
+                %source,
+                "VLESS REALITY TLS handshake failed after authentication; forwarding to target"
+            );
+            let (stream, consumed_after_client_hello) = error
+                .into_source_stream()
+                .context("extract REALITY source stream after handshake failure")?
+                .into_parts();
+            let mut consumed = fallback_prefix;
+            consumed.extend_from_slice(&consumed_after_client_hello);
+            proxy_reality_fallback(stream, reality, consumed).await?;
+            return Ok(None);
+        }
+        Err(_) => return Err(anyhow!("REALITY TLS handshake timed out")),
+    };
+    Ok(Some(tls_stream))
+}
+
+async fn proxy_reality_fallback(
+    stream: TcpStream,
+    reality: &RealityServerState,
+    consumed: Vec<u8>,
+) -> anyhow::Result<()> {
+    let fallback = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        TcpStream::connect((
+            reality.config.server_name.as_str(),
+            reality.config.server_port,
+        )),
+    )
+    .await
+    .map_err(|_| anyhow!("connect REALITY fallback target timed out"))?
+    .with_context(|| {
+        format!(
+            "connect REALITY fallback {}:{}",
+            reality.config.server_name, reality.config.server_port
+        )
+    })?;
+    configure_tcp_stream(&fallback);
+    let control = SessionControl::new();
+    let (mut client_reader, mut client_writer) = split(stream);
+    let (mut fallback_reader, mut fallback_writer) = split(fallback);
+    if !consumed.is_empty() {
+        fallback_writer
+            .write_all(&consumed)
+            .await
+            .context("write REALITY fallback client hello")?;
+    }
+
+    let client_to_fallback = copy_with_traffic(
+        &mut client_reader,
+        &mut fallback_writer,
+        control.clone(),
+        None,
+    );
+    let fallback_to_client =
+        copy_with_traffic(&mut fallback_reader, &mut client_writer, control, None);
+    let _ = tokio::try_join!(client_to_fallback, fallback_to_client)?;
+    Ok(())
 }
 
 async fn serve_connection(
