@@ -2,7 +2,7 @@ use anyhow::{Context, ensure};
 use base64::Engine as _;
 use boring::hpke::HpkeKey;
 use boring::pkey::PKey;
-use boring::ssl::{AlpnError, SelectCertError, SslAcceptor, SslEchKeys, SslMethod};
+use boring::ssl::{AlpnError, SslAcceptor, SslEchKeys, SslMethod, SslOptions, SslVersion};
 use boring::x509::X509;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use sha2::{Digest, Sha256};
@@ -87,7 +87,11 @@ pub async fn load_tls_materials(
     let ech_source = ech_source.cloned();
     let reality = reality.cloned();
     let alpn_protocols = alpn_protocols.to_vec();
-    let (cert_pem, key_pem) = load_source_materials(&source).await?;
+    let (cert_pem, key_pem) = if reality.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        load_source_materials(&source).await?
+    };
     let ech_materials = match ech_source.as_ref() {
         Some(ech_source) => Some(load_ech_source_materials(ech_source).await?),
         None => None,
@@ -124,7 +128,11 @@ pub async fn reload_if_changed(
         return Ok(None);
     }
 
-    let (cert_pem, key_pem) = load_source_materials(&materials.source).await?;
+    let (cert_pem, key_pem) = if materials.reality.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        load_source_materials(&materials.source).await?
+    };
     let ech_materials = match materials.ech_source.as_ref() {
         Some(ech_source) => Some(load_ech_source_materials(ech_source).await?),
         None => None,
@@ -250,42 +258,42 @@ async fn build_acceptor(
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .context("build BoringSSL acceptor")?;
 
-        let mut certs = X509::stack_from_pem(&cert_pem).context("read certificate PEM")?;
-        ensure!(
-            !certs.is_empty(),
-            "certificate PEM did not contain any certificates"
-        );
-        let leaf = certs.remove(0);
-        builder
-            .set_certificate(&leaf)
-            .context("set leaf certificate")?;
-        for cert in certs {
+        if reality.is_some() {
+            builder.set_options(SslOptions::NO_TICKET);
             builder
-                .add_extra_chain_cert(cert)
-                .context("add extra chain certificate")?;
-        }
+                .set_min_proto_version(Some(SslVersion::TLS1_3))
+                .context("set REALITY minimum TLS version")?;
+            builder
+                .set_max_proto_version(Some(SslVersion::TLS1_3))
+                .context("set REALITY maximum TLS version")?;
+            builder
+                .set_sigalgs_list("ed25519")
+                .context("set REALITY signature algorithms")?;
+        } else {
+            let mut certs = X509::stack_from_pem(&cert_pem).context("read certificate PEM")?;
+            ensure!(
+                !certs.is_empty(),
+                "certificate PEM did not contain any certificates"
+            );
+            let leaf = certs.remove(0);
+            builder
+                .set_certificate(&leaf)
+                .context("set leaf certificate")?;
+            for cert in certs {
+                builder
+                    .add_extra_chain_cert(cert)
+                    .context("add extra chain certificate")?;
+            }
 
-        let key = PKey::private_key_from_pem(&key_pem).context("read private key PEM")?;
-        builder.set_private_key(&key).context("set private key")?;
-        builder.check_private_key().context("check private key")?;
+            let key = PKey::private_key_from_pem(&key_pem).context("read private key PEM")?;
+            builder.set_private_key(&key).context("set private key")?;
+            builder.check_private_key().context("check private key")?;
+        }
 
         if let Some((ech_key, ech_config)) = ech_materials.as_ref() {
             let ech_keys =
                 build_ech_keys(ech_key, ech_config.as_deref()).context("build ECH keys")?;
             builder.set_ech_keys(&ech_keys).context("set ECH keys")?;
-        }
-
-        if let Some(reality) = reality {
-            let cert_state = Arc::new(
-                super::reality::build_certificate_state().context("build REALITY certificate")?,
-            );
-            builder.set_select_certificate_callback(move |mut client_hello| {
-                super::reality::configure_certificate(&mut client_hello, &reality, &cert_state)
-                    .map_err(|error| {
-                        tracing::warn!(%error, "REALITY ClientHello rejected");
-                        SelectCertError::ERROR
-                    })
-            });
         }
 
         if !alpn_wire.is_empty() {
