@@ -221,8 +221,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" dist/*.tar.gz dist/*.sha256 --clobber
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" dist/*.tar.gz dist/*.sha256 --clobber
           else
-            gh release create "${{ github.ref_name }}" --generate-notes dist/*.tar.gz dist/*.sha256
+            gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --generate-notes dist/*.tar.gz dist/*.sha256
           fi
