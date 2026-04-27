@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+: "${PREFIX:=/usr/local}"
+: "${CONFIG_DIR:=/etc/noders/anytls}"
+: "${STATE_DIR:=/var/lib/noders/anytls}"
+: "${SERVICE_NAME:=noders}"
+: "${LEGACY_SERVICE_NAME:=${SERVICE_NAME}-anytls}"
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2

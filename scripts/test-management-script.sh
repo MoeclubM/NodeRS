@@ -88,6 +88,41 @@ test_validate_args() {
   fi
 }
 
+test_install_common_defaults_service_names() (
+  local tmp_root script_path stdout_path stderr_path
+
+  tmp_root="$(mktemp -d)"
+  cleanup_install_common_defaults_test() {
+    rm -rf "$tmp_root"
+  }
+  trap cleanup_install_common_defaults_test EXIT
+
+  script_path="$tmp_root/check.sh"
+  cat > "$script_path" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+unset SERVICE_NAME LEGACY_SERVICE_NAME PREFIX CONFIG_DIR STATE_DIR
+source "$COMMON_LIB_PATH"
+printf '%s\n' "$SERVICE_NAME"
+printf '%s\n' "$LEGACY_SERVICE_NAME"
+printf '%s\n' "$PREFIX"
+printf '%s\n' "$CONFIG_DIR"
+printf '%s\n' "$STATE_DIR"
+EOF
+  chmod 0755 "$script_path"
+
+  stdout_path="$tmp_root/stdout"
+  stderr_path="$tmp_root/stderr"
+  bash "$script_path" >"$stdout_path" 2>"$stderr_path"
+
+  assert_equals $'noders\nnoders-anytls\n/usr/local\n/etc/noders/anytls\n/var/lib/noders/anytls' "$(<"$stdout_path")" "install-common defaults did not initialize expected values"
+  if [[ -s "$stderr_path" ]]; then
+    echo "install-common defaults test emitted unexpected stderr" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+)
+
 test_management_script_filters_invalid_units() (
   local tmp_root unit_dir fake_bin systemctl_log stdout_path stderr_path valid_unit invalid_unit expected actual
 
@@ -250,6 +285,7 @@ test_upgrade_skips_binary_self_copy() (
 
 main() {
   test_validate_args
+  test_install_common_defaults_service_names
   test_management_script_filters_invalid_units
   test_upgrade_rejects_legacy_layout
   test_install_management_support_skips_self_copy
