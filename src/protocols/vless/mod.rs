@@ -5,6 +5,7 @@ mod httpupgrade;
 mod mux;
 mod ws;
 mod xhttp;
+mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use serde::Deserialize;
@@ -348,7 +349,7 @@ impl ServerController {
         let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
             server_name: reality.server_name.clone(),
             private_key: reality.private_key,
-            short_id: reality.short_id,
+            short_ids: reality.short_ids.clone(),
         });
         let should_reload = tls_materials.as_ref().is_none_or(|current| {
             !current.matches_source(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
@@ -358,10 +359,15 @@ impl ServerController {
         }
 
         if let Some(reality) = tls.reality.as_ref() {
-            let short_id_hex = hex::encode(reality.short_id);
+            let short_id_hex = reality
+                .short_ids
+                .first()
+                .map(hex::encode)
+                .unwrap_or_default();
             let short_id_tail = &short_id_hex[short_id_hex.len().saturating_sub(4)..];
             info!(
                 reality_server_name = %reality.server_name,
+                reality_short_id_count = reality.short_ids.len(),
                 reality_short_id_tail = %short_id_tail,
                 "applying VLESS REALITY TLS config"
             );
@@ -844,7 +850,7 @@ async fn serve_authenticated_connection<S>(
     lease: SessionLease,
     user: UserEntry,
     request: codec::Request,
-    _packet_encoding: PacketEncoding,
+    packet_encoding: PacketEncoding,
     routing: routing::RoutingTable,
 ) -> anyhow::Result<()>
 where
@@ -863,15 +869,19 @@ where
             .await
         }
         Command::Udp => {
-            serve_udp(
-                stream,
-                accounting,
-                lease,
-                user,
-                request.destination,
-                routing,
-            )
-            .await
+            if packet_encoding == PacketEncoding::Xudp {
+                serve_xudp(stream, accounting, lease, user, routing).await
+            } else {
+                serve_udp(
+                    stream,
+                    accounting,
+                    lease,
+                    user,
+                    request.destination,
+                    routing,
+                )
+                .await
+            }
         }
         Command::Mux => {
             ensure!(
@@ -979,6 +989,27 @@ where
             flatten_join(result)
         }
     }
+}
+
+async fn serve_xudp<S>(
+    mut stream: S,
+    accounting: Arc<Accounting>,
+    lease: SessionLease,
+    user: UserEntry,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    codec::write_response_header(&mut stream).await?;
+    xudp::relay(
+        stream,
+        routing,
+        lease.control(),
+        TrafficRecorder::upload(accounting.clone(), user.id),
+        TrafficRecorder::download(accounting, user.id),
+    )
+    .await
 }
 
 async fn serve_mux<S>(
@@ -1635,7 +1666,7 @@ mod tests {
         let config = EffectiveNodeConfig::from_remote(&remote).expect("reality config");
         let reality = config.tls.reality.expect("reality config");
         assert_eq!(reality.server_name, "reality.example.com");
-        assert_eq!(reality.short_id, [0, 0, 0, 0, 0, 0, 0xa1, 0xb2]);
+        assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
     }
 
     #[test]
