@@ -1,5 +1,6 @@
 pub(crate) mod dns;
 pub(crate) mod reality;
+pub(crate) mod reality_tls;
 pub(crate) mod routing;
 pub(crate) mod rules;
 pub(crate) mod socksaddr;

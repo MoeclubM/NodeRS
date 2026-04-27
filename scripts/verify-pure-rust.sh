@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
+command -v rg >/dev/null 2>&1 || {
+  echo "verify-pure-rust.sh requires 'rg' in PATH" >&2
+  exit 1
+}
+
 banned_patterns=(
   'sing-box_mod'
   'sing-box'
