@@ -49,6 +49,20 @@ pub struct AuthenticatedClientHello {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHelloDetails {
+    pub random: [u8; 32],
+    pub session_id: Vec<u8>,
+    pub key_shares: Vec<ClientKeyShare>,
+    pub alpn_protocols: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyShare {
+    pub group: u16,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedServerHello {
     pub prefix: Vec<u8>,
     pub cipher_suite: u16,
@@ -250,6 +264,19 @@ pub fn authenticate_client_hello(
     })
 }
 
+pub fn client_hello_details(client_hello: &RawClientHello) -> anyhow::Result<ClientHelloDetails> {
+    let parsed = parse_client_hello(&client_hello.handshake)?;
+    Ok(ClientHelloDetails {
+        random: parsed.random,
+        session_id: parsed.session_id.to_vec(),
+        key_shares: parse_key_share_entries(parsed.key_share)?,
+        alpn_protocols: match parsed.alpn {
+            Some(alpn) => parse_alpn_protocols_extension(alpn)?,
+            None => Vec::new(),
+        },
+    })
+}
+
 pub fn build_certificate_state() -> anyhow::Result<RealityCertificateState> {
     let key = PKey::generate(boring::pkey::Id::ED25519).context("generate REALITY Ed25519 key")?;
     let mut public_key = [0u8; 32];
@@ -439,6 +466,7 @@ struct ParsedClientHello<'a> {
     session_id: &'a [u8],
     session_start: usize,
     key_share: &'a [u8],
+    alpn: Option<&'a [u8]>,
 }
 
 fn parse_client_hello(raw: &[u8]) -> anyhow::Result<ParsedClientHello<'_>> {
@@ -516,8 +544,8 @@ fn parse_client_hello(raw: &[u8]) -> anyhow::Result<ParsedClientHello<'_>> {
 
     let mut server_name = None;
     let mut key_share = None;
+    let mut alpn = None;
     let mut supports_tls13 = false;
-    let mut supports_ed25519 = false;
     while offset < extensions_end {
         let extension_type = read_be_u16(raw, offset, "REALITY ClientHello extension type")?;
         let extension_len =
@@ -538,7 +566,10 @@ fn parse_client_hello(raw: &[u8]) -> anyhow::Result<ParsedClientHello<'_>> {
                 supports_tls13 = parse_supported_versions_extension(data)?;
             }
             13 => {
-                supports_ed25519 = parse_signature_algorithms_extension(data)?;
+                parse_signature_algorithms_extension(data)?;
+            }
+            16 => {
+                alpn = Some(data);
             }
             51 => {
                 key_share = Some(data);
@@ -550,10 +581,6 @@ fn parse_client_hello(raw: &[u8]) -> anyhow::Result<ParsedClientHello<'_>> {
     }
 
     ensure!(supports_tls13, "REALITY ClientHello must support TLS 1.3");
-    ensure!(
-        supports_ed25519,
-        "REALITY ClientHello does not advertise Ed25519 signature support"
-    );
 
     Ok(ParsedClientHello {
         server_name: server_name.context("REALITY ClientHello missing SNI")?,
@@ -561,6 +588,7 @@ fn parse_client_hello(raw: &[u8]) -> anyhow::Result<ParsedClientHello<'_>> {
         session_id,
         session_start,
         key_share: key_share.context("REALITY ClientHello missing key_share")?,
+        alpn,
     })
 }
 
@@ -617,7 +645,7 @@ fn parse_supported_versions_extension(bytes: &[u8]) -> anyhow::Result<bool> {
         .any(|version| version == [0x03, 0x04]))
 }
 
-fn parse_signature_algorithms_extension(bytes: &[u8]) -> anyhow::Result<bool> {
+fn parse_signature_algorithms_extension(bytes: &[u8]) -> anyhow::Result<()> {
     let declared_len = read_be_u16(bytes, 0, "REALITY signature_algorithms length")? as usize;
     ensure!(
         declared_len + 2 == bytes.len(),
@@ -627,9 +655,72 @@ fn parse_signature_algorithms_extension(bytes: &[u8]) -> anyhow::Result<bool> {
         declared_len % 2 == 0,
         "REALITY signature_algorithms payload must contain whole schemes"
     );
-    Ok(bytes[2..]
-        .chunks_exact(2)
-        .any(|scheme| scheme == [0x08, 0x07]))
+    Ok(())
+}
+
+fn parse_key_share_entries(key_share: &[u8]) -> anyhow::Result<Vec<ClientKeyShare>> {
+    let declared_len = read_be_u16(key_share, 0, "REALITY key_share list length")? as usize;
+    ensure!(
+        declared_len + 2 == key_share.len(),
+        "REALITY key_share list length does not match payload"
+    );
+
+    let mut offset = 2;
+    let mut entries = Vec::new();
+    while offset < key_share.len() {
+        ensure!(
+            offset + 4 <= key_share.len(),
+            "truncated REALITY key_share entry"
+        );
+        let group = u16::from_be_bytes([key_share[offset], key_share[offset + 1]]);
+        let data_len = u16::from_be_bytes([key_share[offset + 2], key_share[offset + 3]]) as usize;
+        let data_start = offset + 4;
+        let data_end = data_start + data_len;
+        ensure!(
+            data_end <= key_share.len(),
+            "truncated REALITY key_share data"
+        );
+        entries.push(ClientKeyShare {
+            group,
+            data: key_share[data_start..data_end].to_vec(),
+        });
+        offset = data_end;
+    }
+
+    Ok(entries)
+}
+
+fn parse_alpn_protocols_extension(bytes: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let declared_len = read_be_u16(bytes, 0, "REALITY ALPN protocol list length")? as usize;
+    ensure!(
+        declared_len + 2 == bytes.len(),
+        "REALITY ALPN protocol list length does not match payload"
+    );
+    ensure!(
+        declared_len > 0,
+        "REALITY ALPN protocol list cannot be empty"
+    );
+
+    let mut offset = 2;
+    let mut protocols = Vec::new();
+    while offset < bytes.len() {
+        ensure!(
+            offset < bytes.len(),
+            "truncated REALITY ALPN protocol length"
+        );
+        let protocol_len = bytes[offset] as usize;
+        offset += 1;
+        ensure!(protocol_len > 0, "REALITY ALPN protocol cannot be empty");
+        let protocol_end = offset + protocol_len;
+        ensure!(
+            protocol_end <= bytes.len(),
+            "truncated REALITY ALPN protocol bytes"
+        );
+        protocols.push(bytes[offset..protocol_end].to_vec());
+        offset = protocol_end;
+    }
+
+    Ok(protocols)
 }
 
 fn parse_server_supported_versions_extension(bytes: &[u8]) -> anyhow::Result<bool> {
@@ -987,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_client_hello_without_ed25519_support() {
+    fn accepts_client_hello_without_ed25519_support() {
         let server_key = PKey::generate(Id::X25519).expect("server key");
         let client_key = PKey::generate(Id::X25519).expect("client key");
         let mut server_private = [0u8; 32];
@@ -1016,15 +1107,83 @@ mod tests {
             false,
         );
 
-        let error = authenticate_client_hello(
+        let authenticated = authenticate_client_hello(
             &RawClientHello {
                 prefix: Vec::new(),
                 handshake,
             },
             &config,
         )
-        .expect_err("missing ed25519 support should fail");
-        assert!(error.to_string().contains("Ed25519"));
+        .expect("authenticate client hello without ed25519");
+        assert_eq!(authenticated.short_id, [0xa1, 0xb2, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn extracts_client_hello_details_from_hybrid_groups() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(32);
+        body.extend_from_slice(&[0x22; 32]);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(1);
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&encode_server_name_extension("reality.example.com"));
+        extensions.extend_from_slice(&encode_supported_versions_extension());
+        extensions.extend_from_slice(&encode_signature_algorithms_extension(false));
+        extensions.extend_from_slice(&encode_alpn_extension(&[b"h2", b"http/1.1"]));
+
+        let mut key_share_payload = Vec::new();
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&0x6399u16.to_be_bytes());
+        entries.extend_from_slice(&1216u16.to_be_bytes());
+        entries.extend_from_slice(&[0x33; 32]);
+        entries.extend_from_slice(&[0x44; 1184]);
+        entries.extend_from_slice(&0x11ecu16.to_be_bytes());
+        entries.extend_from_slice(&1120u16.to_be_bytes());
+        entries.extend_from_slice(&[0x55; 1088]);
+        entries.extend_from_slice(&[0x66; 32]);
+        key_share_payload.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        key_share_payload.extend_from_slice(&entries);
+
+        let mut key_share_extension = Vec::new();
+        key_share_extension.extend_from_slice(&51u16.to_be_bytes());
+        key_share_extension.extend_from_slice(&(key_share_payload.len() as u16).to_be_bytes());
+        key_share_extension.extend_from_slice(&key_share_payload);
+        extensions.extend_from_slice(&key_share_extension);
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut handshake = Vec::new();
+        handshake.push(1);
+        handshake.push(((body.len() >> 16) & 0xff) as u8);
+        handshake.push(((body.len() >> 8) & 0xff) as u8);
+        handshake.push((body.len() & 0xff) as u8);
+        handshake.extend_from_slice(&body);
+
+        let details = client_hello_details(&RawClientHello {
+            prefix: Vec::new(),
+            handshake,
+        })
+        .expect("client hello details");
+
+        assert_eq!(details.random, [0x11; 32]);
+        assert_eq!(details.session_id, vec![0x22; 32]);
+        assert_eq!(details.key_shares.len(), 2);
+        assert_eq!(details.key_shares[0].group, 0x6399);
+        assert_eq!(details.key_shares[0].data.len(), 32 + 1184);
+        assert_eq!(details.key_shares[0].data[..32], [0x33; 32]);
+        assert_eq!(details.key_shares[1].group, 0x11ec);
+        assert_eq!(details.key_shares[1].data.len(), 1088 + 32);
+        assert_eq!(details.key_shares[1].data[1088..], [0x66; 32]);
+        assert_eq!(
+            details.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     fn build_test_client_hello(
@@ -1035,6 +1194,28 @@ mod tests {
         client_time: u32,
         short_id: [u8; 8],
         include_ed25519: bool,
+    ) -> Vec<u8> {
+        build_test_client_hello_with_alpn(
+            config,
+            client_public,
+            server_name,
+            client_version,
+            client_time,
+            short_id,
+            include_ed25519,
+            &[],
+        )
+    }
+
+    fn build_test_client_hello_with_alpn(
+        config: &RealityTlsConfig,
+        client_public: &[u8; 32],
+        server_name: &str,
+        client_version: [u8; 4],
+        client_time: u32,
+        short_id: [u8; 8],
+        include_ed25519: bool,
+        alpn_protocols: &[&[u8]],
     ) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&0x0303u16.to_be_bytes());
@@ -1054,6 +1235,9 @@ mod tests {
         extensions.extend_from_slice(&encode_server_name_extension(server_name));
         extensions.extend_from_slice(&encode_supported_versions_extension());
         extensions.extend_from_slice(&encode_signature_algorithms_extension(include_ed25519));
+        if !alpn_protocols.is_empty() {
+            extensions.extend_from_slice(&encode_alpn_extension(alpn_protocols));
+        }
         extensions.extend_from_slice(&encode_key_share_extension(client_public));
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         body.extend_from_slice(&extensions);
@@ -1143,6 +1327,22 @@ mod tests {
 
         let mut extension = Vec::new();
         extension.extend_from_slice(&51u16.to_be_bytes());
+        extension.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&payload);
+        extension
+    }
+
+    fn encode_alpn_extension(protocols: &[&[u8]]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let list_len: usize = protocols.iter().map(|protocol| 1 + protocol.len()).sum();
+        payload.extend_from_slice(&(list_len as u16).to_be_bytes());
+        for protocol in protocols {
+            payload.push(protocol.len() as u8);
+            payload.extend_from_slice(protocol);
+        }
+
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&16u16.to_be_bytes());
         extension.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         extension.extend_from_slice(&payload);
         extension

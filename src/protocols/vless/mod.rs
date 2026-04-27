@@ -8,11 +8,13 @@ mod xhttp;
 mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
-use boring::ssl::{SslOptions, SslVersion};
+use boring::ssl::NameType;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
@@ -32,8 +34,88 @@ use super::shared::{
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const COPY_BUFFER_LEN: usize = 64 * 1024;
+const HTTP2_CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-type TlsStream = tokio_boring::SslStream<http1::PrefixedIo<TcpStream>>;
+enum TlsStream {
+    Boring(tokio_boring::SslStream<http1::PrefixedIo<TcpStream>>),
+    Reality(super::shared::reality_tls::RealityTlsStream),
+}
+
+impl TlsStream {
+    fn fallback_local_addr(&self) -> anyhow::Result<SocketAddr> {
+        match self {
+            Self::Boring(stream) => stream
+                .get_ref()
+                .get_ref()
+                .local_addr()
+                .context("read VLESS fallback local address"),
+            Self::Reality(stream) => Ok(stream.local_addr()),
+        }
+    }
+
+    fn fallback_server_name(&self) -> Option<&str> {
+        match self {
+            Self::Boring(stream) => stream.ssl().servername(NameType::HOST_NAME),
+            Self::Reality(stream) => stream.server_name(),
+        }
+    }
+
+    fn selected_alpn_protocol(&self) -> Option<&[u8]> {
+        match self {
+            Self::Boring(stream) => stream.ssl().selected_alpn_protocol(),
+            Self::Reality(stream) => stream.selected_alpn_protocol(),
+        }
+    }
+
+    fn fallback_alpn_protocol(&self) -> Option<&[u8]> {
+        match self {
+            Self::Boring(stream) => stream.ssl().selected_alpn_protocol(),
+            Self::Reality(stream) => stream.fallback_alpn_protocol(),
+        }
+    }
+}
+
+impl Unpin for TlsStream {}
+
+impl AsyncRead for TlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Reality(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Reality(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Reality(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Reality(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RealityServerState {
@@ -47,8 +129,8 @@ struct ObservedRealityTarget {
 }
 
 struct RealityHandshakeProfile {
-    cipher_list: &'static str,
-    curves_list: &'static str,
+    cipher_suite: u16,
+    key_share_group: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -110,10 +192,12 @@ enum PacketEncoding {
     Xudp,
 }
 
+type PathFallbacks = HashMap<String, FallbackTarget>;
+type AlpnFallbacks = HashMap<String, PathFallbacks>;
+
 #[derive(Debug, Clone, Default)]
 pub struct FallbackConfig {
-    default: Option<FallbackTarget>,
-    by_alpn: HashMap<String, FallbackTarget>,
+    by_name: HashMap<String, AlpnFallbacks>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -125,6 +209,8 @@ struct FallbackTarget {
         deserialize_with = "crate::panel::deserialize_u16_from_number_or_string"
     )]
     server_port: u16,
+    #[serde(default)]
+    xver: u8,
 }
 
 impl FallbackConfig {
@@ -140,24 +226,59 @@ impl FallbackConfig {
             None => None,
         };
         if let Some(default) = default {
-            config.default = Some(default);
+            config.insert_entry(ParsedFallbackEntry {
+                name: None,
+                alpn: None,
+                path: None,
+                target: default,
+            });
         }
 
         let by_alpn = match remote.fallback_for_alpn.as_ref() {
             Some(value) => parse_fallback_map(value).context("decode VLESS fallback_for_alpn")?,
             None => HashMap::new(),
         };
-        config.by_alpn.extend(by_alpn);
+        for (alpn, target) in by_alpn {
+            config.insert_entry(ParsedFallbackEntry {
+                name: None,
+                alpn: Some(alpn),
+                path: None,
+                target,
+            });
+        }
+
+        config.finalize();
 
         Ok(config)
     }
 
-    fn select<'a>(&'a self, alpn: Option<&[u8]>) -> Option<&'a FallbackTarget> {
-        alpn.and_then(|value| std::str::from_utf8(value).ok())
+    fn select<'a>(
+        &'a self,
+        server_name: Option<&str>,
+        alpn: Option<&[u8]>,
+        first_packet: &[u8],
+    ) -> Option<&'a FallbackTarget> {
+        let name = server_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let apfb = self
+            .select_name(&name)
+            .and_then(|matched| self.by_name.get(matched))?;
+        let pfb = alpn
+            .and_then(|value| std::str::from_utf8(value).ok())
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
-            .and_then(|value| self.by_alpn.get(value))
-            .or(self.default.as_ref())
+            .and_then(|value| apfb.get(value))
+            .or_else(|| apfb.get(""))?;
+        if (pfb.len() > 1 || !pfb.contains_key(""))
+            && let Some(path) = detect_http_path(first_packet)
+            && let Some(target) = pfb.get(path.as_str())
+        {
+            return Some(target);
+        }
+        pfb.get("")
     }
 
     fn merge_xboard_fallbacks(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
@@ -165,20 +286,95 @@ impl FallbackConfig {
             .as_array()
             .ok_or_else(|| anyhow!("Xboard VLESS fallbacks must be an array"))?;
         for entry in entries {
-            let entry = parse_xboard_fallback_entry(entry)?;
-            if let Some(alpn) = entry.alpn {
-                self.by_alpn.insert(alpn.to_ascii_lowercase(), entry.target);
-            } else {
-                self.default = Some(entry.target);
-            }
+            self.insert_entry(parse_xboard_fallback_entry(entry)?);
         }
         Ok(())
+    }
+
+    fn insert_entry(&mut self, entry: ParsedFallbackEntry) {
+        let name = entry.name.unwrap_or_default();
+        let alpn = entry.alpn.unwrap_or_default();
+        let path = entry.path.unwrap_or_default();
+        self.by_name
+            .entry(name)
+            .or_default()
+            .entry(alpn)
+            .or_default()
+            .insert(path, entry.target);
+    }
+
+    fn finalize(&mut self) {
+        let default_name = self.by_name.get("").cloned();
+        if let Some(default_name_entries) = default_name.as_ref() {
+            let default_alpns = default_name_entries.keys().cloned().collect::<Vec<_>>();
+            for (name, apfb) in &mut self.by_name {
+                if name.is_empty() {
+                    continue;
+                }
+                for alpn in &default_alpns {
+                    apfb.entry(alpn.clone()).or_default();
+                }
+            }
+        }
+
+        for apfb in self.by_name.values_mut() {
+            let default_paths = apfb.get("").cloned();
+            if let Some(default_paths) = default_paths {
+                for (alpn, pfb) in apfb.iter_mut() {
+                    if alpn.is_empty() {
+                        continue;
+                    }
+                    for (path, target) in &default_paths {
+                        pfb.entry(path.clone()).or_insert_with(|| target.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(default_name_entries) = default_name {
+            for (name, apfb) in &mut self.by_name {
+                if name.is_empty() {
+                    continue;
+                }
+                for (alpn, default_paths) in &default_name_entries {
+                    let pfb = apfb.entry(alpn.clone()).or_default();
+                    for (path, target) in default_paths {
+                        pfb.entry(path.clone()).or_insert_with(|| target.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn select_name<'a>(&'a self, server_name: &str) -> Option<&'a str> {
+        if self.by_name.is_empty() {
+            return None;
+        }
+        if let Some((name, _)) = self.by_name.get_key_value(server_name) {
+            return Some(name.as_str());
+        }
+
+        let mut matched = None;
+        for name in self.by_name.keys() {
+            if name.is_empty() {
+                continue;
+            }
+            if !server_name.is_empty()
+                && server_name.contains(name.as_str())
+                && matched.is_none_or(|current: &str| name.len() > current.len())
+            {
+                matched = Some(name.as_str());
+            }
+        }
+        matched.or_else(|| self.by_name.contains_key("").then_some(""))
     }
 }
 
 #[derive(Debug, Clone)]
 struct ParsedFallbackEntry {
+    name: Option<String>,
     alpn: Option<String>,
+    path: Option<String>,
     target: FallbackTarget,
 }
 
@@ -468,7 +664,7 @@ async fn accept_loop(
         let fallbacks = fallbacks.clone();
         tokio::spawn(async move {
             let tls_stream = if let Some(reality) = reality {
-                match accept_reality_tls(acceptor.as_ref(), stream, source, &reality).await {
+                match accept_reality_tls(stream, source, &reality).await {
                     Ok(Some(stream)) => stream,
                     Ok(None) => return,
                     Err(error) => {
@@ -486,7 +682,7 @@ async fn accept_loop(
                 )
                 .await
                 {
-                    Ok(Ok(stream)) => stream,
+                    Ok(Ok(stream)) => TlsStream::Boring(stream),
                     Ok(Err(error)) => {
                         warn!(%error, %source, "VLESS TLS handshake failed");
                         return;
@@ -580,7 +776,6 @@ async fn accept_loop(
 }
 
 async fn accept_reality_tls(
-    _acceptor: &boring::ssl::SslAcceptor,
     mut stream: TcpStream,
     source: SocketAddr,
     reality: &RealityServerState,
@@ -629,45 +824,38 @@ async fn accept_reality_tls(
         }
     };
 
-    let certificate = super::shared::reality::build_server_certificate(
-        &reality.cert_state,
-        &authenticated.auth_key,
-    )
-    .context("build REALITY server certificate")?;
-    let reality_acceptor = build_reality_acceptor(
-        &certificate,
-        reality.cert_state.private_key(),
-        &handshake_profile,
-    );
+    let client_details = super::shared::reality::client_hello_details(&client_hello)
+        .context("parse REALITY ClientHello details")?;
 
-    let tls_stream = match timeout(
+    let tls_stream = match super::shared::reality_tls::accept(
+        stream,
+        &client_hello,
+        &client_details,
+        &authenticated,
+        &reality.cert_state,
+        super::shared::reality_tls::RealityTlsProfile {
+            cipher_suite: handshake_profile.cipher_suite,
+            key_share_group: handshake_profile.key_share_group,
+        },
         TLS_HANDSHAKE_TIMEOUT,
-        tokio_boring::accept(
-            &reality_acceptor?,
-            http1::PrefixedIo::new(stream, client_hello.prefix).capture_inner_reads(),
-        ),
     )
     .await
     {
-        Ok(Ok(mut stream)) => {
-            stream.get_mut().disable_inner_capture();
-            stream
+        Ok(stream) => TlsStream::Reality(stream),
+        Err(error) => {
+            let sent_server_flight = error.sent_server_flight();
+            let (stream, error) = error.into_parts();
+            if !sent_server_flight {
+                warn!(
+                    error = %error,
+                    %source,
+                    "VLESS REALITY TLS handshake failed before server flight; forwarding to target"
+                );
+                proxy_observed_reality_fallback(stream, observed_target, Vec::new()).await?;
+                return Ok(None);
+            }
+            return Err(error.context("VLESS REALITY TLS handshake failed after server flight"));
         }
-        Ok(Err(error)) => {
-            warn!(
-                %error,
-                %source,
-                "VLESS REALITY TLS handshake failed after authentication; forwarding to target"
-            );
-            let (stream, consumed_after_client_hello) = error
-                .into_source_stream()
-                .context("extract REALITY source stream after handshake failure")?
-                .into_parts();
-            proxy_observed_reality_fallback(stream, observed_target, consumed_after_client_hello)
-                .await?;
-            return Ok(None);
-        }
-        Err(_) => return Err(anyhow!("REALITY TLS handshake timed out")),
     };
     Ok(Some(tls_stream))
 }
@@ -675,65 +863,22 @@ async fn accept_reality_tls(
 fn reality_handshake_profile(
     server_hello: &super::shared::reality::ObservedServerHello,
 ) -> anyhow::Result<RealityHandshakeProfile> {
-    let Some(curves_list) = server_hello.curves_list() else {
+    let Some(_curves_list) = server_hello.curves_list() else {
         bail!(
             "unsupported REALITY target key share group 0x{:04x}",
             server_hello.key_share_group
         );
     };
-    let cipher_list = match server_hello.cipher_suite {
-        0x1301 => "TLS_AES_128_GCM_SHA256",
-        0x1302 => "TLS_AES_256_GCM_SHA384",
-        0x1303 => "TLS_CHACHA20_POLY1305_SHA256",
-        _ => {
-            bail!(
-                "unsupported REALITY target cipher suite 0x{:04x}",
-                server_hello.cipher_suite
-            )
-        }
-    };
+    ensure!(
+        matches!(server_hello.cipher_suite, 0x1301 | 0x1302 | 0x1303),
+        "unsupported REALITY target cipher suite 0x{:04x}",
+        server_hello.cipher_suite
+    );
 
     Ok(RealityHandshakeProfile {
-        cipher_list,
-        curves_list,
+        cipher_suite: server_hello.cipher_suite,
+        key_share_group: server_hello.key_share_group,
     })
-}
-
-fn build_reality_acceptor(
-    certificate: &boring::x509::X509Ref,
-    private_key: &boring::pkey::PKeyRef<boring::pkey::Private>,
-    profile: &RealityHandshakeProfile,
-) -> anyhow::Result<boring::ssl::SslAcceptor> {
-    let mut builder =
-        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
-            .context("build per-connection REALITY acceptor")?;
-    builder.set_options(SslOptions::NO_TICKET);
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_3))
-        .context("set REALITY TLS minimum version")?;
-    builder
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .context("set REALITY TLS maximum version")?;
-    builder
-        .set_sigalgs_list("ed25519")
-        .context("set REALITY TLS signature algorithms")?;
-    builder
-        .set_certificate(certificate)
-        .context("set REALITY TLS certificate")?;
-    builder
-        .set_private_key(private_key)
-        .context("set REALITY TLS private key")?;
-    builder
-        .check_private_key()
-        .context("check REALITY TLS private key")?;
-    builder
-        .set_curves_list(profile.curves_list)
-        .context("set REALITY TLS key share group")?;
-    builder
-        .set_strict_cipher_list(profile.cipher_list)
-        .context("set REALITY TLS cipher suite")?;
-
-    Ok(builder.build())
 }
 
 async fn observe_reality_target(
@@ -857,8 +1002,127 @@ async fn proxy_reality_fallback(
     Ok(())
 }
 
+struct FallbackContext {
+    local_addr: SocketAddr,
+    server_name: Option<String>,
+    alpn: Option<Vec<u8>>,
+    first_packet: Vec<u8>,
+}
+
+async fn prefetch_first_packet(stream: &mut TlsStream) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = vec![0u8; 8192];
+    match tokio::time::timeout(REQUEST_HEADER_TIMEOUT, stream.read(&mut buffer)).await {
+        Ok(Ok(0)) => Ok(Vec::new()),
+        Ok(Ok(read)) => {
+            buffer.truncate(read);
+            Ok(buffer)
+        }
+        Ok(Err(error)) => Err(error).context("read VLESS fallback preface"),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+async fn prepare_fallback_stream(
+    stream: TlsStream,
+) -> anyhow::Result<(FallbackContext, TlsStream)> {
+    let local_addr = stream.fallback_local_addr()?;
+    let server_name = stream.fallback_server_name().map(str::to_string);
+    let alpn = stream.fallback_alpn_protocol().map(|value| value.to_vec());
+    let mut stream = stream;
+    let first_packet = prefetch_first_packet(&mut stream).await?;
+    let replay = first_packet.clone();
+    Ok((
+        FallbackContext {
+            local_addr,
+            server_name,
+            alpn,
+            first_packet,
+        },
+        http1::PrefixedIo::new(stream, replay).into_inner(),
+    ))
+}
+
+fn detect_http_path(first_packet: &[u8]) -> Option<String> {
+    if first_packet.len() < 18 || first_packet.get(4).copied() == Some(b'*') {
+        return None;
+    }
+    for index in 4..=8.min(first_packet.len().saturating_sub(1)) {
+        if first_packet[index] == b'/' && first_packet[index - 1] == b' ' {
+            let search_end = first_packet.len().min(64);
+            for end in (index + 1)..search_end {
+                match first_packet[end] {
+                    b'\r' | b'\n' => break,
+                    b'?' | b' ' => {
+                        return Some(String::from_utf8_lossy(&first_packet[index..end]).into());
+                    }
+                    _ => {}
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn normalize_proxy_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(value) => value
+            .ip()
+            .to_ipv4()
+            .map(|ip| SocketAddr::new(std::net::IpAddr::V4(ip), value.port()))
+            .unwrap_or(SocketAddr::V6(value)),
+        other => other,
+    }
+}
+
+fn encode_proxy_header(source: SocketAddr, local: SocketAddr, xver: u8) -> anyhow::Result<Vec<u8>> {
+    let source = normalize_proxy_addr(source);
+    let local = normalize_proxy_addr(local);
+    match xver {
+        1 => Ok(match (source.ip(), local.ip()) {
+            (std::net::IpAddr::V4(source_ip), std::net::IpAddr::V4(local_ip)) => format!(
+                "PROXY TCP4 {source_ip} {local_ip} {} {}\r\n",
+                source.port(),
+                local.port()
+            )
+            .into_bytes(),
+            (std::net::IpAddr::V6(source_ip), std::net::IpAddr::V6(local_ip)) => format!(
+                "PROXY TCP6 {source_ip} {local_ip} {} {}\r\n",
+                source.port(),
+                local.port()
+            )
+            .into_bytes(),
+            _ => b"PROXY UNKNOWN\r\n".to_vec(),
+        }),
+        2 => {
+            let mut header = Vec::with_capacity(28);
+            header.extend_from_slice(b"\x0D\x0A\x0D\x0A\x00\x0D\x0AQUIT\x0A");
+            match (source.ip(), local.ip()) {
+                (std::net::IpAddr::V4(source_ip), std::net::IpAddr::V4(local_ip)) => {
+                    header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0C]);
+                    header.extend_from_slice(&source_ip.octets());
+                    header.extend_from_slice(&local_ip.octets());
+                }
+                (std::net::IpAddr::V6(source_ip), std::net::IpAddr::V6(local_ip)) => {
+                    header.extend_from_slice(&[0x21, 0x21, 0x00, 0x24]);
+                    header.extend_from_slice(&source_ip.octets());
+                    header.extend_from_slice(&local_ip.octets());
+                }
+                _ => {
+                    header.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
+                    return Ok(header);
+                }
+            }
+            header.extend_from_slice(&source.port().to_be_bytes());
+            header.extend_from_slice(&local.port().to_be_bytes());
+            Ok(header)
+        }
+        other => bail!("unsupported VLESS fallback xver {other}"),
+    }
+}
+
 async fn serve_connection(
-    mut stream: TlsStream,
+    stream: TlsStream,
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
@@ -866,10 +1130,17 @@ async fn serve_connection(
     routing: routing::RoutingTable,
     fallbacks: FallbackConfig,
 ) -> anyhow::Result<()> {
-    let negotiated_alpn = stream
-        .ssl()
-        .selected_alpn_protocol()
-        .map(|value| value.to_vec());
+    let (fallback, mut stream) = prepare_fallback_stream(stream).await?;
+    if !fallback.first_packet.is_empty() && fallback.first_packet.len() < 18 {
+        if let Some(target) = fallbacks.select(
+            fallback.server_name.as_deref(),
+            fallback.alpn.as_deref(),
+            &fallback.first_packet,
+        ) {
+            proxy_fallback(stream, source, fallback.local_addr, target, Vec::new()).await?;
+            return Ok(());
+        }
+    }
     let mut consumed = Vec::with_capacity(64);
     let request = match timeout(
         REQUEST_HEADER_TIMEOUT,
@@ -879,23 +1150,35 @@ async fn serve_connection(
     {
         Ok(Ok(request)) => request,
         Ok(Err(error)) => {
-            if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
-                proxy_fallback(stream, target, consumed).await?;
+            if let Some(target) = fallbacks.select(
+                fallback.server_name.as_deref(),
+                fallback.alpn.as_deref(),
+                &fallback.first_packet,
+            ) {
+                proxy_fallback(stream, source, fallback.local_addr, target, consumed).await?;
                 return Ok(());
             }
             return Err(error);
         }
         Err(_) => {
-            if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
-                proxy_fallback(stream, target, consumed).await?;
+            if let Some(target) = fallbacks.select(
+                fallback.server_name.as_deref(),
+                fallback.alpn.as_deref(),
+                &fallback.first_packet,
+            ) {
+                proxy_fallback(stream, source, fallback.local_addr, target, consumed).await?;
                 return Ok(());
             }
             return Err(anyhow!("VLESS request header timed out"));
         }
     };
     if let Err(error) = validate_request_addons(&request) {
-        if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
-            proxy_fallback(stream, target, consumed).await?;
+        if let Some(target) = fallbacks.select(
+            fallback.server_name.as_deref(),
+            fallback.alpn.as_deref(),
+            &fallback.first_packet,
+        ) {
+            proxy_fallback(stream, source, fallback.local_addr, target, consumed).await?;
             return Ok(());
         }
         return Err(error);
@@ -904,8 +1187,12 @@ async fn serve_connection(
     let user = match users.get(&request.user) {
         Some(user) => user,
         None => {
-            if let Some(target) = fallbacks.select(negotiated_alpn.as_deref()) {
-                proxy_fallback(stream, target, consumed).await?;
+            if let Some(target) = fallbacks.select(
+                fallback.server_name.as_deref(),
+                fallback.alpn.as_deref(),
+                &fallback.first_packet,
+            ) {
+                proxy_fallback(stream, source, fallback.local_addr, target, consumed).await?;
                 return Ok(());
             }
             bail!("unknown VLESS user")
@@ -1059,11 +1346,20 @@ async fn serve_xhttp_connection(
     routing: routing::RoutingTable,
     config: xhttp::XhttpConfig,
 ) -> anyhow::Result<()> {
-    let negotiated_alpn = stream
-        .ssl()
-        .selected_alpn_protocol()
-        .map(|value| value.to_vec());
-    if negotiated_alpn.as_deref() == Some(b"h2") {
+    let mut stream = http1::PrefixedIo::new(stream, Vec::new()).capture_inner_reads();
+    let is_h2 = if stream.get_ref().selected_alpn_protocol() == Some(b"h2") {
+        true
+    } else {
+        timeout(
+            REQUEST_HEADER_TIMEOUT,
+            sniff_http2_connection_preface(&mut stream),
+        )
+        .await
+        .map_err(|_| anyhow!("XHTTP connection preface timed out"))??
+    };
+    let (stream, prefetched) = stream.into_parts();
+    let stream = http1::PrefixedIo::new(stream, prefetched);
+    if is_h2 {
         return serve_xhttp_h2_connection(
             stream,
             source,
@@ -1089,7 +1385,7 @@ async fn serve_xhttp_connection(
 }
 
 async fn serve_xhttp_http1_connection(
-    stream: TlsStream,
+    mut stream: http1::PrefixedIo<TlsStream>,
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
@@ -1097,7 +1393,6 @@ async fn serve_xhttp_http1_connection(
     routing: routing::RoutingTable,
     config: xhttp::XhttpConfig,
 ) -> anyhow::Result<()> {
-    let mut stream = http1::PrefixedIo::new(stream, Vec::new());
     loop {
         let wrapped = xhttp::accept_prefixed(stream, &config).await?;
         match wrapped {
@@ -1120,15 +1415,18 @@ async fn serve_xhttp_http1_connection(
     }
 }
 
-async fn serve_xhttp_h2_connection(
-    stream: TlsStream,
+async fn serve_xhttp_h2_connection<S>(
+    stream: S,
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
     routing: routing::RoutingTable,
     config: xhttp::XhttpConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let on_stream: Arc<dyn Fn(xhttp::XhttpStream) + Send + Sync> = Arc::new(move |stream| {
         let accounting = accounting.clone();
         let users = users.clone();
@@ -1143,6 +1441,30 @@ async fn serve_xhttp_h2_connection(
         });
     });
     xhttp::serve_h2(stream, config, on_stream).await
+}
+
+async fn sniff_http2_connection_preface<S>(
+    stream: &mut http1::PrefixedIo<S>,
+) -> anyhow::Result<bool>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut bytes = [0u8; HTTP2_CONNECTION_PREFACE.len()];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let read = stream
+            .read(&mut bytes[offset..])
+            .await
+            .context("read XHTTP connection preface")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        offset += read;
+        if bytes[..offset] != HTTP2_CONNECTION_PREFACE[..offset] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn serve_xhttp_stream(
@@ -1367,6 +1689,8 @@ where
 
 async fn proxy_fallback(
     stream: TlsStream,
+    source: SocketAddr,
+    local: SocketAddr,
     target: &FallbackTarget,
     consumed: Vec<u8>,
 ) -> anyhow::Result<()> {
@@ -1382,6 +1706,13 @@ async fn proxy_fallback(
     let control = SessionControl::new();
     let (mut client_reader, mut client_writer) = split(stream);
     let (mut fallback_reader, mut fallback_writer) = split(fallback);
+    if target.xver != 0 {
+        let header = encode_proxy_header(source, local, target.xver)?;
+        fallback_writer
+            .write_all(&header)
+            .await
+            .context("write VLESS fallback proxy protocol header")?;
+    }
     if !consumed.is_empty() {
         fallback_writer
             .write_all(&consumed)
@@ -1646,14 +1977,14 @@ fn parse_fallback_map(
         .ok_or_else(|| anyhow!("VLESS fallback_for_alpn must be an object"))?;
     let mut targets = HashMap::new();
     for (alpn, value) in object {
-        let key = alpn.trim();
+        let key = alpn.trim().to_ascii_lowercase();
         ensure!(
             !key.is_empty(),
             "VLESS fallback_for_alpn contains empty ALPN"
         );
         ensure!(
             targets
-                .insert(key.to_string(), parse_fallback_target(value)?)
+                .insert(key.clone(), parse_fallback_target(value)?)
                 .is_none(),
             "duplicate VLESS fallback_for_alpn entry {key}"
         );
@@ -1668,6 +1999,7 @@ fn parse_fallback_target(value: &serde_json::Value) -> anyhow::Result<FallbackTa
         !target.server.trim().is_empty() && target.server_port > 0,
         "VLESS fallback target requires server and server_port"
     );
+    ensure!(target.xver <= 2, "VLESS fallback xver must be 0, 1 or 2");
     Ok(target)
 }
 
@@ -1680,11 +2012,8 @@ fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<Pars
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
-        .trim();
-    ensure!(
-        name.is_empty(),
-        "Xboard VLESS fallback name is not supported yet"
-    );
+        .trim()
+        .to_ascii_lowercase();
 
     let path = object
         .get("path")
@@ -1692,15 +2021,16 @@ fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<Pars
         .unwrap_or_default()
         .trim();
     ensure!(
-        path.is_empty(),
-        "Xboard VLESS fallback path is not supported yet"
+        path.is_empty() || path.starts_with('/'),
+        "Xboard VLESS fallback path must start with /"
     );
 
     let xver = object
         .get("xver")
-        .and_then(serde_json::Value::as_u64)
+        .map(parse_u8_json)
+        .transpose()?
         .unwrap_or(0);
-    ensure!(xver == 0, "Xboard VLESS fallback xver is not supported yet");
+    ensure!(xver <= 2, "Xboard VLESS fallback xver must be 0, 1 or 2");
 
     let fallback_type = object
         .get("type")
@@ -1715,7 +2045,8 @@ fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<Pars
     let dest = object
         .get("dest")
         .ok_or_else(|| anyhow!("Xboard VLESS fallback entry requires dest"))?;
-    let target = parse_xboard_fallback_dest(dest)?;
+    let mut target = parse_xboard_fallback_dest(dest)?;
+    target.xver = xver;
 
     let alpn = object
         .get("alpn")
@@ -1724,7 +2055,25 @@ fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<Pars
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
 
-    Ok(ParsedFallbackEntry { alpn, target })
+    Ok(ParsedFallbackEntry {
+        name: (!name.is_empty()).then_some(name),
+        alpn,
+        path: (!path.is_empty()).then_some(path.to_string()),
+        target,
+    })
+}
+
+fn parse_u8_json(value: &serde_json::Value) -> anyhow::Result<u8> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| anyhow!("expected u8 number, got {value}")),
+        serde_json::Value::String(text) => {
+            text.trim().parse::<u8>().context("parse u8 string value")
+        }
+        _ => bail!("expected u8 number or decimal string, got {value}"),
+    }
 }
 
 fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<FallbackTarget> {
@@ -1742,6 +2091,7 @@ fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<Fallb
             Ok(FallbackTarget {
                 server: "127.0.0.1".to_string(),
                 server_port,
+                xver: 0,
             })
         }
         serde_json::Value::String(text) => {
@@ -1761,6 +2111,7 @@ fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<Fallb
                 return Ok(FallbackTarget {
                     server: "127.0.0.1".to_string(),
                     server_port,
+                    xver: 0,
                 });
             }
 
@@ -1782,6 +2133,7 @@ fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<Fallb
             Ok(FallbackTarget {
                 server: server.trim().to_string(),
                 server_port,
+                xver: 0,
             })
         }
         _ => bail!("Xboard VLESS fallback dest must be a string or number"),
@@ -1875,29 +2227,225 @@ mod tests {
     #[test]
     fn fallback_selection_uses_default_when_alpn_does_not_match() {
         let config = FallbackConfig {
-            default: Some(FallbackTarget {
-                server: "127.0.0.1".to_string(),
-                server_port: 80,
-            }),
-            by_alpn: HashMap::from([(
-                "h2".to_string(),
-                FallbackTarget {
-                    server: "127.0.0.1".to_string(),
-                    server_port: 443,
-                },
+            by_name: HashMap::from([(
+                String::new(),
+                HashMap::from([
+                    (
+                        String::new(),
+                        HashMap::from([(
+                            String::new(),
+                            FallbackTarget {
+                                server: "127.0.0.1".to_string(),
+                                server_port: 80,
+                                xver: 0,
+                            },
+                        )]),
+                    ),
+                    (
+                        "h2".to_string(),
+                        HashMap::from([(
+                            String::new(),
+                            FallbackTarget {
+                                server: "127.0.0.1".to_string(),
+                                server_port: 443,
+                                xver: 0,
+                            },
+                        )]),
+                    ),
+                ]),
             )]),
         };
 
         assert_eq!(
-            config.select(Some(b"h2")).map(|target| target.server_port),
+            config
+                .select(None, Some(b"h2"), b"GET / HTTP/1.1\r\n\r\n")
+                .map(|target| target.server_port),
             Some(443)
         );
         assert_eq!(
             config
-                .select(Some(b"http/1.1"))
+                .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
                 .map(|target| target.server_port),
             Some(80)
         );
+    }
+
+    #[test]
+    fn fallback_selection_prefers_matching_server_name() {
+        let config = FallbackConfig {
+            by_name: HashMap::from([
+                (
+                    String::new(),
+                    HashMap::from([(
+                        String::new(),
+                        HashMap::from([(
+                            String::new(),
+                            FallbackTarget {
+                                server: "127.0.0.1".to_string(),
+                                server_port: 80,
+                                xver: 0,
+                            },
+                        )]),
+                    )]),
+                ),
+                (
+                    "example.com".to_string(),
+                    HashMap::from([
+                        (
+                            String::new(),
+                            HashMap::from([(
+                                String::new(),
+                                FallbackTarget {
+                                    server: "127.0.0.1".to_string(),
+                                    server_port: 8080,
+                                    xver: 0,
+                                },
+                            )]),
+                        ),
+                        (
+                            "h2".to_string(),
+                            HashMap::from([(
+                                String::new(),
+                                FallbackTarget {
+                                    server: "127.0.0.1".to_string(),
+                                    server_port: 8443,
+                                    xver: 0,
+                                },
+                            )]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            config
+                .select(
+                    Some("api.example.com"),
+                    Some(b"http/1.1"),
+                    b"GET / HTTP/1.1\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(8080)
+        );
+        assert_eq!(
+            config
+                .select(
+                    Some("api.example.com"),
+                    Some(b"h2"),
+                    b"GET / HTTP/1.1\r\n\r\n"
+                )
+                .map(|target| target.server_port),
+            Some(8443)
+        );
+        assert_eq!(
+            config
+                .select(
+                    Some("other.example.net"),
+                    Some(b"http/1.1"),
+                    b"GET / HTTP/1.1\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn fallback_selection_inherits_default_name_alpn_and_path_layers() {
+        let config = FallbackConfig::from_remote(&NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": 80 },
+                { "alpn": "h2", "dest": 443 },
+                { "path": "/ws", "dest": 8080 },
+                { "name": "example.com", "dest": 8443 }
+            ])),
+            ..base_remote()
+        })
+        .expect("fallback config");
+
+        assert_eq!(
+            config
+                .select(
+                    Some("api.example.com"),
+                    Some(b"http/1.1"),
+                    b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(8443)
+        );
+        assert_eq!(
+            config
+                .select(
+                    Some("api.example.com"),
+                    Some(b"h2"),
+                    b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(8443)
+        );
+        assert_eq!(
+            config
+                .select(
+                    Some("api.example.com"),
+                    Some(b"http/1.1"),
+                    b"GET /ws HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn fallback_selection_rejects_unmatched_alpn_without_default() {
+        let config = FallbackConfig::from_remote(&NodeConfigResponse {
+            fallback_for_alpn: Some(serde_json::json!({
+                "h2": {
+                    "server": "127.0.0.1",
+                    "server_port": 443
+                }
+            })),
+            ..base_remote()
+        })
+        .expect("fallback config");
+
+        assert!(
+            config
+                .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fallback_for_alpn_keys_are_case_insensitive() {
+        let remote = NodeConfigResponse {
+            fallback_for_alpn: Some(serde_json::json!({
+                "H2": {
+                    "server": "127.0.0.1",
+                    "server_port": 8443,
+                }
+            })),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        assert_eq!(
+            config
+                .select(None, Some(b"h2"), b"GET / HTTP/1.1\r\n\r\n")
+                .map(|target| target.server_port),
+            Some(8443)
+        );
+    }
+
+    #[test]
+    fn parses_fallback_xver() {
+        let target = parse_fallback_target(&serde_json::json!({
+            "server": "127.0.0.1",
+            "server_port": 8080,
+            "xver": 2
+        }))
+        .expect("parse fallback");
+
+        assert_eq!(target.xver, 2);
     }
 
     #[test]
@@ -2109,6 +2657,55 @@ mod tests {
         assert_eq!(config.tls.alpn, vec!["http/1.1".to_string()]);
     }
 
+    #[tokio::test]
+    async fn sniff_http2_connection_preface_accepts_exact_preface() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut stream = http1::PrefixedIo::new(server, Vec::new()).capture_inner_reads();
+        let write = tokio::spawn(async move {
+            client
+                .write_all(HTTP2_CONNECTION_PREFACE)
+                .await
+                .expect("write h2 preface");
+        });
+
+        let is_h2 = sniff_http2_connection_preface(&mut stream)
+            .await
+            .expect("sniff http2 preface");
+        let (_stream, captured) = stream.into_parts();
+        write.await.expect("join write");
+
+        assert!(is_h2);
+        assert_eq!(captured, HTTP2_CONNECTION_PREFACE);
+    }
+
+    #[tokio::test]
+    async fn sniff_http2_connection_preface_rejects_http1_request_and_preserves_prefix() {
+        let request = b"GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut stream = http1::PrefixedIo::new(server, Vec::new()).capture_inner_reads();
+        let write = tokio::spawn(async move {
+            client
+                .write_all(request)
+                .await
+                .expect("write http1 request");
+        });
+
+        let is_h2 = sniff_http2_connection_preface(&mut stream)
+            .await
+            .expect("sniff http1 preface");
+        let (stream, captured) = stream.into_parts();
+        let mut stream = http1::PrefixedIo::new(stream, captured);
+        let parsed = http1::read_request_head(&mut stream)
+            .await
+            .expect("parse preserved http1 request");
+        write.await.expect("join write");
+
+        assert!(!is_h2);
+        assert_eq!(parsed.request.method, "GET");
+        assert_eq!(parsed.request.path, "/x");
+        assert_eq!(parsed.request.host, "example.com");
+    }
+
     #[test]
     fn still_rejects_runtime_vless_flow_addons() {
         let request = codec::Request {
@@ -2140,35 +2737,141 @@ mod tests {
         let remote = NodeConfigResponse {
             fallbacks: Some(serde_json::json!([
                 { "dest": 80 },
-                { "alpn": "h2", "dest": "127.0.0.1:8443" }
+                { "name": "example.com", "alpn": "h2", "dest": "127.0.0.1:8443" }
             ])),
             ..base_remote()
         };
 
         let config = FallbackConfig::from_remote(&remote).expect("fallback config");
         assert_eq!(
-            config.select(Some(b"h2")).map(|target| target.server_port),
+            config
+                .select(
+                    Some("sub.example.com"),
+                    Some(b"h2"),
+                    b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
             Some(8443)
         );
         assert_eq!(
             config
-                .select(Some(b"http/1.1"))
+                .select(
+                    Some("other.example.net"),
+                    Some(b"http/1.1"),
+                    b"GET / HTTP/1.1\r\nHost: other.example.net\r\n\r\n",
+                )
                 .map(|target| target.server_port),
             Some(80)
         );
     }
 
     #[test]
-    fn rejects_xboard_fallbacks_with_unsupported_path() {
+    fn parses_xboard_fallbacks_with_path_name_and_xver() {
         let remote = NodeConfigResponse {
             fallbacks: Some(serde_json::json!([
-                { "path": "/ws", "dest": 80 }
+                { "dest": 80 },
+                { "name": "example.com", "alpn": "h2", "path": "/ws", "dest": "127.0.0.1:8443", "xver": 1 }
+            ])),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        let target = config
+            .select(
+                Some("api.example.com"),
+                Some(b"h2"),
+                b"GET /ws?ed=2048 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            )
+            .expect("path-specific fallback");
+        assert_eq!(target.server, "127.0.0.1");
+        assert_eq!(target.server_port, 8443);
+        assert_eq!(target.xver, 1);
+
+        assert_eq!(
+            config
+                .select(
+                    Some("other.example.com"),
+                    Some(b"http/1.1"),
+                    b"GET / HTTP/1.1\r\nHost: other.example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn fallback_selection_uses_default_path_when_http_path_misses() {
+        let config = FallbackConfig::from_remote(&NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": 80 },
+                { "path": "/ws", "dest": 8080 }
+            ])),
+            ..base_remote()
+        })
+        .expect("fallback config");
+
+        assert_eq!(
+            config
+                .select(
+                    None,
+                    None,
+                    b"GET /other HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                )
+                .map(|target| target.server_port),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn rejects_xboard_fallback_path_without_leading_slash() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "path": "ws", "dest": 80 }
             ])),
             ..base_remote()
         };
 
         let error = FallbackConfig::from_remote(&remote).expect_err("unsupported fallback path");
-        assert!(error.to_string().contains("fallback path"));
+        assert!(error.to_string().contains("must start with /"));
+    }
+
+    #[test]
+    fn encodes_proxy_protocol_headers() {
+        let v1 = encode_proxy_header(
+            SocketAddr::from(([1, 2, 3, 4], 1234)),
+            SocketAddr::from(([5, 6, 7, 8], 443)),
+            1,
+        )
+        .expect("v1");
+        assert_eq!(v1, b"PROXY TCP4 1.2.3.4 5.6.7.8 1234 443\r\n");
+
+        let v2 = encode_proxy_header(
+            SocketAddr::from(([1, 2, 3, 4], 1234)),
+            SocketAddr::from(([5, 6, 7, 8], 443)),
+            2,
+        )
+        .expect("v2");
+        assert_eq!(
+            &v2[..16],
+            b"\x0D\x0A\x0D\x0A\x00\x0D\x0AQUIT\x0A\x21\x11\x00\x0C"
+        );
+        assert_eq!(&v2[16..20], &[1, 2, 3, 4]);
+        assert_eq!(&v2[20..24], &[5, 6, 7, 8]);
+        assert_eq!(&v2[24..26], &1234u16.to_be_bytes());
+        assert_eq!(&v2[26..28], &443u16.to_be_bytes());
+    }
+
+    #[test]
+    fn detects_http_path_from_first_packet() {
+        assert_eq!(
+            detect_http_path(b"GET /ws?ed=2048 HTTP/1.1\r\nHost: example.com\r\n\r\n").as_deref(),
+            Some("/ws")
+        );
+        assert_eq!(
+            detect_http_path(b"POST /api HTTP/1.1\r\nHost: example.com\r\n\r\n").as_deref(),
+            Some("/api")
+        );
+        assert!(detect_http_path(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").is_none());
     }
 
     #[test]

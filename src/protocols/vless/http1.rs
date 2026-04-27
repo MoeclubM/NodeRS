@@ -55,13 +55,20 @@ impl<S> PrefixedIo<S> {
         self
     }
 
-    pub fn disable_inner_capture(&mut self) {
-        self.capture_inner = false;
-        self.captured_inner.clear();
-    }
-
     pub fn into_parts(self) -> (S, Vec<u8>) {
         (self.inner, self.captured_inner)
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 
     pub fn prepend_prefix(mut self, prefix: Vec<u8>) -> Self {

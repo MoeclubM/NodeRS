@@ -73,18 +73,7 @@ impl LoadedTlsMaterials {
         self.source == *source
             && self.ech_source.as_ref() == ech_source
             && self.reality.as_ref() == reality
-            && self.alpn_protocols == normalized_alpn_protocols(reality, alpn_protocols)
-    }
-}
-
-fn normalized_alpn_protocols(
-    reality: Option<&RealityTlsConfig>,
-    alpn_protocols: &[String],
-) -> Vec<String> {
-    if reality.is_some() {
-        Vec::new()
-    } else {
-        alpn_protocols.to_vec()
+            && self.alpn_protocols == alpn_protocols
     }
 }
 
@@ -97,7 +86,7 @@ pub async fn load_tls_materials(
     let source = source.clone();
     let ech_source = ech_source.cloned();
     let reality = reality.cloned();
-    let alpn_protocols = normalized_alpn_protocols(reality.as_ref(), alpn_protocols);
+    let alpn_protocols = alpn_protocols.to_vec();
     let (cert_pem, key_pem) = if reality.is_some() {
         (Vec::new(), Vec::new())
     } else {
@@ -264,11 +253,7 @@ async fn build_acceptor(
 ) -> anyhow::Result<Arc<SslAcceptor>> {
     let ech_materials = ech_materials.cloned();
     let reality = reality.cloned();
-    let alpn_wire = if reality.is_some() {
-        Vec::new()
-    } else {
-        encode_alpn_protocols(alpn_protocols)?
-    };
+    let alpn_wire = encode_alpn_protocols(alpn_protocols)?;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<SslAcceptor>> {
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
             .context("build BoringSSL acceptor")?;
@@ -311,7 +296,7 @@ async fn build_acceptor(
             builder.set_ech_keys(&ech_keys).context("set ECH keys")?;
         }
 
-        if !alpn_wire.is_empty() {
+        if reality.is_none() && !alpn_wire.is_empty() {
             builder
                 .set_alpn_protos(&alpn_wire)
                 .context("set ALPN protocols")?;
@@ -351,7 +336,17 @@ async fn build_acceptor(
 }
 
 pub(crate) fn encode_alpn_protocols(protocols: &[String]) -> anyhow::Result<Vec<u8>> {
+    let protocols = parse_alpn_protocols(protocols)?;
     let mut encoded = Vec::new();
+    for protocol in protocols {
+        encoded.push(protocol.len() as u8);
+        encoded.extend_from_slice(&protocol);
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn parse_alpn_protocols(protocols: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut parsed = Vec::with_capacity(protocols.len());
     for protocol in protocols {
         let protocol = protocol.trim();
         ensure!(
@@ -366,10 +361,9 @@ pub(crate) fn encode_alpn_protocols(protocols: &[String]) -> anyhow::Result<Vec<
             protocol.len() <= u8::MAX as usize,
             "ALPN protocol {protocol:?} is too long"
         );
-        encoded.push(protocol.len() as u8);
-        encoded.extend_from_slice(protocol.as_bytes());
+        parsed.push(protocol.as_bytes().to_vec());
     }
-    Ok(encoded)
+    Ok(parsed)
 }
 
 fn build_ech_keys(
@@ -644,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reality_materials_ignore_alpn_when_matching_source() {
+    async fn reality_materials_track_alpn_when_matching_source() {
         let reality = RealityTlsConfig {
             server_name: "reality.example.com".to_string(),
             server_port: 443,
@@ -664,7 +658,7 @@ mod tests {
         .expect("reality materials");
 
         let other_alpn = vec!["http/1.1".to_string()];
-        assert!(materials.matches_source(
+        assert!(!materials.matches_source(
             &TlsMaterialSource::SelfSigned {
                 subject_alt_names: vec!["node.example.com".to_string()],
             },

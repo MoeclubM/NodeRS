@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 base64 = "0.22.1"
 blake3 = "1.8.4"
-boring = "5.1.0"
+boring = { version = "5.1.0", features = ["mlkem"] }
 bytes = "1.11.1"
 futures-util = "0.3.32"
 h2 = "0.4.13"
@@ -21,7 +21,9 @@ parking_lot = "0.12.5"
 p256 = { version = "0.13.2", features = ["ecdsa", "pem", "pkcs8"] }
 percent-encoding = "2.3.2"
 pbkdf2 = "0.12.2"
+rand_core06 = { package = "rand_core", version = "0.6.4" }
 prost = "0.14.1"
+pqc_kyber = { version = "0.7.1", features = ["std"] }
 rand = "0.10.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "query", "rustls", "http2"] }
