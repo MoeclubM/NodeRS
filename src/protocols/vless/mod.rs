@@ -1584,8 +1584,10 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     {
         bail!("REALITY settings require tls mode 2 for VLESS nodes");
     }
-    if remote.tls_mode() == 2 && !matches!(transport_mode, TransportMode::Tcp) {
-        bail!("REALITY currently only supports VLESS tcp transport in NodeRS");
+    if remote.tls_mode() == 2
+        && !matches!(transport_mode, TransportMode::Tcp | TransportMode::Xhttp(_))
+    {
+        bail!("REALITY currently only supports VLESS tcp or xhttp transport in NodeRS");
     }
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
@@ -2006,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reality_with_non_tcp_transport() {
+    fn rejects_reality_with_unsupported_transport() {
         let remote = NodeConfigResponse {
             tls: Some(serde_json::json!(2)),
             network: "ws".to_string(),
@@ -2026,7 +2028,34 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("only supports VLESS tcp transport")
+                .contains("only supports VLESS tcp or xhttp transport")
+        );
+    }
+
+    #[test]
+    fn accepts_reality_with_xhttp_transport() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            network: "xhttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            reality_settings: NodeRealitySettings {
+                server_name: "reality.example.com".to_string(),
+                private_key: REALITY_KEY_B64.to_string(),
+                short_id: "a1b2".to_string(),
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("REALITY xhttp transport");
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
+        assert_eq!(
+            config.tls.alpn,
+            vec!["http/1.1".to_string(), "h2".to_string()]
         );
     }
 
