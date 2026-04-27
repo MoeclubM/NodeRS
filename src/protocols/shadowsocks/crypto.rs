@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::accounting::{SessionControl, UserEntry};
 use crate::panel::PanelUser;
-use crate::protocols::anytls::socksaddr::SocksAddr;
+use crate::protocols::shared::socksaddr::SocksAddr;
 
 const LEGACY_TAG_LEN: usize = 16;
 const LEGACY_LENGTH_CHUNK_LEN: usize = 2 + LEGACY_TAG_LEN;

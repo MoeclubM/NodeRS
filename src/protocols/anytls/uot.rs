@@ -6,11 +6,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, 
 use tokio::net::UdpSocket;
 
 use crate::accounting::SessionControl;
-
-use super::routing::RoutingTable;
-use super::socksaddr::SocksAddr;
-use super::traffic::TrafficRecorder;
-use super::transport;
+use crate::protocols::shared::{
+    routing::RoutingTable, socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
+};
 
 pub const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 pub const LEGACY_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";

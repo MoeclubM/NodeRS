@@ -131,7 +131,7 @@ pub struct NodeConfigResponse {
     #[serde(
         default,
         alias = "zeroRttHandshake",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub zero_rtt_handshake: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
@@ -160,13 +160,13 @@ pub struct NodeConfigResponse {
     #[serde(
         default,
         alias = "globalPadding",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub global_padding: bool,
     #[serde(
         default,
         alias = "authenticatedLength",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub authenticated_length: bool,
     #[serde(default)]
@@ -178,7 +178,7 @@ pub struct NodeConfigResponse {
     #[serde(
         default,
         alias = "ignoreClientBandwidth",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub ignore_client_bandwidth: bool,
     #[serde(default)]
@@ -192,7 +192,7 @@ pub struct NodeConfigResponse {
     #[serde(
         default,
         alias = "udpOverStream",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub udp_over_stream: bool,
     #[serde(
@@ -223,13 +223,7 @@ pub struct NodeConfigResponse {
 
 impl NodeConfigResponse {
     pub fn tls_mode(&self) -> i64 {
-        value_to_i64(self.tls.as_ref()).unwrap_or_else(|| {
-            if json_value_enabled(self.tls.as_ref()) {
-                1
-            } else {
-                0
-            }
-        })
+        self.tls.as_ref().and_then(tls_mode_from_value).unwrap_or(0)
     }
 
     pub fn multiplex_enabled(&self) -> bool {
@@ -249,6 +243,9 @@ impl NodeConfigResponse {
         }
         if !reality.server_name.trim().is_empty() {
             settings.server_name = reality.server_name.clone();
+        }
+        if !reality.server_names.is_empty() {
+            settings.server_names = reality.server_names.clone();
         }
         if reality.server_port != 0 {
             settings.server_port = reality.server_port;
@@ -280,8 +277,14 @@ pub struct NodeTlsSettings {
     pub server_name: String,
     #[serde(
         default,
+        alias = "serverNames",
+        deserialize_with = "deserialize_string_list_on_null"
+    )]
+    pub server_names: Vec<String>,
+    #[serde(
+        default,
         alias = "allowInsecure",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub allow_insecure: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
@@ -325,7 +328,7 @@ pub struct NodeRealitySettings {
     #[serde(
         default,
         alias = "allowInsecure",
-        deserialize_with = "deserialize_default_on_null"
+        deserialize_with = "deserialize_bool_from_any_on_null"
     )]
     pub allow_insecure: bool,
     #[serde(
@@ -334,6 +337,12 @@ pub struct NodeRealitySettings {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub server_name: String,
+    #[serde(
+        default,
+        alias = "serverNames",
+        deserialize_with = "deserialize_string_list_on_null"
+    )]
+    pub server_names: Vec<String>,
     #[serde(
         default,
         alias = "serverPort",
@@ -370,7 +379,7 @@ pub struct NodeRealitySettings {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeEchSettings {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_from_any_on_null")]
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub config: String,
@@ -409,11 +418,15 @@ impl NodeEchSettings {
 
 impl NodeTlsSettings {
     pub fn is_configured(&self) -> bool {
-        !self.server_name.trim().is_empty() || self.allow_insecure || self.ech.is_enabled()
+        !self.server_name.trim().is_empty()
+            || !self.server_names.is_empty()
+            || self.allow_insecure
+            || self.ech.is_enabled()
     }
 
     pub fn has_reality_key_material(&self) -> bool {
-        !self.public_key.trim().is_empty()
+        self.server_port != 0
+            || !self.public_key.trim().is_empty()
             || !self.private_key.trim().is_empty()
             || !self.short_id.trim().is_empty()
             || !self.short_ids.is_empty()
@@ -423,6 +436,7 @@ impl NodeTlsSettings {
         NodeRealitySettings {
             allow_insecure: self.allow_insecure,
             server_name: self.server_name.clone(),
+            server_names: self.server_names.clone(),
             server_port: self.server_port,
             public_key: self.public_key.clone(),
             private_key: self.private_key.clone(),
@@ -436,6 +450,7 @@ impl NodeRealitySettings {
     pub fn is_configured(&self) -> bool {
         self.allow_insecure
             || !self.server_name.trim().is_empty()
+            || !self.server_names.is_empty()
             || self.server_port != 0
             || !self.public_key.trim().is_empty()
             || !self.private_key.trim().is_empty()
@@ -1355,7 +1370,7 @@ pub struct HandshakeResponse {
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct HandshakeWebSocket {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_from_any_on_null")]
     pub enabled: bool,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub ws_url: String,
@@ -1653,32 +1668,97 @@ fn value_to_i64(value: Option<&serde_json::Value>) -> Option<i64> {
         serde_json::Value::Number(number) => number
             .as_i64()
             .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
-        serde_json::Value::String(text) => text.parse().ok(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
         _ => None,
     }
 }
 
-fn json_value_enabled(value: Option<&serde_json::Value>) -> bool {
+fn tls_mode_from_value(value: &serde_json::Value) -> Option<i64> {
     match value {
-        None | Some(serde_json::Value::Null) => false,
-        Some(serde_json::Value::Bool(value)) => *value,
-        Some(serde_json::Value::Number(number)) => {
+        serde_json::Value::Null => Some(0),
+        serde_json::Value::Bool(value) => Some(i64::from(*value)),
+        serde_json::Value::Number(_) => value_to_i64(Some(value)),
+        serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "no" | "none" | "disabled" => Some(0),
+            "1" | "true" | "on" | "yes" | "tls" | "xtls" | "enabled" => Some(1),
+            "2" | "reality" => Some(2),
+            _ => text.trim().parse().ok(),
+        },
+        serde_json::Value::Array(items) => Some(i64::from(items.iter().any(json_value_is_enabled))),
+        serde_json::Value::Object(object) => {
+            if object
+                .get("enabled")
+                .is_some_and(|value| !json_value_is_enabled(value))
+            {
+                return Some(0);
+            }
+            for key in ["mode", "type", "security", "tls"] {
+                if let Some(mode) = object.get(key).and_then(tls_mode_from_value) {
+                    return Some(mode);
+                }
+            }
+            Some(i64::from(json_value_is_enabled(value)))
+        }
+    }
+}
+
+pub(crate) fn value_to_bool(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Null => Some(false),
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::Number(_) => value_to_i64(Some(value)).map(|value| value != 0),
+        serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "no" | "none" | "disabled" => Some(false),
+            "1" | "true" | "on" | "yes" | "enabled" => Some(true),
+            _ => None,
+        },
+        serde_json::Value::Array(items) => Some(items.iter().any(json_value_is_enabled)),
+        serde_json::Value::Object(_) => Some(json_value_is_enabled(value)),
+    }
+}
+
+pub(crate) fn json_value_is_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(number) => {
             number.as_i64().is_some_and(|value| value != 0)
                 || number.as_u64().is_some_and(|value| value != 0)
                 || number.as_f64().is_some_and(|value| value != 0.0)
         }
-        Some(serde_json::Value::String(text)) => {
+        serde_json::Value::String(text) => {
             let normalized = text.trim().to_ascii_lowercase();
             !matches!(
                 normalized.as_str(),
                 "" | "0" | "false" | "off" | "no" | "none" | "disabled"
             )
         }
-        Some(serde_json::Value::Array(items)) => !items.is_empty(),
-        Some(serde_json::Value::Object(object)) => object
-            .get("enabled")
-            .map(|value| json_value_enabled(Some(value)))
-            .unwrap_or(!object.is_empty()),
+        serde_json::Value::Array(items) => items.iter().any(json_value_is_enabled),
+        serde_json::Value::Object(object) => {
+            if object.is_empty() {
+                return false;
+            }
+            if let Some(enabled) = object.get("enabled") {
+                return json_value_is_enabled(enabled);
+            }
+            object.values().any(json_value_is_enabled)
+        }
+    }
+}
+
+fn json_value_enabled(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(json_value_is_enabled)
+}
+
+pub(crate) fn deserialize_bool_from_any_on_null<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        Some(value) => value_to_bool(&value).ok_or_else(|| {
+            serde::de::Error::custom(format!("expected bool-like value, got {value}"))
+        }),
+        None => Ok(false),
     }
 }
 
@@ -2487,6 +2567,50 @@ mod tests {
 
         assert_eq!(enabled.tls_mode(), 1);
         assert!(enabled.multiplex_enabled());
+
+        let reality: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": "reality"
+        }))
+        .expect("parse reality string tls mode");
+        assert_eq!(reality.tls_mode(), 2);
+
+        let object_reality: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": {
+                "type": "reality"
+            }
+        }))
+        .expect("parse reality object tls mode");
+        assert_eq!(object_reality.tls_mode(), 2);
+    }
+
+    #[test]
+    fn parses_bool_like_panel_values() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vmess",
+            "server_port": 443,
+            "globalPadding": 1,
+            "authenticatedLength": "true",
+            "ignoreClientBandwidth": "yes",
+            "udpOverStream": "0",
+            "tls_settings": {
+                "allow_insecure": "true",
+                "ech": {
+                    "enabled": 1
+                }
+            }
+        }))
+        .expect("parse bool-like values");
+
+        assert!(config.global_padding);
+        assert!(config.authenticated_length);
+        assert!(config.ignore_client_bandwidth);
+        assert!(!config.udp_over_stream);
+        assert!(config.tls_settings.allow_insecure);
+        assert!(config.tls_settings.ech.enabled);
     }
 
     #[test]
@@ -2556,6 +2680,35 @@ mod tests {
         assert_eq!(reality.server_port, 7443);
         assert_eq!(reality.public_key, "reality-pub");
         assert_eq!(reality.short_id, "beef");
+    }
+
+    #[test]
+    fn parses_reality_server_names_aliases() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls": 2,
+            "tlsSettings": {
+                "serverNames": "tls-a.example.com,tls-b.example.com",
+                "publicKey": "tls-pub"
+            },
+            "realitySettings": {
+                "serverNames": ["reality-a.example.com", "reality-b.example.com"],
+                "publicKey": "reality-pub"
+            }
+        }))
+        .expect("parse serverNames aliases");
+
+        let reality = config.effective_reality_settings();
+        assert_eq!(
+            reality.server_names,
+            vec![
+                "reality-a.example.com".to_string(),
+                "reality-b.example.com".to_string()
+            ]
+        );
+        assert!(config.tls_settings.is_configured());
+        assert!(reality.is_configured());
     }
 
     #[test]

@@ -737,82 +737,102 @@ fn apply_network_settings(
     config: &mut XhttpConfig,
     object: &serde_json::Map<String, Value>,
 ) -> anyhow::Result<()> {
-    if let Some(path) = object.get("path").and_then(Value::as_str) {
+    if let Some(path) = setting_str(object, &["path"]) {
         config.path = normalize_path(path.trim());
     }
     if object.contains_key("host") {
         config.hosts = parse_hosts(object.get("host"))?;
     }
-    if let Some(mode) = object.get("mode").and_then(Value::as_str) {
+    if let Some(mode) = setting_str(object, &["mode"]) {
         config.mode = normalize_mode(mode)?;
     }
-    if let Some(placement) = object.get("sessionPlacement").and_then(Value::as_str) {
+    if let Some(placement) = setting_str(object, &["sessionPlacement", "session_placement"]) {
         config.session_placement = Placement::parse(placement, "sessionPlacement")?;
     }
-    if let Some(key) = object.get("sessionKey").and_then(Value::as_str) {
+    if let Some(key) = setting_str(object, &["sessionKey", "session_key"]) {
         config.session_key = key.trim().to_string();
     }
-    if let Some(placement) = object.get("seqPlacement").and_then(Value::as_str) {
+    if let Some(placement) = setting_str(object, &["seqPlacement", "seq_placement"]) {
         config.seq_placement = Placement::parse(placement, "seqPlacement")?;
     }
-    if let Some(key) = object.get("seqKey").and_then(Value::as_str) {
+    if let Some(key) = setting_str(object, &["seqKey", "seq_key"]) {
         config.seq_key = key.trim().to_string();
     }
-    if let Some(method) = object.get("uplinkHTTPMethod").and_then(Value::as_str) {
+    if let Some(method) = setting_str(object, &["uplinkHTTPMethod", "uplink_http_method"]) {
         config.uplink_http_method = normalize_method(method);
     }
-    if let Some(placement) = object.get("uplinkDataPlacement").and_then(Value::as_str) {
+    if let Some(placement) = setting_str(object, &["uplinkDataPlacement", "uplink_data_placement"])
+    {
         config.uplink_data_placement = UplinkDataPlacement::parse(placement)?;
     }
-    if let Some(key) = object.get("uplinkDataKey").and_then(Value::as_str) {
+    if let Some(key) = setting_str(object, &["uplinkDataKey", "uplink_data_key"]) {
         config.uplink_data_key = key.trim().to_string();
     }
     if let Some(headers) = object.get("headers") {
         config.headers = parse_headers(headers)?;
     }
-    if let Some(value) = object.get("xPaddingBytes") {
+    if let Some(value) = setting_value(object, &["xPaddingBytes", "x_padding_bytes"]) {
         config.x_padding_bytes = parse_non_negative_range(value, "xPaddingBytes")?;
     }
-    if let Some(value) = object.get("xPaddingObfsMode").and_then(Value::as_bool) {
+    if let Some(value) = setting_bool(object, &["xPaddingObfsMode", "x_padding_obfs_mode"]) {
         config.x_padding_obfs_mode = value;
     }
-    if let Some(value) = object.get("xPaddingKey").and_then(Value::as_str) {
+    if let Some(value) = setting_str(object, &["xPaddingKey", "x_padding_key"]) {
         config.x_padding_key = value.trim().to_string();
     }
-    if let Some(value) = object.get("xPaddingHeader").and_then(Value::as_str) {
+    if let Some(value) = setting_str(object, &["xPaddingHeader", "x_padding_header"]) {
         config.x_padding_header = value.trim().to_string();
     }
-    if let Some(value) = object.get("xPaddingPlacement").and_then(Value::as_str) {
+    if let Some(value) = setting_str(object, &["xPaddingPlacement", "x_padding_placement"]) {
         config.x_padding_placement = XPaddingPlacement::parse(value)?;
     }
-    if let Some(value) = object.get("xPaddingMethod").and_then(Value::as_str) {
+    if let Some(value) = setting_str(object, &["xPaddingMethod", "x_padding_method"]) {
         config.x_padding_method = XPaddingMethod::parse(value)?;
     }
-    if let Some(no_sse_header) = object.get("noSSEHeader").and_then(Value::as_bool) {
+    if let Some(no_sse_header) = setting_bool(object, &["noSSEHeader", "no_sse_header"]) {
         config.no_sse_header = no_sse_header;
     }
-    if let Some(limit) = object.get("scMaxEachPostBytes") {
+    if let Some(limit) = setting_value(object, &["scMaxEachPostBytes", "sc_max_each_post_bytes"]) {
         let limit = parse_positive_range_upper(limit, "scMaxEachPostBytes")?;
         if limit > 0 {
             config.sc_max_each_post_bytes = limit;
         }
     }
-    if let Some(limit) = object.get("scMaxBufferedPosts") {
+    if let Some(limit) = setting_value(object, &["scMaxBufferedPosts", "sc_max_buffered_posts"]) {
         let limit = parse_non_negative_usize(limit, "scMaxBufferedPosts")?;
         if limit > 0 {
             config.sc_max_buffered_posts = limit;
         }
     }
-    if let Some(value) = object.get("scStreamUpServerSecs") {
+    if let Some(value) = setting_value(
+        object,
+        &["scStreamUpServerSecs", "sc_stream_up_server_secs"],
+    ) {
         config.sc_stream_up_server_secs = parse_non_negative_range(value, "scStreamUpServerSecs")?;
     }
-    if let Some(limit) = object.get("serverMaxHeaderBytes") {
+    if let Some(limit) = setting_value(object, &["serverMaxHeaderBytes", "server_max_header_bytes"])
+    {
         let limit = parse_non_negative_usize(limit, "serverMaxHeaderBytes")?;
         if limit > 0 {
             config.server_max_header_bytes = limit;
         }
     }
     Ok(())
+}
+
+fn setting_value<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn setting_str<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    setting_value(object, keys).and_then(Value::as_str)
+}
+
+fn setting_bool(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    setting_value(object, keys).and_then(crate::panel::value_to_bool)
 }
 
 pub(super) async fn accept<S>(
@@ -2884,6 +2904,52 @@ mod tests {
         assert_eq!(config.x_padding_placement, XPaddingPlacement::Cookie);
         assert_eq!(config.x_padding_method, XPaddingMethod::Tokenish);
         assert_eq!(config.server_max_header_bytes, 4096);
+    }
+
+    #[test]
+    fn parses_snake_case_network_settings_aliases() {
+        let config = XhttpConfig::from_network_settings(Some(&serde_json::json!({
+            "path": "edge",
+            "mode": "packet-up",
+            "session_placement": "header",
+            "session_key": "X-Sid",
+            "seq_placement": "query",
+            "seq_key": "seq",
+            "uplink_http_method": "GET",
+            "uplink_data_placement": "header",
+            "uplink_data_key": "data",
+            "x_padding_bytes": "4-8",
+            "x_padding_obfs_mode": "true",
+            "x_padding_key": "pad",
+            "x_padding_header": "X-Pad",
+            "x_padding_placement": "header",
+            "x_padding_method": "repeat-x",
+            "no_sse_header": 1,
+            "sc_max_each_post_bytes": 64,
+            "sc_max_buffered_posts": 3,
+            "sc_stream_up_server_secs": "1-2",
+            "server_max_header_bytes": 2048
+        })))
+        .expect("parse snake case config");
+
+        assert_eq!(config.session_placement, Placement::Header);
+        assert_eq!(config.session_key, "X-Sid");
+        assert_eq!(config.seq_placement, Placement::Query);
+        assert_eq!(config.seq_key, "seq");
+        assert_eq!(config.uplink_http_method, "GET");
+        assert_eq!(config.uplink_data_placement, UplinkDataPlacement::Header);
+        assert_eq!(config.uplink_data_key, "data");
+        assert_eq!(config.x_padding_bytes, Range { min: 4, max: 8 });
+        assert!(config.x_padding_obfs_mode);
+        assert_eq!(config.x_padding_key, "pad");
+        assert_eq!(config.x_padding_header, "X-Pad");
+        assert_eq!(config.x_padding_placement, XPaddingPlacement::Header);
+        assert_eq!(config.x_padding_method, XPaddingMethod::RepeatX);
+        assert!(config.no_sse_header);
+        assert_eq!(config.sc_max_each_post_bytes, 64);
+        assert_eq!(config.sc_max_buffered_posts, 3);
+        assert_eq!(config.sc_stream_up_server_secs, Range { min: 1, max: 2 });
+        assert_eq!(config.server_max_header_bytes, 2048);
     }
 
     #[test]

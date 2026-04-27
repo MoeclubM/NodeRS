@@ -19,12 +19,11 @@ use tracing::{debug, warn};
 
 use super::activity::{ActivityTracker, HEARTBEAT_INTERVAL, SESSION_IDLE_TIMEOUT};
 use super::padding::PaddingScheme;
-use super::routing::RoutingTable;
-use super::socksaddr::SocksAddr;
-use super::traffic::TrafficRecorder;
-use super::transport;
 use super::uot;
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
+use crate::protocols::shared::{
+    routing::RoutingTable, socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
+};
 use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
@@ -669,15 +668,15 @@ async fn handle_stream(
         return result;
     }
 
-    let mut remote = transport::connect_tcp_destination(&destination, &context.routing)
+    let remote = transport::connect_tcp_destination(&destination, &context.routing)
         .await
         .with_context(|| format!("connect remote destination {destination}"));
 
     let result = async {
-        match remote.as_mut() {
-            Ok(stream) => {
+        match remote {
+            Ok(mut stream) => {
                 let mut prefetched_download = prefetch_remote_download_with_grace(
-                    stream,
+                    &stream,
                     if has_pending_upload {
                         std::time::Duration::ZERO
                     } else {
@@ -715,7 +714,7 @@ async fn handle_stream(
                 };
                 handle_tcp_stream(
                     app_side,
-                    stream,
+                    &mut stream,
                     prefetched_download,
                     initial_download_bytes,
                     tcp_context,
@@ -806,7 +805,6 @@ async fn prefetch_remote_download_with_grace(
 
 #[cfg(test)]
 mod tests {
-    use super::super::traffic::TrafficRecorder;
     use super::channel::{
         ChannelReader, InboundMessage, PayloadBuffer, PayloadPool, bounded_inbound_channel,
         test_chunk,
@@ -825,6 +823,7 @@ mod tests {
         read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
+    use crate::protocols::shared::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
     use std::io::IoSlice;
     use std::pin::Pin;

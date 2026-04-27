@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::accounting::Accounting;
 use crate::panel::{NodeConfigResponse, PanelUser};
 
-use super::anytls::{self, effective_listen_ip};
+use super::shared::{self, effective_listen_ip};
 
 const DEFAULT_HYSTERIA_BINARY: &str = "hysteria";
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,7 +30,7 @@ const STATS_HTTP_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
-    pub tls: anytls::EffectiveTlsConfig,
+    pub tls: shared::EffectiveTlsConfig,
     pub auth_mode: AuthMode,
     pub up_mbps: Option<u64>,
     pub down_mbps: Option<u64>,
@@ -250,7 +250,7 @@ struct HysteriaMasqueradeStringConfigFile {
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
-        let tls = anytls::EffectiveTlsConfig::from_remote(remote)?;
+        let tls = shared::EffectiveTlsConfig::from_remote(remote)?;
         let up_mbps = value_to_optional_u64(remote.up_mbps.as_ref())?;
         let down_mbps = value_to_optional_u64(remote.down_mbps.as_ref())?;
         let udp_idle_timeout = if remote.heartbeat.trim().is_empty() {
@@ -963,6 +963,9 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if remote.tls_mode() == 2 {
         bail!("Xboard tls mode 2 is not supported by NodeRS Hysteria2 controller yet");
     }
+    if remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material() {
+        bail!("REALITY settings are not supported for Hysteria2 nodes");
+    }
     if remote.multiplex_enabled() {
         bail!("Xboard multiplex is not supported by NodeRS Hysteria2 controller");
     }
@@ -1012,9 +1015,7 @@ fn hysteria2_version_supported(value: Option<&serde_json::Value>) -> bool {
 fn is_absent_or_empty_object(value: Option<&serde_json::Value>) -> bool {
     match value {
         None | Some(serde_json::Value::Null) => true,
-        Some(serde_json::Value::Object(object)) => object.is_empty(),
-        Some(serde_json::Value::Bool(false)) => true,
-        _ => false,
+        Some(value) => !crate::panel::json_value_is_enabled(value),
     }
 }
 
@@ -1323,7 +1324,7 @@ struct TlsPaths {
 }
 
 async fn ensure_tls_materials(
-    tls: &anytls::EffectiveTlsConfig,
+    tls: &shared::EffectiveTlsConfig,
     state_dir: &Path,
 ) -> anyhow::Result<TlsPaths> {
     let tls_dir = state_dir.join("tls");
@@ -1331,14 +1332,14 @@ async fn ensure_tls_materials(
         .await
         .with_context(|| format!("create Hysteria2 TLS directory {}", tls_dir.display()))?;
     match &tls.source {
-        anytls::tls::TlsMaterialSource::Files {
+        shared::tls::TlsMaterialSource::Files {
             cert_path,
             key_path,
         } => Ok(TlsPaths {
             cert_path: absolute_path(cert_path).await?,
             key_path: absolute_path(key_path).await?,
         }),
-        anytls::tls::TlsMaterialSource::Inline { cert_pem, key_pem } => {
+        shared::tls::TlsMaterialSource::Inline { cert_pem, key_pem } => {
             let cert_path = tls_dir.join("fullchain.pem");
             let key_path = tls_dir.join("privkey.pem");
             write_atomic(&cert_path, cert_pem).await?;
@@ -1348,19 +1349,19 @@ async fn ensure_tls_materials(
                 key_path,
             })
         }
-        anytls::tls::TlsMaterialSource::SelfSigned { .. }
-        | anytls::tls::TlsMaterialSource::Acme { .. } => {
+        shared::tls::TlsMaterialSource::SelfSigned { .. }
+        | shared::tls::TlsMaterialSource::Acme { .. } => {
             let cert_path = tls_dir.join("fullchain.pem");
             let key_path = tls_dir.join("privkey.pem");
             match &tls.source {
-                anytls::tls::TlsMaterialSource::SelfSigned { subject_alt_names } => {
+                shared::tls::TlsMaterialSource::SelfSigned { subject_alt_names } => {
                     let generated = rcgen::generate_simple_self_signed(subject_alt_names.clone())
                         .context("generate Hysteria2 self-signed certificate")?;
                     write_atomic(&cert_path, generated.cert.pem().as_bytes()).await?;
                     write_atomic(&key_path, generated.signing_key.serialize_pem().as_bytes())
                         .await?;
                 }
-                anytls::tls::TlsMaterialSource::Acme {
+                shared::tls::TlsMaterialSource::Acme {
                     cert_path: source_cert_path,
                     key_path: source_key_path,
                     config,
@@ -1665,7 +1666,7 @@ mod tests {
         let config = EffectiveNodeConfig {
             listen_ip: "0.0.0.0".to_string(),
             server_port: 443,
-            tls: anytls::EffectiveTlsConfig::from_remote(&base_remote()).expect("tls config"),
+            tls: shared::EffectiveTlsConfig::from_remote(&base_remote()).expect("tls config"),
             auth_mode: AuthMode::Http,
             up_mbps: Some(100),
             down_mbps: Some(200),

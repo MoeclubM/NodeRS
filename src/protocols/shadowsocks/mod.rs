@@ -17,7 +17,7 @@ use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser};
 
 use self::crypto::{Method, UserCredential, decode_udp_packet, encode_udp_packet};
-use super::anytls::{
+use super::shared::{
     bind_listeners, bind_udp_sockets, configure_tcp_stream, effective_listen_ip, routing,
     socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
 };
@@ -860,6 +860,14 @@ fn parse_networks(network: &str) -> anyhow::Result<EnabledNetworks> {
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
+    if remote.tls.is_some()
+        || remote.tls_settings.is_configured()
+        || remote.tls_settings.has_reality_key_material()
+        || remote.reality_settings.is_configured()
+        || remote.cert_config.is_some()
+    {
+        bail!("Xboard tls/reality settings are not supported for Shadowsocks nodes");
+    }
     if remote
         .network_settings
         .as_ref()
@@ -915,27 +923,7 @@ fn network_settings_enabled(value: &Value) -> bool {
 }
 
 fn value_enabled(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(number) => {
-            number.as_i64().is_some_and(|value| value != 0)
-                || number.as_u64().is_some_and(|value| value != 0)
-                || number.as_f64().is_some_and(|value| value != 0.0)
-        }
-        Value::String(text) => {
-            let normalized = text.trim().to_ascii_lowercase();
-            !matches!(
-                normalized.as_str(),
-                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
-            )
-        }
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(object) => object
-            .get("enabled")
-            .map(value_enabled)
-            .unwrap_or(!object.is_empty()),
-    }
+    crate::panel::json_value_is_enabled(value)
 }
 
 fn normalize_option_key(key: &str) -> String {

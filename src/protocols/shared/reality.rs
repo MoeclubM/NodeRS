@@ -13,7 +13,7 @@ use sha2::{Sha256, Sha512};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealityTlsConfig {
-    pub server_name: String,
+    pub server_names: Vec<String>,
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
 }
@@ -103,9 +103,9 @@ fn derive_auth_key(
         .servername(NameType::HOST_NAME)
         .context("REALITY ClientHello missing SNI")?;
     ensure!(
-        server_name == config.server_name,
-        "REALITY ClientHello SNI {server_name} does not match {}",
-        config.server_name
+        server_name_allowed(config, server_name),
+        "REALITY ClientHello SNI {server_name} does not match configured server_names {}",
+        config.server_names.join(",")
     );
 
     let random = client_hello.random();
@@ -163,6 +163,13 @@ fn derive_auth_key(
     );
 
     Ok(auth_key)
+}
+
+fn server_name_allowed(config: &RealityTlsConfig, server_name: &str) -> bool {
+    config
+        .server_names
+        .iter()
+        .any(|expected| expected == server_name)
 }
 
 fn derive_shared_key(private_key: [u8; 32], peer_public_key: &[u8]) -> anyhow::Result<[u8; 32]> {
@@ -312,6 +319,18 @@ mod tests {
 
         let public_key = parse_peer_public_key(&key_share).expect("public key");
         assert_eq!(public_key, [5u8; 32].as_slice());
+    }
+
+    #[test]
+    fn reality_server_name_matching_is_exact() {
+        let config = RealityTlsConfig {
+            server_names: vec!["Example.com".to_string()],
+            private_key: [0u8; 32],
+            short_ids: vec![[0u8; 8]],
+        };
+
+        assert!(server_name_allowed(&config, "Example.com"));
+        assert!(!server_name_allowed(&config, "example.com"));
     }
 
     #[test]

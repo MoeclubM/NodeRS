@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::accounting::SessionControl;
 use crate::panel::PanelUser;
-use crate::protocols::anytls::socksaddr::SocksAddr;
+use crate::protocols::shared::socksaddr::SocksAddr;
 
 use super::crypto::{
     Aead2022Method, UserCredential, address_wire_len, parse_socks_addr, random_bytes,

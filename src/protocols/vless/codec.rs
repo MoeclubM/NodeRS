@@ -2,7 +2,7 @@ use anyhow::{Context, bail, ensure};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::protocols::anytls::socksaddr::SocksAddr;
+use crate::protocols::shared::socksaddr::SocksAddr;
 
 pub const VERSION: u8 = 0x00;
 const ADDONS_LEN_NONE: u8 = 0x00;

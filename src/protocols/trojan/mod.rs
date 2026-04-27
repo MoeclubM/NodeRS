@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser};
 
-use super::anytls::{
+use super::shared::{
     EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing,
     socksaddr::SocksAddr, tls, traffic::TrafficRecorder, transport,
 };
@@ -74,7 +74,10 @@ pub struct FallbackConfig {
 struct FallbackTarget {
     #[serde(default)]
     server: String,
-    #[serde(deserialize_with = "crate::panel::deserialize_u16_from_number_or_string")]
+    #[serde(
+        alias = "serverPort",
+        deserialize_with = "crate::panel::deserialize_u16_from_number_or_string"
+    )]
     server_port: u16,
     #[serde(default)]
     xver: u8,
@@ -1173,10 +1176,13 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             remote.tls_mode()
         );
     }
+    if remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material() {
+        anyhow::bail!("REALITY settings are not supported for Trojan nodes");
+    }
     if remote
         .network_settings
         .as_ref()
-        .is_some_and(json_value_effectively_enabled)
+        .is_some_and(crate::panel::json_value_is_enabled)
     {
         anyhow::bail!("Xboard networkSettings is not supported by NodeRS Trojan server yet");
     }
@@ -1190,39 +1196,22 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
 }
 
 fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
-    let Some(object) = value.as_object() else {
-        bail!("Xboard transport must be an object when provided");
+    if !crate::panel::json_value_is_enabled(value) {
+        return Ok(());
+    }
+    let transport_type = match value {
+        serde_json::Value::String(text) => text.trim(),
+        serde_json::Value::Object(object) => object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default(),
+        _ => bail!("Xboard transport must be a string or object when provided"),
     };
-    let transport_type = object
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
     if transport_type.is_empty() || transport_type.eq_ignore_ascii_case("tcp") {
         return Ok(());
     }
     bail!("Xboard transport is not supported by NodeRS Trojan server yet")
-}
-
-fn json_value_effectively_enabled(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::Bool(value) => *value,
-        serde_json::Value::Number(number) => {
-            number.as_i64().is_some_and(|value| value != 0)
-                || number.as_u64().is_some_and(|value| value != 0)
-                || number.as_f64().is_some_and(|value| value != 0.0)
-        }
-        serde_json::Value::String(text) => {
-            let normalized = text.trim().to_ascii_lowercase();
-            !matches!(
-                normalized.as_str(),
-                "" | "0" | "false" | "off" | "no" | "none" | "disabled"
-            )
-        }
-        serde_json::Value::Array(items) => items.iter().any(json_value_effectively_enabled),
-        serde_json::Value::Object(object) => object.values().any(json_value_effectively_enabled),
-    }
 }
 
 fn detect_http_path(first_packet: &[u8]) -> Option<String> {
@@ -1602,6 +1591,14 @@ mod tests {
 
         assert_eq!(target.server, "127.0.0.1");
         assert_eq!(target.server_port, 8080);
+
+        let target = parse_fallback_target(&serde_json::json!({
+            "server": "127.0.0.1",
+            "serverPort": "8081"
+        }))
+        .expect("parse fallback camel port");
+
+        assert_eq!(target.server_port, 8081);
     }
 
     #[test]
@@ -1830,6 +1827,13 @@ mod tests {
         };
 
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 443);
+
+        let remote = NodeConfigResponse {
+            transport: Some(serde_json::json!("tcp")),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("string tcp transport");
         assert_eq!(config.server_port, 443);
     }
 
