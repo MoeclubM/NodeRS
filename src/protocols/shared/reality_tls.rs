@@ -57,6 +57,7 @@ pub struct RealityTlsProfile {
 pub struct RealityTlsStream {
     local_addr: SocketAddr,
     server_name: String,
+    selected_alpn_protocol: Option<Vec<u8>>,
     reader: DuplexStream,
     writer: DuplexStream,
     read_task: JoinHandle<anyhow::Result<()>>,
@@ -97,11 +98,11 @@ impl RealityTlsStream {
     }
 
     pub fn selected_alpn_protocol(&self) -> Option<&[u8]> {
-        None
+        self.selected_alpn_protocol.as_deref()
     }
 
     pub fn fallback_alpn_protocol(&self) -> Option<&[u8]> {
-        None
+        self.selected_alpn_protocol()
     }
 }
 
@@ -150,6 +151,8 @@ pub async fn accept(
     authenticated: &AuthenticatedClientHello,
     cert_state: &RealityCertificateState,
     profile: RealityTlsProfile,
+    observed_server_hello: Option<&super::reality::ObservedServerHello>,
+    server_alpn_protocols: &[Vec<u8>],
     handshake_timeout: Duration,
 ) -> Result<RealityTlsStream, RealityTlsAcceptError> {
     let prepared = (|| -> anyhow::Result<_> {
@@ -157,20 +160,28 @@ pub async fn accept(
         let server_share =
             ServerKeyShare::generate(profile.key_share_group, &client_details.key_shares)
                 .context("generate REALITY server key share")?;
+        let selected_alpn_protocol =
+            select_alpn_protocol(server_alpn_protocols, &client_details.alpn_protocols)
+                .context("select REALITY ALPN protocol")?;
         let certificate_der = build_server_certificate(cert_state, &authenticated.auth_key)
             .context("build REALITY certificate")?
             .to_der()
             .context("encode REALITY certificate")?;
 
-        let server_hello = build_server_hello(
-            client_details.session_id.as_slice(),
-            profile.cipher_suite,
-            profile.key_share_group,
-            server_share.server_share(),
-        )
-        .context("build REALITY ServerHello")?;
-        let encrypted_extensions =
-            build_encrypted_extensions().context("build REALITY EncryptedExtensions")?;
+        let server_hello = match observed_server_hello {
+            Some(server_hello) => server_hello
+                .rewrite_key_share(server_share.server_share())
+                .context("rewrite observed REALITY ServerHello")?,
+            None => build_server_hello(
+                client_details.session_id.as_slice(),
+                profile.cipher_suite,
+                profile.key_share_group,
+                server_share.server_share(),
+            )
+            .context("build REALITY ServerHello")?,
+        };
+        let encrypted_extensions = build_encrypted_extensions(selected_alpn_protocol.as_deref())
+            .context("build REALITY EncryptedExtensions")?;
         let certificate =
             build_certificate_message(&certificate_der).context("build REALITY Certificate")?;
 
@@ -221,6 +232,7 @@ pub async fn accept(
         Ok((
             suite,
             server_hello,
+            selected_alpn_protocol,
             encrypted_extensions,
             certificate,
             certificate_verify,
@@ -237,6 +249,7 @@ pub async fn accept(
     let (
         suite,
         server_hello,
+        selected_alpn_protocol,
         encrypted_extensions,
         certificate,
         certificate_verify,
@@ -358,6 +371,7 @@ pub async fn accept(
         stream,
         local_addr,
         authenticated.server_name.clone(),
+        selected_alpn_protocol,
         reader_cipher,
         writer_cipher,
     ))
@@ -367,6 +381,7 @@ fn spawn_reality_stream(
     stream: TcpStream,
     local_addr: SocketAddr,
     server_name: String,
+    selected_alpn_protocol: Option<Vec<u8>>,
     reader_cipher: RecordCipher,
     writer_cipher: RecordCipher,
 ) -> RealityTlsStream {
@@ -385,6 +400,7 @@ fn spawn_reality_stream(
     RealityTlsStream {
         local_addr,
         server_name,
+        selected_alpn_protocol,
         reader,
         writer,
         read_task,
@@ -720,13 +736,64 @@ fn build_certificate_message(certificate_der: &[u8]) -> anyhow::Result<Vec<u8>> 
     build_handshake_message(TLS_HANDSHAKE_TYPE_CERTIFICATE, &body)
 }
 
-fn build_encrypted_extensions() -> anyhow::Result<Vec<u8>> {
-    let body = [0u8, 0u8];
-    let mut handshake = Vec::with_capacity(6);
+fn build_encrypted_extensions(selected_alpn_protocol: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    let mut extensions = Vec::new();
+    if let Some(protocol) = selected_alpn_protocol {
+        ensure!(
+            !protocol.is_empty(),
+            "REALITY selected ALPN protocol cannot be empty"
+        );
+        ensure!(
+            protocol.len() <= u8::MAX as usize,
+            "REALITY selected ALPN protocol is too long"
+        );
+
+        let mut alpn = Vec::with_capacity(5 + protocol.len());
+        alpn.extend_from_slice(&((protocol.len() + 1) as u16).to_be_bytes());
+        alpn.push(protocol.len() as u8);
+        alpn.extend_from_slice(protocol);
+        extensions.extend_from_slice(&16u16.to_be_bytes());
+        extensions.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&alpn);
+    }
+
+    let mut body = Vec::with_capacity(2 + extensions.len());
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::with_capacity(4 + body.len());
     handshake.push(TLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS);
     handshake.extend_from_slice(&encode_u24(body.len())?);
     handshake.extend_from_slice(&body);
     Ok(handshake)
+}
+
+fn select_alpn_protocol(
+    server_protocols: &[Vec<u8>],
+    client_protocols: &[Vec<u8>],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if server_protocols.is_empty() || client_protocols.is_empty() {
+        return Ok(None);
+    }
+    for server_protocol in server_protocols {
+        ensure!(
+            !server_protocol.is_empty(),
+            "REALITY configured ALPN protocol cannot be empty"
+        );
+        if client_protocols
+            .iter()
+            .any(|client| client == server_protocol)
+        {
+            return Ok(Some(server_protocol.clone()));
+        }
+    }
+    anyhow::bail!(
+        "REALITY client requested unsupported application protocols {:?}",
+        client_protocols
+            .iter()
+            .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
+            .collect::<Vec<_>>()
+    )
 }
 
 fn build_server_hello(
@@ -1474,11 +1541,47 @@ mod tests {
 
     #[test]
     fn builds_empty_encrypted_extensions_for_reality() {
-        let encrypted_extensions = build_encrypted_extensions().expect("encrypted extensions");
+        let encrypted_extensions = build_encrypted_extensions(None).expect("encrypted extensions");
         assert_eq!(
             encrypted_extensions,
             [TLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, 0, 0, 2, 0, 0]
         );
+    }
+
+    #[test]
+    fn builds_alpn_encrypted_extensions_for_reality() {
+        let encrypted_extensions =
+            build_encrypted_extensions(Some(b"h2")).expect("encrypted extensions");
+        assert_eq!(
+            encrypted_extensions,
+            [
+                TLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS,
+                0,
+                0,
+                11,
+                0,
+                9,
+                0,
+                16,
+                0,
+                5,
+                0,
+                3,
+                2,
+                b'h',
+                b'2',
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_first_matching_alpn_protocol() {
+        let selected = select_alpn_protocol(
+            &[b"h2".to_vec(), b"http/1.1".to_vec()],
+            &[b"http/1.1".to_vec(), b"h2".to_vec()],
+        )
+        .expect("select alpn");
+        assert_eq!(selected, Some(b"h2".to_vec()));
     }
 
     #[test]

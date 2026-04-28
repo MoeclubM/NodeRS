@@ -121,6 +121,7 @@ impl AsyncWrite for TlsStream {
 struct RealityServerState {
     config: tls::RealityTlsConfig,
     cert_state: Arc<super::shared::reality::RealityCertificateState>,
+    alpn_protocols: Vec<Vec<u8>>,
 }
 
 struct ObservedRealityTarget {
@@ -607,6 +608,8 @@ impl ServerController {
                     super::shared::reality::build_certificate_state()
                         .context("build VLESS REALITY certificate state")?,
                 ),
+                alpn_protocols: tls::parse_alpn_protocols(&tls.alpn)
+                    .context("parse VLESS REALITY ALPN protocols")?,
             }),
             None => None,
         };
@@ -668,7 +671,12 @@ async fn accept_loop(
                     Ok(Some(stream)) => stream,
                     Ok(None) => return,
                     Err(error) => {
-                        warn!(%error, %source, "VLESS REALITY handshake failed");
+                        warn!(
+                            error = %error,
+                            error_chain = %format_args!("{error:#}"),
+                            %source,
+                            "VLESS REALITY handshake failed"
+                        );
                         return;
                     }
                 }
@@ -837,6 +845,8 @@ async fn accept_reality_tls(
             cipher_suite: handshake_profile.cipher_suite,
             key_share_group: handshake_profile.key_share_group,
         },
+        Some(&observed_target.server_hello),
+        &reality.alpn_protocols,
         TLS_HANDSHAKE_TIMEOUT,
     )
     .await
@@ -848,12 +858,19 @@ async fn accept_reality_tls(
             if !sent_server_flight {
                 warn!(
                     error = %error,
+                    error_chain = %format_args!("{error:#}"),
                     %source,
                     "VLESS REALITY TLS handshake failed before server flight; forwarding to target"
                 );
                 proxy_observed_reality_fallback(stream, observed_target, Vec::new()).await?;
                 return Ok(None);
             }
+            warn!(
+                error = %error,
+                error_chain = %format_args!("{error:#}"),
+                %source,
+                "VLESS REALITY TLS handshake failed after server flight"
+            );
             return Err(error.context("VLESS REALITY TLS handshake failed after server flight"));
         }
     };
