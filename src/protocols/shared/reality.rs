@@ -67,6 +67,8 @@ pub struct ObservedServerHello {
     pub prefix: Vec<u8>,
     pub cipher_suite: u16,
     pub key_share_group: u16,
+    handshake: Vec<u8>,
+    key_share_range: (usize, usize),
 }
 
 impl ObservedServerHello {
@@ -77,6 +79,25 @@ impl ObservedServerHello {
             0x11ec => Some("X25519MLKEM768"),
             _ => None,
         }
+    }
+
+    pub fn rewrite_key_share(&self, server_share: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let (start, end) = self.key_share_range;
+        ensure!(
+            end >= start,
+            "REALITY observed ServerHello key_share range is invalid"
+        );
+        ensure!(
+            end <= self.handshake.len(),
+            "REALITY observed ServerHello key_share range exceeds handshake"
+        );
+        ensure!(
+            end - start == server_share.len(),
+            "REALITY observed ServerHello key_share length mismatch"
+        );
+        let mut handshake = self.handshake.clone();
+        handshake[start..end].copy_from_slice(server_share);
+        Ok(handshake)
     }
 }
 
@@ -420,6 +441,7 @@ fn parse_server_hello(prefix: Vec<u8>, raw: &[u8]) -> anyhow::Result<ObservedSer
 
     let mut supports_tls13 = false;
     let mut key_share_group = None;
+    let mut key_share_range = None;
     while offset < extensions_end {
         let extension_type = read_be_u16(raw, offset, "REALITY target ServerHello extension type")?;
         let extension_len = read_be_u16(
@@ -440,7 +462,9 @@ fn parse_server_hello(prefix: Vec<u8>, raw: &[u8]) -> anyhow::Result<ObservedSer
                 supports_tls13 = parse_server_supported_versions_extension(data)?;
             }
             51 => {
-                key_share_group = Some(parse_server_key_share_extension(data)?);
+                let (group, range) = parse_server_key_share_extension(data, data_start)?;
+                key_share_group = Some(group);
+                key_share_range = Some(range);
             }
             _ => {}
         }
@@ -457,6 +481,8 @@ fn parse_server_hello(prefix: Vec<u8>, raw: &[u8]) -> anyhow::Result<ObservedSer
         prefix,
         cipher_suite,
         key_share_group: key_share_group.context("REALITY target ServerHello missing key_share")?,
+        handshake: raw.to_vec(),
+        key_share_range: key_share_range.context("REALITY target ServerHello missing key_share")?,
     })
 }
 
@@ -731,7 +757,10 @@ fn parse_server_supported_versions_extension(bytes: &[u8]) -> anyhow::Result<boo
     Ok(bytes == [0x03, 0x04])
 }
 
-fn parse_server_key_share_extension(bytes: &[u8]) -> anyhow::Result<u16> {
+fn parse_server_key_share_extension(
+    bytes: &[u8],
+    payload_offset: usize,
+) -> anyhow::Result<(u16, (usize, usize))> {
     let group = read_be_u16(bytes, 0, "REALITY target key_share group")?;
     let key_len = read_be_u16(bytes, 2, "REALITY target key_share length")? as usize;
     ensure!(
@@ -739,7 +768,7 @@ fn parse_server_key_share_extension(bytes: &[u8]) -> anyhow::Result<u16> {
         "REALITY target key_share length does not match payload"
     );
     ensure!(key_len > 0, "REALITY target key_share cannot be empty");
-    Ok(group)
+    Ok((group, (payload_offset + 4, payload_offset + 4 + key_len)))
 }
 
 fn server_name_allowed(config: &RealityTlsConfig, server_name: &str) -> bool {
@@ -1062,6 +1091,8 @@ mod tests {
                 prefix: Vec::new(),
                 cipher_suite: 0x1301,
                 key_share_group: 0x6399,
+                handshake: Vec::new(),
+                key_share_range: (0, 0),
             }
             .curves_list(),
             Some("X25519Kyber768Draft00")
@@ -1071,10 +1102,29 @@ mod tests {
                 prefix: Vec::new(),
                 cipher_suite: 0x1301,
                 key_share_group: 0x11ec,
+                handshake: Vec::new(),
+                key_share_range: (0, 0),
             }
             .curves_list(),
             Some("X25519MLKEM768")
         );
+    }
+
+    #[test]
+    fn rewrites_observed_server_hello_key_share_in_place() {
+        let handshake = build_test_server_hello(0x1301, 29);
+        let observed = parse_server_hello(Vec::new(), &handshake).expect("parse server hello");
+
+        let rewritten = observed
+            .rewrite_key_share(&[0x99; 32])
+            .expect("rewrite server hello key share");
+
+        assert_eq!(rewritten.len(), handshake.len());
+        assert_eq!(
+            rewritten[..rewritten.len() - 32],
+            handshake[..handshake.len() - 32]
+        );
+        assert_eq!(rewritten[rewritten.len() - 32..], [0x99; 32]);
     }
 
     #[test]
@@ -1387,6 +1437,7 @@ mod tests {
         let mut payload = Vec::new();
         let key_share = match group {
             29 => vec![0x44; 32],
+            0x6399 => vec![0x33; 32 + 1088],
             0x11ec => vec![0x33; 32 + 1088],
             _ => vec![0x22; 32],
         };
