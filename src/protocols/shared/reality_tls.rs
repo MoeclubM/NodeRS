@@ -7,6 +7,7 @@ use boring::rand::rand_bytes;
 use boring::sign::Signer;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384};
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -485,6 +486,9 @@ async fn pump_outbound(
     mut control: UnboundedReceiver<OutboundControl>,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; TLS_MAX_PLAINTEXT_LEN];
+    let mut record = Vec::with_capacity(
+        TLS_RECORD_HEADER_LEN + TLS_MAX_PLAINTEXT_LEN + 1 + cipher.suite.tag_len(),
+    );
     let mut control_closed = false;
     loop {
         tokio::select! {
@@ -505,23 +509,62 @@ async fn pump_outbound(
                 }
             }
             read = source.read(&mut buffer) => {
-                let read = read.context("read REALITY plaintext from pipe")?;
+                let mut read = read.context("read REALITY plaintext from pipe")?;
                 if read == 0 {
                     send_close_notify(&mut stream, &mut cipher).await.ok();
                     stream.shutdown().await.ok();
                     return Ok(());
                 }
-                let record = cipher
-                    .encrypt_record(TLS_CONTENT_TYPE_APPLICATION_DATA, &buffer[..read])
+                let mut source_closed = false;
+                while read < TLS_MAX_PLAINTEXT_LEN {
+                    match try_read_available(&mut source, &mut buffer[read..])
+                        .await
+                        .context("coalesce REALITY plaintext from pipe")?
+                    {
+                        Some(0) => {
+                            source_closed = true;
+                            break;
+                        }
+                        Some(available) => {
+                            read += available;
+                        }
+                        None => break,
+                    }
+                }
+                cipher
+                    .encrypt_record_into(
+                        TLS_CONTENT_TYPE_APPLICATION_DATA,
+                        &buffer[..read],
+                        &mut record,
+                    )
                     .context("encrypt REALITY application record")?;
                 stream
                     .write_all(&record)
                     .await
                     .context("write REALITY application record")?;
-                stream.flush().await.ok();
+                if source_closed {
+                    send_close_notify(&mut stream, &mut cipher).await.ok();
+                    stream.shutdown().await.ok();
+                    return Ok(());
+                }
             }
         }
     }
+}
+
+async fn try_read_available<R>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<Option<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buffer);
+        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(Some(read_buf.filled().len()))),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Ready(Ok(None)),
+        }
+    })
+    .await
 }
 
 fn handle_post_handshake_message(
@@ -937,26 +980,40 @@ impl RecordCipher {
         inner_content_type: u8,
         plaintext: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        let mut record =
+            Vec::with_capacity(TLS_RECORD_HEADER_LEN + plaintext.len() + 1 + self.suite.tag_len());
+        self.encrypt_record_into(inner_content_type, plaintext, &mut record)?;
+        Ok(record)
+    }
+
+    fn encrypt_record_into(
+        &mut self,
+        inner_content_type: u8,
+        plaintext: &[u8],
+        record: &mut Vec<u8>,
+    ) -> anyhow::Result<()> {
         ensure!(
-            plaintext.len() < TLS_MAX_PLAINTEXT_LEN,
+            plaintext.len() <= TLS_MAX_PLAINTEXT_LEN,
             "REALITY plaintext chunk exceeds TLS record limit"
         );
-        let mut inner = Vec::with_capacity(plaintext.len() + 1);
-        inner.extend_from_slice(plaintext);
-        inner.push(inner_content_type);
-        let mut tag = vec![0u8; self.suite.tag_len()];
-        let header = build_encrypted_record_header(inner.len() + tag.len())?;
+        record.clear();
+        record.extend_from_slice(plaintext);
+        record.push(inner_content_type);
+        let mut tag = [0u8; 16];
+        let header = build_encrypted_record_header(record.len() + self.suite.tag_len())?;
         let nonce = build_nonce(self.iv, self.sequence);
         let written_tag = self
             .context
-            .seal_in_place(&nonce, &mut inner, &mut tag, &header)
+            .seal_in_place(&nonce, record, &mut tag, &header)
             .context("seal REALITY TLS record")?;
         self.sequence += 1;
 
-        let mut record = header;
-        record.extend_from_slice(&inner);
+        let payload_len = record.len() + written_tag.len();
         record.extend_from_slice(written_tag);
-        Ok(record)
+        record.resize(payload_len + TLS_RECORD_HEADER_LEN, 0);
+        record.copy_within(0..payload_len, TLS_RECORD_HEADER_LEN);
+        record[..TLS_RECORD_HEADER_LEN].copy_from_slice(&header);
+        Ok(())
     }
 
     fn decrypt_record(
@@ -1006,16 +1063,20 @@ impl RecordCipher {
     }
 }
 
-fn build_encrypted_record_header(payload_len: usize) -> anyhow::Result<Vec<u8>> {
+fn build_encrypted_record_header(
+    payload_len: usize,
+) -> anyhow::Result<[u8; TLS_RECORD_HEADER_LEN]> {
     ensure!(
         payload_len <= u16::MAX as usize,
         "REALITY encrypted record is too large"
     );
-    let mut header = Vec::with_capacity(TLS_RECORD_HEADER_LEN);
-    header.push(TLS_CONTENT_TYPE_APPLICATION_DATA);
-    header.extend_from_slice(&0x0303u16.to_be_bytes());
-    header.extend_from_slice(&(payload_len as u16).to_be_bytes());
-    Ok(header)
+    Ok([
+        TLS_CONTENT_TYPE_APPLICATION_DATA,
+        0x03,
+        0x03,
+        ((payload_len >> 8) & 0xff) as u8,
+        (payload_len & 0xff) as u8,
+    ])
 }
 
 fn build_nonce(iv: [u8; 12], sequence: u64) -> [u8; 12] {
@@ -1533,6 +1594,24 @@ mod tests {
             .expect("decrypt");
         assert_eq!(decrypted.content_type, TLS_CONTENT_TYPE_APPLICATION_DATA);
         assert_eq!(decrypted.payload, b"hello");
+    }
+
+    #[test]
+    fn encrypts_tls13_application_record_at_plaintext_limit() {
+        let suite = CipherSuite::from_id(0x1301).expect("suite");
+        let secret = vec![0x11; 32];
+        let mut writer = RecordCipher::new(suite, &secret).expect("writer");
+        let mut reader = RecordCipher::new(suite, &secret).expect("reader");
+        let payload = vec![0x55; TLS_MAX_PLAINTEXT_LEN];
+
+        let record = writer
+            .encrypt_record(TLS_CONTENT_TYPE_APPLICATION_DATA, &payload)
+            .expect("encrypt");
+        let decrypted = reader
+            .decrypt_record(record[0], &record[TLS_RECORD_HEADER_LEN..])
+            .expect("decrypt");
+        assert_eq!(decrypted.content_type, TLS_CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(decrypted.payload, payload);
     }
 
     #[test]

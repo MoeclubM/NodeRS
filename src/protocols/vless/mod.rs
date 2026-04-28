@@ -805,8 +805,7 @@ async fn accept_reality_tls(
             }
         };
 
-    let observed_target = match observe_reality_target(&client_hello.prefix, reality, source).await
-    {
+    let observed_target = match observe_reality_target(&client_hello.prefix, reality).await {
         Ok(observed) => observed,
         Err(error) => {
             warn!(
@@ -901,7 +900,6 @@ fn reality_handshake_profile(
 async fn observe_reality_target(
     client_hello_prefix: &[u8],
     reality: &RealityServerState,
-    source: SocketAddr,
 ) -> anyhow::Result<ObservedRealityTarget> {
     let mut target = timeout(
         TLS_HANDSHAKE_TIMEOUT,
@@ -930,13 +928,6 @@ async fn observe_reality_target(
     )
     .await
     .map_err(|_| anyhow!("read REALITY target ServerHello timed out"))??;
-
-    info!(
-        %source,
-        cipher_suite = format_args!("0x{:04x}", observed.cipher_suite),
-        key_share_group = format_args!("0x{:04x}", observed.key_share_group),
-        "observed REALITY target TLS 1.3 ServerHello"
-    );
 
     Ok(ObservedRealityTarget {
         stream: target,
@@ -1026,7 +1017,10 @@ struct FallbackContext {
     first_packet: Vec<u8>,
 }
 
-async fn prefetch_first_packet(stream: &mut TlsStream) -> anyhow::Result<Vec<u8>> {
+async fn prefetch_first_packet<S>(stream: &mut S) -> anyhow::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buffer = vec![0u8; 8192];
     match tokio::time::timeout(REQUEST_HEADER_TIMEOUT, stream.read(&mut buffer)).await {
         Ok(Ok(0)) => Ok(Vec::new()),
@@ -1039,15 +1033,24 @@ async fn prefetch_first_packet(stream: &mut TlsStream) -> anyhow::Result<Vec<u8>
     }
 }
 
+async fn prefetch_prefixed_stream<S>(
+    mut stream: S,
+) -> anyhow::Result<(Vec<u8>, http1::PrefixedIo<S>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let first_packet = prefetch_first_packet(&mut stream).await?;
+    let replay = first_packet.clone();
+    Ok((first_packet, http1::PrefixedIo::new(stream, replay)))
+}
+
 async fn prepare_fallback_stream(
     stream: TlsStream,
-) -> anyhow::Result<(FallbackContext, TlsStream)> {
+) -> anyhow::Result<(FallbackContext, http1::PrefixedIo<TlsStream>)> {
     let local_addr = stream.fallback_local_addr()?;
     let server_name = stream.fallback_server_name().map(str::to_string);
     let alpn = stream.fallback_alpn_protocol().map(|value| value.to_vec());
-    let mut stream = stream;
-    let first_packet = prefetch_first_packet(&mut stream).await?;
-    let replay = first_packet.clone();
+    let (first_packet, stream) = prefetch_prefixed_stream(stream).await?;
     Ok((
         FallbackContext {
             local_addr,
@@ -1055,7 +1058,7 @@ async fn prepare_fallback_stream(
             alpn,
             first_packet,
         },
-        http1::PrefixedIo::new(stream, replay).into_inner(),
+        stream,
     ))
 }
 
@@ -1704,13 +1707,16 @@ where
     .await
 }
 
-async fn proxy_fallback(
-    stream: TlsStream,
+async fn proxy_fallback<S>(
+    stream: S,
     source: SocketAddr,
     local: SocketAddr,
     target: &FallbackTarget,
     consumed: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let fallback = TcpStream::connect((target.server.as_str(), target.server_port))
         .await
         .with_context(|| {
@@ -2721,6 +2727,43 @@ mod tests {
         assert_eq!(parsed.request.method, "GET");
         assert_eq!(parsed.request.path, "/x");
         assert_eq!(parsed.request.host, "example.com");
+    }
+
+    #[tokio::test]
+    async fn prefetched_vless_tcp_prefix_is_replayed_to_request_reader() {
+        let mut request = Vec::new();
+        request.push(codec::VERSION);
+        request.extend_from_slice(&[0x11; 16]);
+        request.push(0);
+        request.push(0x01);
+        request.extend_from_slice(&443u16.to_be_bytes());
+        request.push(0x02);
+        request.push(11);
+        request.extend_from_slice(b"example.com");
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let write = tokio::spawn(async move {
+            client
+                .write_all(&request)
+                .await
+                .expect("write VLESS request");
+        });
+
+        let (first_packet, mut stream) = prefetch_prefixed_stream(server)
+            .await
+            .expect("prepare prefixed stream");
+        let mut consumed = Vec::new();
+        let request = codec::read_request(&mut stream, &mut consumed)
+            .await
+            .expect("read replayed VLESS request");
+        write.await.expect("join write");
+
+        assert_eq!(first_packet, consumed);
+        assert_eq!(request.command, Command::Tcp);
+        assert_eq!(
+            request.destination,
+            SocksAddr::Domain("example.com".to_string(), 443)
+        );
     }
 
     #[test]
