@@ -1091,6 +1091,10 @@ impl HashKind {
         }
     }
 
+    fn zero_secret(self) -> Vec<u8> {
+        vec![0u8; self.output_len()]
+    }
+
     fn hkdf_extract(self, salt: Option<&[u8]>, ikm: &[u8]) -> Vec<u8> {
         match self {
             Self::Sha256 => hkdf_extract_sha256(salt, ikm),
@@ -1151,7 +1155,7 @@ impl Tls13KeySchedule {
     fn new(hash_kind: HashKind) -> Self {
         Self {
             hash_kind,
-            current_secret: hash_kind.hkdf_extract(None, &[]),
+            current_secret: hash_kind.hkdf_extract(None, &hash_kind.zero_secret()),
         }
     }
 
@@ -1176,7 +1180,9 @@ impl Tls13KeySchedule {
         let salt = self
             .derive_secret_for_empty_hash(b"derived")
             .expect("derive REALITY empty hash secret");
-        self.current_secret = self.hash_kind.hkdf_extract(Some(&salt), &[]);
+        self.current_secret = self
+            .hash_kind
+            .hkdf_extract(Some(&salt), &self.hash_kind.zero_secret());
     }
 
     fn derive_secret_for_empty_hash(&self, label: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -1487,6 +1493,30 @@ fn encode_u24(value: usize) -> anyhow::Result<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    fn parse_test_client_cipher_suites(handshake: &[u8]) -> Vec<u16> {
+        let mut offset = 4;
+        offset += 2;
+        offset += 32;
+        let session_id_len = handshake[offset] as usize;
+        offset += 1 + session_id_len;
+        let cipher_suites_len =
+            u16::from_be_bytes([handshake[offset], handshake[offset + 1]]) as usize;
+        offset += 2;
+        let cipher_suites_end = offset + cipher_suites_len;
+        let mut cipher_suites = Vec::new();
+        while offset < cipher_suites_end {
+            cipher_suites.push(u16::from_be_bytes([
+                handshake[offset],
+                handshake[offset + 1],
+            ]));
+            offset += 2;
+        }
+        cipher_suites
+    }
 
     #[test]
     fn encrypts_and_decrypts_tls13_application_record() {
@@ -1597,5 +1627,134 @@ mod tests {
             server_share.server_share.len(),
             TLS_MLKEM768_CIPHERTEXT_BYTES + 32
         );
+    }
+
+    #[test]
+    fn tls13_key_schedule_uses_hash_len_zero_secret_for_empty_input() {
+        let schedule = Tls13KeySchedule::new(HashKind::Sha256);
+        assert_eq!(
+            schedule.current_secret,
+            HashKind::Sha256.hkdf_extract(None, &vec![0u8; HashKind::Sha256.output_len()])
+        );
+        assert_ne!(
+            schedule.current_secret,
+            HashKind::Sha256.hkdf_extract(None, &[])
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_plain_tls13_client_without_observed_server_hello() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener address");
+        let cert_state = super::super::reality::build_certificate_state()
+            .expect("build REALITY certificate state");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let client_hello = super::super::reality::read_client_hello(&mut stream)
+                .await
+                .expect("read client hello");
+            let client_details = super::super::reality::client_hello_details(&client_hello)
+                .expect("parse client hello details");
+            let cipher_suite = parse_test_client_cipher_suites(&client_hello.handshake)
+                .into_iter()
+                .find(|suite| matches!(suite, 0x1301 | 0x1302 | 0x1303))
+                .expect("client did not offer a supported TLS 1.3 cipher suite");
+            let key_share_group = if client_details
+                .key_shares
+                .iter()
+                .any(|key_share| key_share.group == TLS_GROUP_X25519)
+            {
+                TLS_GROUP_X25519
+            } else if client_details
+                .key_shares
+                .iter()
+                .any(|key_share| key_share.group == TLS_GROUP_X25519_MLKEM768)
+            {
+                TLS_GROUP_X25519_MLKEM768
+            } else {
+                panic!("client did not offer a supported TLS 1.3 key share");
+            };
+            let authenticated = AuthenticatedClientHello {
+                server_name: "localhost".to_string(),
+                client_version: [0, 0, 0, 0],
+                client_time: 0,
+                short_id: [0; 8],
+                auth_key: [7; 32],
+            };
+            let mut tls_stream = match accept(
+                stream,
+                &client_hello,
+                &client_details,
+                &authenticated,
+                &cert_state,
+                RealityTlsProfile {
+                    cipher_suite,
+                    key_share_group,
+                },
+                None,
+                &[],
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                Ok(stream) => stream,
+                Err(error) => panic!("server handshake failed: {:#}", error.into_parts().1),
+            };
+            let mut buffer = [0u8; 4];
+            tls_stream
+                .read_exact(&mut buffer)
+                .await
+                .expect("read plaintext from client");
+            assert_eq!(&buffer, b"ping");
+            tls_stream
+                .write_all(b"pong")
+                .await
+                .expect("write plaintext to client");
+            tls_stream.flush().await.expect("flush plaintext to client");
+            let mut eof = [0u8; 1];
+            let read = tls_stream
+                .read(&mut eof)
+                .await
+                .expect("wait for client close");
+            assert_eq!(read, 0);
+        });
+
+        let client = tokio::spawn(async move {
+            let mut builder = SslConnector::builder(SslMethod::tls()).expect("build connector");
+            builder.set_verify(SslVerifyMode::NONE);
+            builder
+                .set_sigalgs_list("ed25519")
+                .expect("set client signature algorithms");
+            let config = builder
+                .build()
+                .configure()
+                .expect("configure connector")
+                .verify_hostname(false);
+            let stream = TcpStream::connect(addr).await.expect("connect server");
+            let mut tls_stream = tokio_boring::connect(config, "localhost", stream)
+                .await
+                .expect("complete TLS handshake");
+            tls_stream
+                .write_all(b"ping")
+                .await
+                .expect("write plaintext to server");
+            let mut buffer = [0u8; 4];
+            tls_stream
+                .read_exact(&mut buffer)
+                .await
+                .expect("read plaintext from server");
+            assert_eq!(&buffer, b"pong");
+            tls_stream.shutdown().await.expect("shutdown client stream");
+        });
+
+        timeout(Duration::from_secs(10), async {
+            server.await.expect("join server task");
+            client.await.expect("join client task");
+        })
+        .await
+        .expect("plain TLS interoperability test timed out");
     }
 }
