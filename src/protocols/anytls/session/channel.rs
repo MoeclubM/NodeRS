@@ -11,7 +11,6 @@ use super::frame::SMALL_DATA_FRAME_FLUSH_THRESHOLD;
 
 pub(super) enum InboundMessage {
     Data(BufferedChunk),
-    Fin,
 }
 
 #[derive(Debug)]
@@ -182,9 +181,7 @@ impl InboundSender {
         {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
-                let InboundMessage::Data(chunk) = message else {
-                    return Err(TrySendError::Closed);
-                };
+                let InboundMessage::Data(chunk) = message;
                 Err(TrySendError::Full(chunk.into_payload()))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Closed),
@@ -201,13 +198,6 @@ impl InboundSender {
             .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
             .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before data could be delivered"))
-    }
-
-    pub(super) async fn send_fin(&self) -> anyhow::Result<()> {
-        self.tx
-            .send(InboundMessage::Fin)
-            .await
-            .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
     }
 
     pub(super) fn available_send_budget(&self) -> usize {
@@ -511,7 +501,7 @@ impl AsyncRead for ChannelReader {
                     self.current = Some(chunk);
                     self.offset = 0;
                 }
-                Poll::Ready(Some(InboundMessage::Fin)) | Poll::Ready(None) => {
+                Poll::Ready(None) => {
                     self.finished = true;
                     return Poll::Ready(Ok(()));
                 }

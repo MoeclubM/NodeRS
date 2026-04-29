@@ -98,7 +98,7 @@ where
                     pending = Some(chunk);
                     continue;
                 }
-                Some(InboundMessage::Fin) | None => {
+                None => {
                     let _ = writer.shutdown().await;
                     return Ok(total);
                 }
@@ -168,10 +168,6 @@ fn fill_ready_upload_batch(
                     *pending = Some(chunk);
                     break;
                 }
-            }
-            Ok(InboundMessage::Fin) => {
-                *finished = true;
-                break;
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {

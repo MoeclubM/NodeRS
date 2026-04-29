@@ -25,12 +25,17 @@ const UDP_CHACHA_NONCE_LEN: usize = 24;
 const REQUEST_FIXED_HEADER_LEN: usize = 1 + 8 + 2;
 const HEADER_TYPE_CLIENT: u8 = 0;
 const HEADER_TYPE_SERVER: u8 = 1;
+const HEADER_TYPE_CLIENT_ENCRYPTED: u8 = 10;
+const HEADER_TYPE_SERVER_ENCRYPTED: u8 = 11;
+const TLS_RECORD_TYPE_APPLICATION_DATA: u8 = 23;
+const TLS_RECORD_HEADER_LEN: usize = 5;
 const TIMESTAMP_TOLERANCE_SECS: i64 = 30;
 const TCP_REPLAY_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub(crate) struct TcpResponseContext {
     pub(crate) request_salt: Vec<u8>,
+    encrypted_protocol: bool,
 }
 
 #[derive(Clone, Default)]
@@ -45,6 +50,7 @@ pub(crate) struct AcceptedTcpReader<R> {
     session_key: Vec<u8>,
     next_nonce: u64,
     plain_prefix: Vec<u8>,
+    encrypted_protocol: bool,
     response_context: TcpResponseContext,
 }
 
@@ -96,18 +102,14 @@ pub(crate) fn derive_user_psk(user: &PanelUser, method: Aead2022Method) -> anyho
     let key_len = method.key_len();
     let password = user.password.trim();
     if !password.is_empty() {
-        if let Ok(decoded) = STANDARD.decode(password) {
-            if decoded.len() >= key_len {
-                return Ok(normalize_psk(&decoded, key_len)?);
-            }
-        }
-
-        return Ok(fixed_length_raw_key(password.as_bytes(), key_len));
+        return decode_psk(password, key_len)
+            .with_context(|| format!("decode Shadowsocks 2022 user {} key", user.id));
     }
 
     let uuid = user.uuid.trim();
     if !uuid.is_empty() {
-        return Ok(fixed_length_raw_key(uuid.as_bytes(), key_len));
+        return decode_psk(uuid, key_len)
+            .with_context(|| format!("decode Shadowsocks 2022 user {} key", user.id));
     }
 
     bail!("Shadowsocks 2022 user {} is missing password/uuid", user.id)
@@ -121,8 +123,7 @@ pub(crate) fn identity_hash(psk: &[u8]) -> [u8; 16] {
 }
 
 fn has_identity_header(users: &[UserCredential], method: Aead2022Method) -> bool {
-    let _ = users;
-    !matches!(method, Aead2022Method::ChaCha20Poly1305)
+    users.len() > 1 && !matches!(method, Aead2022Method::ChaCha20Poly1305)
 }
 
 impl TcpReplayCache {
@@ -209,11 +210,11 @@ where
             "invalid Shadowsocks 2022 TCP fixed header length {}",
             fixed_plain.len()
         );
-        ensure!(
-            fixed_plain[0] == HEADER_TYPE_CLIENT,
-            "unexpected Shadowsocks 2022 TCP header type {}",
-            fixed_plain[0]
-        );
+        let encrypted_protocol = match fixed_plain[0] {
+            HEADER_TYPE_CLIENT => false,
+            HEADER_TYPE_CLIENT_ENCRYPTED => true,
+            other => bail!("unexpected Shadowsocks 2022 TCP header type {other}"),
+        };
         let timestamp = u64::from_be_bytes(fixed_plain[1..9].try_into().expect("timestamp slice"));
         validate_timestamp(timestamp)?;
         let variable_len =
@@ -264,8 +265,10 @@ where
             session_key,
             next_nonce: 2,
             plain_prefix,
+            encrypted_protocol,
             response_context: TcpResponseContext {
                 request_salt: salt.to_vec(),
+                encrypted_protocol,
             },
         })
     }
@@ -278,6 +281,11 @@ where
     where
         W: AsyncWrite + Unpin,
     {
+        if self.encrypted_protocol {
+            self.pump_encrypted_to_plain(&mut writer, control).await?;
+            return Ok(());
+        }
+
         if !self.plain_prefix.is_empty() {
             tokio::select! {
                 _ = control.cancelled() => return Ok(()),
@@ -286,50 +294,137 @@ where
         }
 
         loop {
-            let Some(length_ciphertext) = read_exact_or_eof(&mut self.inner, 2 + TAG_LEN).await?
-            else {
+            let chunk = tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                chunk = self.read_plain_chunk() => chunk?,
+            };
+            let Some(payload) = chunk else {
                 let _ = writer.shutdown().await;
                 return Ok(());
             };
-            let length_plain = decrypt_tcp_chunk(
-                self.method,
-                &self.session_key,
-                self.next_nonce,
-                &length_ciphertext,
-                "Shadowsocks 2022 TCP length chunk",
-            )?;
-            self.next_nonce += 1;
-            ensure!(
-                length_plain.len() == 2,
-                "invalid Shadowsocks 2022 TCP length chunk size {}",
-                length_plain.len()
-            );
-            let payload_len =
-                u16::from_be_bytes(length_plain[..2].try_into().expect("length bytes")) as usize;
-            ensure!(
-                payload_len <= MAX_TCP_CHUNK_LEN,
-                "Shadowsocks 2022 TCP payload length {payload_len} exceeds limit {MAX_TCP_CHUNK_LEN}"
-            );
-            let mut payload_ciphertext = vec![0u8; payload_len + TAG_LEN];
-            self.inner
-                .read_exact(&mut payload_ciphertext)
-                .await
-                .with_context(|| {
-                    format!("read Shadowsocks 2022 TCP payload chunk ({payload_len} bytes)")
-                })?;
-            let payload = decrypt_tcp_chunk(
-                self.method,
-                &self.session_key,
-                self.next_nonce,
-                &payload_ciphertext,
-                "Shadowsocks 2022 TCP payload chunk",
-            )?;
-            self.next_nonce += 1;
             if !payload.is_empty() {
                 tokio::select! {
                     _ = control.cancelled() => return Ok(()),
                     result = writer.write_all(&payload) => result.context("write decrypted Shadowsocks 2022 TCP payload")?,
                 }
+            }
+        }
+    }
+}
+
+impl<R> AcceptedTcpReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    async fn read_plain_chunk(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(length_ciphertext) = read_exact_or_eof(&mut self.inner, 2 + TAG_LEN).await? else {
+            return Ok(None);
+        };
+        let length_plain = decrypt_tcp_chunk(
+            self.method,
+            &self.session_key,
+            self.next_nonce,
+            &length_ciphertext,
+            "Shadowsocks 2022 TCP length chunk",
+        )?;
+        self.next_nonce += 1;
+        ensure!(
+            length_plain.len() == 2,
+            "invalid Shadowsocks 2022 TCP length chunk size {}",
+            length_plain.len()
+        );
+        let payload_len =
+            u16::from_be_bytes(length_plain[..2].try_into().expect("length bytes")) as usize;
+        ensure!(
+            payload_len <= MAX_TCP_CHUNK_LEN,
+            "Shadowsocks 2022 TCP payload length {payload_len} exceeds limit {MAX_TCP_CHUNK_LEN}"
+        );
+        let mut payload_ciphertext = vec![0u8; payload_len + TAG_LEN];
+        self.inner
+            .read_exact(&mut payload_ciphertext)
+            .await
+            .with_context(|| {
+                format!("read Shadowsocks 2022 TCP payload chunk ({payload_len} bytes)")
+            })?;
+        let payload = decrypt_tcp_chunk(
+            self.method,
+            &self.session_key,
+            self.next_nonce,
+            &payload_ciphertext,
+            "Shadowsocks 2022 TCP payload chunk",
+        )?;
+        self.next_nonce += 1;
+        Ok(Some(payload))
+    }
+
+    async fn pump_encrypted_to_plain<W>(
+        &mut self,
+        writer: &mut W,
+        control: Arc<SessionControl>,
+    ) -> anyhow::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if !self.plain_prefix.is_empty() {
+            tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                result = writer.write_all(&self.plain_prefix) => result.context("write decrypted Shadowsocks 2022 encrypted TCP prefix")?,
+            }
+            self.plain_prefix.clear();
+        }
+
+        loop {
+            let chunk = tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                chunk = self.read_plain_chunk() => chunk?,
+            };
+            let Some(record_header) = chunk else {
+                let _ = writer.shutdown().await;
+                return Ok(());
+            };
+            ensure!(
+                record_header.len() == TLS_RECORD_HEADER_LEN,
+                "invalid Shadowsocks 2022 encrypted TCP TLS record header length {}",
+                record_header.len()
+            );
+            let record_type = record_header[0];
+            let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+            tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                result = writer.write_all(&record_header) => result.context("write decrypted Shadowsocks 2022 encrypted TCP TLS record header")?,
+            }
+
+            if record_type == TLS_RECORD_TYPE_APPLICATION_DATA {
+                let mut raw_payload = vec![0u8; record_len];
+                tokio::select! {
+                    _ = control.cancelled() => return Ok(()),
+                    result = self.inner.read_exact(&mut raw_payload) => result.context("read Shadowsocks 2022 encrypted TCP raw TLS application payload")?,
+                };
+                tokio::select! {
+                    _ = control.cancelled() => return Ok(()),
+                    result = writer.write_all(&raw_payload) => result.context("write decrypted Shadowsocks 2022 encrypted TCP raw TLS application payload")?,
+                }
+                continue;
+            }
+
+            let chunk = tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                chunk = self.read_plain_chunk() => chunk?,
+            };
+            let Some(payload) = chunk else {
+                bail!(
+                    "unexpected EOF while reading Shadowsocks 2022 encrypted TCP TLS record body"
+                );
+            };
+            ensure!(
+                payload.len() == record_len,
+                "invalid Shadowsocks 2022 encrypted TCP TLS record body length {} expected {}",
+                payload.len(),
+                record_len
+            );
+            tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                result = writer.write_all(&payload) => result.context("write decrypted Shadowsocks 2022 encrypted TCP TLS record body")?,
             }
         }
     }
@@ -356,6 +451,20 @@ where
     let mut next_nonce = 0u64;
     let mut sent_header = false;
     let mut buffer = vec![0u8; MAX_TCP_CHUNK_LEN];
+
+    if response_context.encrypted_protocol {
+        return pump_plain_to_encrypted_tcp(
+            response_context,
+            method,
+            response_salt,
+            session_key,
+            next_nonce,
+            reader,
+            writer,
+            control,
+        )
+        .await;
+    }
 
     loop {
         let read = tokio::select! {
@@ -428,6 +537,166 @@ where
             result = writer.write_all(&payload_ciphertext) => result.context("write Shadowsocks 2022 TCP response payload chunk")?,
         }
     }
+}
+
+async fn pump_plain_to_encrypted_tcp<R, W>(
+    response_context: &TcpResponseContext,
+    method: Aead2022Method,
+    response_salt: Vec<u8>,
+    session_key: Vec<u8>,
+    mut next_nonce: u64,
+    mut reader: R,
+    mut writer: W,
+    control: Arc<SessionControl>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(mut record_header) = read_exact_or_eof(&mut reader, TLS_RECORD_HEADER_LEN).await?
+    else {
+        let _ = writer.shutdown().await;
+        return Ok(());
+    };
+
+    let mut fixed_plain = Vec::with_capacity(1 + 8 + response_context.request_salt.len() + 2);
+    fixed_plain.push(HEADER_TYPE_SERVER_ENCRYPTED);
+    fixed_plain.extend_from_slice(&(current_unix_time()? as u64).to_be_bytes());
+    fixed_plain.extend_from_slice(&response_context.request_salt);
+    fixed_plain.extend_from_slice(&0u16.to_be_bytes());
+
+    let mut output = Vec::with_capacity(response_salt.len() + fixed_plain.len() + TAG_LEN);
+    output.extend_from_slice(&response_salt);
+    output.extend_from_slice(&encrypt_tcp_chunk(
+        method,
+        &session_key,
+        next_nonce,
+        &fixed_plain,
+        "Shadowsocks 2022 encrypted TCP response fixed header",
+    )?);
+    next_nonce += 1;
+    tokio::select! {
+        _ = control.cancelled() => return Ok(()),
+        result = writer.write_all(&output) => result.context("write Shadowsocks 2022 encrypted TCP response header")?,
+    }
+
+    loop {
+        write_tls_record_to_encrypted_tcp(
+            method,
+            &session_key,
+            &mut next_nonce,
+            record_header,
+            &mut reader,
+            &mut writer,
+            &control,
+        )
+        .await?;
+
+        let next = tokio::select! {
+            _ = control.cancelled() => return Ok(()),
+            record_header = read_exact_or_eof(&mut reader, TLS_RECORD_HEADER_LEN) => record_header?,
+        };
+        let Some(next) = next else {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        };
+        record_header = next;
+    }
+}
+
+async fn write_tls_record_to_encrypted_tcp<R, W>(
+    method: Aead2022Method,
+    session_key: &[u8],
+    next_nonce: &mut u64,
+    record_header: Vec<u8>,
+    reader: &mut R,
+    writer: &mut W,
+    control: &Arc<SessionControl>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    ensure!(
+        record_header.len() == TLS_RECORD_HEADER_LEN,
+        "invalid Shadowsocks 2022 encrypted TCP TLS record header length {}",
+        record_header.len()
+    );
+    let record_type = record_header[0];
+    let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+    write_tcp_stream_chunk(
+        method,
+        session_key,
+        next_nonce,
+        &record_header,
+        writer,
+        control,
+        "Shadowsocks 2022 encrypted TCP TLS record header",
+    )
+    .await?;
+
+    let mut record_payload = vec![0u8; record_len];
+    tokio::select! {
+        _ = control.cancelled() => return Ok(()),
+        result = reader.read_exact(&mut record_payload) => result.context("read Shadowsocks 2022 encrypted TCP TLS record body")?,
+    };
+    if record_type == TLS_RECORD_TYPE_APPLICATION_DATA {
+        tokio::select! {
+            _ = control.cancelled() => return Ok(()),
+            result = writer.write_all(&record_payload) => result.context("write Shadowsocks 2022 encrypted TCP raw TLS application payload")?,
+        }
+    } else {
+        write_tcp_stream_chunk(
+            method,
+            session_key,
+            next_nonce,
+            &record_payload,
+            writer,
+            control,
+            "Shadowsocks 2022 encrypted TCP TLS record body",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn write_tcp_stream_chunk<W>(
+    method: Aead2022Method,
+    session_key: &[u8],
+    next_nonce: &mut u64,
+    payload: &[u8],
+    writer: &mut W,
+    control: &Arc<SessionControl>,
+    context: &str,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    ensure!(
+        payload.len() <= MAX_TCP_CHUNK_LEN,
+        "Shadowsocks 2022 TCP payload length {} exceeds limit {}",
+        payload.len(),
+        MAX_TCP_CHUNK_LEN
+    );
+    let length_ciphertext = encrypt_tcp_chunk(
+        method,
+        session_key,
+        *next_nonce,
+        &(payload.len() as u16).to_be_bytes(),
+        "Shadowsocks 2022 TCP length chunk",
+    )?;
+    *next_nonce += 1;
+    let payload_ciphertext = encrypt_tcp_chunk(method, session_key, *next_nonce, payload, context)?;
+    *next_nonce += 1;
+    tokio::select! {
+        _ = control.cancelled() => return Ok(()),
+        result = writer.write_all(&length_ciphertext) => result.context("write Shadowsocks 2022 TCP length chunk")?,
+    }
+    tokio::select! {
+        _ = control.cancelled() => return Ok(()),
+        result = writer.write_all(&payload_ciphertext) => result.with_context(|| format!("write {context}"))?,
+    }
+    Ok(())
 }
 
 pub(crate) fn identify_udp_request(
@@ -762,13 +1031,6 @@ fn identify_udp_request_chacha(
     })
 }
 
-fn fixed_length_raw_key(bytes: &[u8], key_len: usize) -> Vec<u8> {
-    let mut raw = vec![0u8; key_len];
-    let copy_len = bytes.len().min(key_len);
-    raw[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    raw
-}
-
 fn normalize_psk(value: &[u8], key_len: usize) -> anyhow::Result<Vec<u8>> {
     ensure!(
         value.len() >= key_len,
@@ -1083,22 +1345,21 @@ mod tests {
     use crate::protocols::shadowsocks::crypto::Method;
 
     fn sample_credential(method: Aead2022Method) -> UserCredential {
-        let secret = derive_user_psk(
-            &PanelUser {
-                id: 1,
-                password: "12345678-1234-1234-1234-123456789abc".to_string(),
-                uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
-                ..Default::default()
-            },
-            method,
-        )
-        .expect("user psk");
         let server_psk = match method {
             Aead2022Method::Aes128Gcm => "QUJDREVGR0hJSktMTU5PUA==",
             Aead2022Method::Aes256Gcm | Aead2022Method::ChaCha20Poly1305 => {
                 "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
             }
         };
+        let secret = derive_user_psk(
+            &PanelUser {
+                id: 1,
+                password: server_psk.to_string(),
+                ..Default::default()
+            },
+            method,
+        )
+        .expect("user psk");
         UserCredential {
             user: UserEntry {
                 id: 1,
@@ -1114,32 +1375,35 @@ mod tests {
     }
 
     #[test]
-    fn derives_user_key_from_uuid_prefix() {
+    fn derives_user_key_from_base64_uuid_when_password_is_missing() {
         let key = derive_user_psk(
             &PanelUser {
                 id: 1,
-                uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
+                uuid: "MTIzNDU2Nzg5MGFiY2RlZg==".to_string(),
                 ..Default::default()
             },
             Aead2022Method::Aes128Gcm,
         )
         .expect("key");
-        assert_eq!(key, b"12345678-1234-12");
+        assert_eq!(key, b"1234567890abcdef");
     }
 
     #[test]
-    fn derives_user_key_from_password_prefix_when_present() {
+    fn derives_user_key_from_base64_password_when_present() {
         let key = derive_user_psk(
             &PanelUser {
                 id: 1,
-                password: "password-based-key-material".to_string(),
-                uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
+                password: "cGFzc3dvcmQtYmFzZWQta2V5LW1hdGVyaWFs".to_string(),
+                uuid: "MTIzNDU2Nzg5MGFiY2RlZg==".to_string(),
                 ..Default::default()
             },
             Aead2022Method::Aes128Gcm,
         )
         .expect("key");
-        assert_eq!(key, b"password-based-k");
+        assert_eq!(
+            key,
+            Sha256::digest(b"password-based-key-material")[..16].to_vec()
+        );
     }
 
     #[test]
@@ -1157,22 +1421,227 @@ mod tests {
     }
 
     #[test]
-    fn treats_uuid_as_raw_material_instead_of_base64() {
-        let key = derive_user_psk(
+    fn rejects_non_base64_user_key() {
+        let error = derive_user_psk(
             &PanelUser {
                 id: 1,
-                uuid: "1234567890abcdef1234567890abcdef".to_string(),
+                uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
                 ..Default::default()
             },
             Aead2022Method::Aes128Gcm,
         )
-        .expect("key");
-        assert_eq!(key, b"1234567890abcdef");
+        .expect_err("raw uuid should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("decode Shadowsocks 2022 user 1 key")
+        );
     }
 
     #[test]
     fn accepts_large_tcp_chunk_lengths() {
         assert_eq!(MAX_TCP_CHUNK_LEN, u16::MAX as usize);
+    }
+
+    fn append_tcp_stream_chunk(
+        output: &mut Vec<u8>,
+        method: Aead2022Method,
+        session_key: &[u8],
+        next_nonce: &mut u64,
+        payload: &[u8],
+    ) {
+        output.extend_from_slice(
+            &encrypt_tcp_chunk(
+                method,
+                session_key,
+                *next_nonce,
+                &(payload.len() as u16).to_be_bytes(),
+                "encrypt length",
+            )
+            .expect("length"),
+        );
+        *next_nonce += 1;
+        output.extend_from_slice(
+            &encrypt_tcp_chunk(method, session_key, *next_nonce, payload, "encrypt payload")
+                .expect("payload"),
+        );
+        *next_nonce += 1;
+    }
+
+    #[test]
+    fn decodes_tcp_encrypted_protocol_extension() {
+        let credential = sample_credential(Aead2022Method::Aes128Gcm);
+        let request_salt = vec![7u8; credential.secret.len()];
+        let session_key =
+            session_subkey(&credential.secret, &request_salt, credential.secret.len());
+        let destination = SocksAddr::Domain("example.com".to_string(), 443);
+        let mut variable_plain = Vec::new();
+        write_socks_addr(&mut variable_plain, &destination).expect("addr");
+        variable_plain.extend_from_slice(&1u16.to_be_bytes());
+        variable_plain.push(0);
+        let fixed_plain = {
+            let mut bytes = Vec::new();
+            bytes.push(HEADER_TYPE_CLIENT_ENCRYPTED);
+            bytes.extend_from_slice(&(current_unix_time().expect("time") as u64).to_be_bytes());
+            bytes.extend_from_slice(&(variable_plain.len() as u16).to_be_bytes());
+            bytes
+        };
+        let mut request = request_salt.clone();
+        request.extend_from_slice(
+            &encrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
+                &session_key,
+                0,
+                &fixed_plain,
+                "encrypt fixed",
+            )
+            .expect("fixed"),
+        );
+        request.extend_from_slice(
+            &encrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
+                &session_key,
+                1,
+                &variable_plain,
+                "encrypt variable",
+            )
+            .expect("variable"),
+        );
+        let mut next_nonce = 2u64;
+        let handshake_header = [22, 3, 3, 0, 3];
+        append_tcp_stream_chunk(
+            &mut request,
+            Aead2022Method::Aes128Gcm,
+            &session_key,
+            &mut next_nonce,
+            &handshake_header,
+        );
+        append_tcp_stream_chunk(
+            &mut request,
+            Aead2022Method::Aes128Gcm,
+            &session_key,
+            &mut next_nonce,
+            b"abc",
+        );
+        let application_header = [23, 3, 3, 0, 5];
+        append_tcp_stream_chunk(
+            &mut request,
+            Aead2022Method::Aes128Gcm,
+            &session_key,
+            &mut next_nonce,
+            &application_header,
+        );
+        request.extend_from_slice(b"hello");
+
+        let replay = TcpReplayCache::default();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let accepted = AcceptedTcpReader::accept(
+                std::io::Cursor::new(request),
+                std::slice::from_ref(&credential),
+                &replay,
+            )
+            .await
+            .expect("accept");
+            let (mut plain_reader, plain_writer) = tokio::io::duplex(4096);
+            let pump = tokio::spawn(async move {
+                accepted
+                    .pump_to_plain(plain_writer, SessionControl::new())
+                    .await
+                    .expect("pump");
+            });
+            let mut output = Vec::new();
+            plain_reader
+                .read_to_end(&mut output)
+                .await
+                .expect("read output");
+            pump.await.expect("join pump");
+
+            let mut expected = Vec::new();
+            write_socks_addr(&mut expected, &destination).expect("addr");
+            expected.extend_from_slice(&handshake_header);
+            expected.extend_from_slice(b"abc");
+            expected.extend_from_slice(&application_header);
+            expected.extend_from_slice(b"hello");
+            assert_eq!(output, expected);
+        });
+    }
+
+    #[test]
+    fn encodes_tcp_encrypted_protocol_extension_response() {
+        let credential = sample_credential(Aead2022Method::Aes128Gcm);
+        let request_salt = vec![8u8; credential.secret.len()];
+        let response_context = TcpResponseContext {
+            request_salt: request_salt.clone(),
+            encrypted_protocol: true,
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let input = [b"\x17\x03\x03\x00\x05".as_slice(), b"hello".as_slice()].concat();
+            let (mut response_reader, response_writer) = tokio::io::duplex(4096);
+            let pump_credential = credential.clone();
+            let pump = tokio::spawn(async move {
+                pump_plain_to_tcp(
+                    &pump_credential,
+                    &response_context,
+                    std::io::Cursor::new(input),
+                    response_writer,
+                    SessionControl::new(),
+                )
+                .await
+                .expect("pump response");
+            });
+            let mut output = Vec::new();
+            response_reader
+                .read_to_end(&mut output)
+                .await
+                .expect("read response");
+            pump.await.expect("join response pump");
+
+            let key_len = Aead2022Method::Aes128Gcm.key_len();
+            let response_salt = &output[..key_len];
+            let session_key = session_subkey(&credential.secret, response_salt, key_len);
+            let fixed_len = 1 + 8 + key_len + 2;
+            let fixed_start = key_len;
+            let fixed_end = fixed_start + fixed_len + TAG_LEN;
+            let fixed_plain = decrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
+                &session_key,
+                0,
+                &output[fixed_start..fixed_end],
+                "decrypt fixed response",
+            )
+            .expect("fixed response");
+            assert_eq!(fixed_plain[0], HEADER_TYPE_SERVER_ENCRYPTED);
+            assert_eq!(&fixed_plain[9..9 + key_len], request_salt.as_slice());
+            assert_eq!(
+                u16::from_be_bytes([fixed_plain[9 + key_len], fixed_plain[10 + key_len]]),
+                0
+            );
+
+            let mut offset = fixed_end;
+            let length_plain = decrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
+                &session_key,
+                1,
+                &output[offset..offset + 2 + TAG_LEN],
+                "decrypt response length",
+            )
+            .expect("length");
+            assert_eq!(u16::from_be_bytes([length_plain[0], length_plain[1]]), 5);
+            offset += 2 + TAG_LEN;
+            let header_plain = decrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
+                &session_key,
+                2,
+                &output[offset..offset + 5 + TAG_LEN],
+                "decrypt response header",
+            )
+            .expect("header");
+            assert_eq!(header_plain, b"\x17\x03\x03\x00\x05");
+            offset += 5 + TAG_LEN;
+            assert_eq!(&output[offset..], b"hello");
+        });
     }
 
     #[test]
@@ -1298,6 +1767,63 @@ mod tests {
         request.extend_from_slice(
             &encrypt_tcp_chunk(
                 Aead2022Method::ChaCha20Poly1305,
+                &session_key,
+                1,
+                &variable_plain,
+                "encrypt variable",
+            )
+            .expect("variable"),
+        );
+
+        let replay = TcpReplayCache::default();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let accepted = runtime
+            .block_on(AcceptedTcpReader::accept(
+                std::io::Cursor::new(request),
+                std::slice::from_ref(&credential),
+                &replay,
+            ))
+            .expect("accept");
+        assert_eq!(accepted.credential().user.id, credential.user.id);
+    }
+
+    #[test]
+    fn aes_tcp_accept_uses_single_user_format_without_identity_header() {
+        let credential = sample_credential(Aead2022Method::Aes128Gcm);
+        let request_salt = vec![7u8; credential.secret.len()];
+        let session_key =
+            session_subkey(&credential.secret, &request_salt, credential.secret.len());
+
+        let mut variable_plain = Vec::new();
+        write_socks_addr(
+            &mut variable_plain,
+            &SocksAddr::Domain("example.com".to_string(), 443),
+        )
+        .expect("addr");
+        variable_plain.extend_from_slice(&0u16.to_be_bytes());
+        variable_plain.extend_from_slice(b"hello");
+        let fixed_plain = {
+            let mut bytes = Vec::new();
+            bytes.push(HEADER_TYPE_CLIENT);
+            bytes.extend_from_slice(&(current_unix_time().expect("time") as u64).to_be_bytes());
+            bytes.extend_from_slice(&(variable_plain.len() as u16).to_be_bytes());
+            bytes
+        };
+
+        let mut request = request_salt.clone();
+        request.extend_from_slice(
+            &encrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
+                &session_key,
+                0,
+                &fixed_plain,
+                "encrypt fixed",
+            )
+            .expect("fixed"),
+        );
+        request.extend_from_slice(
+            &encrypt_tcp_chunk(
+                Aead2022Method::Aes128Gcm,
                 &session_key,
                 1,
                 &variable_plain,

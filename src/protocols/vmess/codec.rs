@@ -18,6 +18,7 @@ const ADDRESS_IPV6: u8 = 0x03;
 pub enum Command {
     Tcp,
     Udp,
+    Mux,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,11 +106,14 @@ pub fn parse_request_header(header: &[u8]) -> anyhow::Result<Request> {
     let command = match header[37] {
         COMMAND_TCP => Command::Tcp,
         COMMAND_UDP => Command::Udp,
-        COMMAND_MUX => bail!("VMess mux is not supported"),
+        COMMAND_MUX => Command::Mux,
         other => bail!("unsupported VMess command: {other}"),
     };
-
-    let (destination, address_len) = parse_destination(&header[38..])?;
+    let (destination, address_len) = if command == Command::Mux {
+        (SocksAddr::Domain("v1.mux.cool".to_string(), 0), 0usize)
+    } else {
+        parse_destination(&header[38..])?
+    };
     let padding_start = 38 + address_len;
     ensure!(
         header.len() == padding_start + padding_len + 4,
@@ -196,23 +200,26 @@ mod tests {
         header.push(match command {
             Command::Tcp => COMMAND_TCP,
             Command::Udp => COMMAND_UDP,
+            Command::Mux => COMMAND_MUX,
         });
-        match destination {
-            SocksAddr::Ip(SocketAddr::V4(addr)) => {
-                header.extend_from_slice(&addr.port().to_be_bytes());
-                header.push(ADDRESS_IPV4);
-                header.extend_from_slice(&addr.ip().octets());
-            }
-            SocksAddr::Ip(SocketAddr::V6(addr)) => {
-                header.extend_from_slice(&addr.port().to_be_bytes());
-                header.push(ADDRESS_IPV6);
-                header.extend_from_slice(&addr.ip().octets());
-            }
-            SocksAddr::Domain(host, port) => {
-                header.extend_from_slice(&port.to_be_bytes());
-                header.push(ADDRESS_DOMAIN);
-                header.push(host.len() as u8);
-                header.extend_from_slice(host.as_bytes());
+        if command != Command::Mux {
+            match destination {
+                SocksAddr::Ip(SocketAddr::V4(addr)) => {
+                    header.extend_from_slice(&addr.port().to_be_bytes());
+                    header.push(ADDRESS_IPV4);
+                    header.extend_from_slice(&addr.ip().octets());
+                }
+                SocksAddr::Ip(SocketAddr::V6(addr)) => {
+                    header.extend_from_slice(&addr.port().to_be_bytes());
+                    header.push(ADDRESS_IPV6);
+                    header.extend_from_slice(&addr.ip().octets());
+                }
+                SocksAddr::Domain(host, port) => {
+                    header.extend_from_slice(&port.to_be_bytes());
+                    header.push(ADDRESS_DOMAIN);
+                    header.push(host.len() as u8);
+                    header.extend_from_slice(host.as_bytes());
+                }
             }
         }
         header.extend(std::iter::repeat_n(0xaa, padding_len));
@@ -267,5 +274,22 @@ mod tests {
         let last = header.len() - 1;
         header[last] ^= 0xff;
         assert!(parse_request_header(&header).is_err());
+    }
+
+    #[test]
+    fn parses_mux_command_without_destination() {
+        let header = build_header(
+            Command::Mux,
+            SecurityType::Aes128Gcm,
+            RequestOptions::new(0x01),
+            SocksAddr::Domain("ignored.example".to_string(), 443),
+            0,
+        );
+        let request = parse_request_header(&header).unwrap();
+        assert_eq!(request.command, Command::Mux);
+        assert_eq!(
+            request.destination,
+            SocksAddr::Domain("v1.mux.cool".to_string(), 0)
+        );
     }
 }

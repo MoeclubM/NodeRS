@@ -79,12 +79,13 @@ impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
         let method = parse_method(remote)?;
+        let networks = parse_networks(&remote.network, &method)?;
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
             method,
             server_key: remote.server_key.trim().to_string(),
-            networks: parse_networks(&remote.network)?,
+            networks,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
                 &remote.custom_outbounds,
@@ -775,6 +776,15 @@ fn build_users(
                 !matches!(kind, crypto::Aead2022Method::ChaCha20Poly1305) || users.len() <= 1,
                 "Shadowsocks 2022 chacha20-poly1305 does not support multi-user"
             );
+            if users.len() == 1 {
+                return Ok(vec![UserCredential {
+                    user: UserEntry::from_panel_user(&users[0]),
+                    method: method.clone(),
+                    identity_hash: aead2022::identity_hash(&server_secret),
+                    server_secret: server_secret.clone(),
+                    secret: server_secret,
+                }]);
+            }
             users
                 .iter()
                 .map(|user| {
@@ -829,12 +839,18 @@ fn parse_method(remote: &NodeConfigResponse) -> anyhow::Result<Method> {
     Ok(method)
 }
 
-fn parse_networks(network: &str) -> anyhow::Result<EnabledNetworks> {
+fn parse_networks(network: &str, method: &Method) -> anyhow::Result<EnabledNetworks> {
     let network = network.trim();
     if network.is_empty() {
+        if matches!(method, Method::Aead2022(_)) {
+            return Ok(EnabledNetworks {
+                tcp: true,
+                udp: true,
+            });
+        }
         return Ok(EnabledNetworks {
             tcp: true,
-            udp: true,
+            udp: false,
         });
     }
 
@@ -959,8 +975,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_both_networks() {
+    fn legacy_defaults_to_tcp_only() {
         let config = EffectiveNodeConfig::from_remote(&base_remote()).expect("config");
+        assert!(config.networks.tcp);
+        assert!(!config.networks.udp);
+    }
+
+    #[test]
+    fn shadowsocks_2022_defaults_to_both_networks() {
+        let remote = NodeConfigResponse {
+            cipher: "2022-blake3-aes-128-gcm".to_string(),
+            server_key: "QUJDREVGR0hJSktMTU5PUA==".to_string(),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert!(config.networks.tcp);
         assert!(config.networks.udp);
     }
@@ -1007,6 +1035,74 @@ mod tests {
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert!(matches!(config.method, Method::Aead2022(_)));
+    }
+
+    #[test]
+    fn shadowsocks_2022_single_user_uses_server_key() {
+        let users = build_users(
+            &Method::Aead2022(crypto::Aead2022Method::Aes128Gcm),
+            "QUJDREVGR0hJSktMTU5PUA==",
+            &[PanelUser {
+                id: 1,
+                password: "user-password".to_string(),
+                ..Default::default()
+            }],
+        )
+        .expect("users");
+
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].secret, b"ABCDEFGHIJKLMNOP");
+    }
+
+    #[test]
+    fn shadowsocks_2022_multi_user_decodes_base64_user_keys() {
+        let users = build_users(
+            &Method::Aead2022(crypto::Aead2022Method::Aes128Gcm),
+            "QUJDREVGR0hJSktMTU5PUA==",
+            &[
+                PanelUser {
+                    id: 1,
+                    password: "MTIzNDU2Nzg5MGFiY2RlZg==".to_string(),
+                    ..Default::default()
+                },
+                PanelUser {
+                    id: 2,
+                    password: "YWJjZGVmMTIzNDU2Nzg5MA==".to_string(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect("users");
+
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].secret, b"1234567890abcdef");
+        assert_eq!(users[1].secret, b"abcdef1234567890");
+    }
+
+    #[test]
+    fn rejects_shadowsocks_2022_multi_user_raw_key() {
+        let error = build_users(
+            &Method::Aead2022(crypto::Aead2022Method::Aes128Gcm),
+            "QUJDREVGR0hJSktMTU5PUA==",
+            &[
+                PanelUser {
+                    id: 1,
+                    password: "not-base64-key".to_string(),
+                    ..Default::default()
+                },
+                PanelUser {
+                    id: 2,
+                    password: "YWJjZGVmMTIzNDU2Nzg5MA==".to_string(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect_err("raw key should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("decode Shadowsocks 2022 user 1 key")
+        );
     }
 
     #[test]

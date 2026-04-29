@@ -1,6 +1,8 @@
 mod codec;
 mod crypto;
 
+use super::vless::mux;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -37,8 +39,11 @@ pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
     pub tls: Option<EffectiveTlsConfig>,
+    #[cfg(test)]
     pub security: SecurityType,
+    #[cfg(test)]
     pub global_padding: bool,
+    #[cfg(test)]
     pub authenticated_length: bool,
     pub routing: routing::RoutingTable,
 }
@@ -46,21 +51,21 @@ pub struct EffectiveNodeConfig {
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
+        #[cfg(test)]
         let security = SecurityType::from_remote(&remote.cipher)?;
-        if security.normalized() == SecurityType::None
-            && remote.global_padding
-            && !remote.authenticated_length
-        {
-            bail!("VMess global_padding requires authenticated_length when security is none/zero");
-        }
+        #[cfg(not(test))]
+        SecurityType::from_remote(&remote.cipher)?;
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
             tls: (remote.tls_mode() == 1)
                 .then(|| EffectiveTlsConfig::from_remote(remote))
                 .transpose()?,
+            #[cfg(test)]
             security,
+            #[cfg(test)]
             global_padding: remote.global_padding,
+            #[cfg(test)]
             authenticated_length: remote.authenticated_length,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
@@ -76,13 +81,7 @@ impl EffectiveNodeConfig {
         let mut options = crypto::RequestOptions::default();
         match self.security.normalized() {
             SecurityType::None => {
-                if self.authenticated_length {
-                    options.set_chunk_stream();
-                    options.set_authenticated_length();
-                    if self.global_padding {
-                        options.set_global_padding();
-                    }
-                } else if matches!(command, Command::Udp) {
+                if matches!(command, Command::Udp) {
                     options.set_chunk_stream();
                 }
             }
@@ -448,6 +447,9 @@ where
         Command::Udp => {
             serve_udp(stream, accounting, lease, user.0, request, runtime.routing).await
         }
+        Command::Mux => {
+            serve_mux(stream, accounting, lease, user.0, request, runtime.routing).await
+        }
     }
 }
 
@@ -586,6 +588,142 @@ where
             control.cancel();
             client_task.abort();
             flatten_join(result, "join VMess UDP downlink relay")
+        }
+    }
+}
+
+async fn serve_mux<S>(
+    stream: S,
+    accounting: Arc<Accounting>,
+    lease: SessionLease,
+    user: UserEntry,
+    request: Request,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let response_header = encode_response_header(
+        request.response_header,
+        &request.request_body_key,
+        &request.request_body_iv,
+    )?;
+
+    let control = lease.control();
+    let upload = TrafficRecorder::upload(accounting.clone(), user.id);
+    let download = TrafficRecorder::download(accounting, user.id);
+
+    let (client_read_half, mut client_write_half) = split(stream);
+    client_write_half
+        .write_all(&response_header)
+        .await
+        .context("write VMess mux response header")?;
+    let client_reader = BodyReader::new(client_read_half, request.request_body_config()?)?;
+    let client_writer = BodyWriter::new(client_write_half, request.response_body_config()?)?;
+    let (client_plain, mux_plain) = tokio::io::duplex(COPY_BUFFER_LEN);
+    let (plain_reader, plain_writer) = split(client_plain);
+
+    let mut client_to_mux = tokio::spawn(relay_body_to_plain(
+        client_reader,
+        plain_writer,
+        control.clone(),
+    ));
+    let mut mux_to_client = tokio::spawn(relay_plain_to_body(
+        plain_reader,
+        client_writer,
+        control.clone(),
+    ));
+    let mut mux_task = tokio::spawn(mux::relay(
+        mux_plain,
+        routing,
+        control.clone(),
+        upload,
+        download,
+    ));
+
+    tokio::select! {
+        _ = control.cancelled() => {
+            client_to_mux.abort();
+            mux_to_client.abort();
+            mux_task.abort();
+            Ok(())
+        }
+        result = &mut client_to_mux => {
+            control.cancel();
+            mux_to_client.abort();
+            mux_task.abort();
+            flatten_join(result, "join VMess mux uplink bridge")
+        }
+        result = &mut mux_to_client => {
+            control.cancel();
+            client_to_mux.abort();
+            mux_task.abort();
+            flatten_join(result, "join VMess mux downlink bridge")
+        }
+        result = &mut mux_task => {
+            control.cancel();
+            client_to_mux.abort();
+            mux_to_client.abort();
+            flatten_join(result, "join VMess mux relay")
+        }
+    }
+}
+
+async fn relay_body_to_plain<R, W>(
+    mut reader: BodyReader<R>,
+    mut writer: W,
+    control: Arc<SessionControl>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; COPY_BUFFER_LEN];
+    loop {
+        let read = tokio::select! {
+            _ = control.cancelled() => return Ok(()),
+            read = reader.read_plain(&mut buffer) => match read {
+                Ok(read) => read,
+                Err(error) if is_broken_pipe(&error) => {
+                    let _ = writer.shutdown().await;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
+        };
+        if read == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        tokio::select! {
+            _ = control.cancelled() => return Ok(()),
+            result = writer.write_all(&buffer[..read]) => result.context("write VMess mux plaintext")?,
+        }
+    }
+}
+
+async fn relay_plain_to_body<R, W>(
+    mut reader: R,
+    mut writer: BodyWriter<W>,
+    control: Arc<SessionControl>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; COPY_BUFFER_LEN];
+    loop {
+        let read = tokio::select! {
+            _ = control.cancelled() => return Ok(()),
+            read = reader.read(&mut buffer) => read.context("read VMess mux plaintext")?,
+        };
+        if read == 0 {
+            writer.finish().await?;
+            return Ok(());
+        }
+        tokio::select! {
+            _ = control.cancelled() => return Ok(()),
+            result = writer.write_all_plain(&buffer[..read]) => result?,
         }
     }
 }
@@ -764,9 +902,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     {
         bail!("Xboard transport is not supported by NodeRS VMess server yet");
     }
-    if remote.multiplex_enabled() {
-        bail!("Xboard multiplex is not supported by NodeRS VMess server yet");
-    }
     if !matches!(remote.tls_mode(), 0 | 1) {
         bail!(
             "Xboard tls mode {} is not supported by NodeRS VMess server yet",
@@ -797,6 +932,7 @@ mod tests {
     use super::*;
     use crate::panel::CertConfig;
     use crate::protocols::shared::socksaddr::SocksAddr;
+    use tokio::io::duplex;
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -890,6 +1026,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_enabled_vmess_multiplex_config() {
+        let remote = NodeConfigResponse {
+            multiplex: Some(serde_json::json!({
+                "enabled": true,
+                "protocol": "mux"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.server_port, 10086);
+    }
+
+    #[test]
     fn accepts_empty_xboard_network_settings_for_tcp() {
         let remote = NodeConfigResponse {
             network: "tcp".to_string(),
@@ -963,6 +1112,93 @@ mod tests {
         };
         let error = config.validate_request(&request).expect_err("body options");
         assert!(error.to_string().contains("requires chunk stream"));
+    }
+
+    #[tokio::test]
+    async fn bridges_vmess_mux_body_to_plain_stream() {
+        let mut options = crypto::RequestOptions::default();
+        options.set_chunk_stream();
+        let config = crypto::BodyConfig::new(
+            SecurityType::None,
+            options,
+            [0x11; 16],
+            [0x22; 16],
+            [0x11; 16],
+            [0x22; 16],
+        )
+        .expect("body config");
+        let (client_io, server_io) = duplex(4096);
+        let (plain_reader, plain_writer) = duplex(4096);
+
+        let write = tokio::spawn(async move {
+            let mut writer = BodyWriter::new(client_io, config).expect("writer");
+            writer
+                .write_all_plain(b"mux-bytes")
+                .await
+                .expect("write body");
+            writer.finish().await.expect("finish body");
+        });
+        let bridge = tokio::spawn(async move {
+            let reader = BodyReader::new(server_io, config).expect("reader");
+            relay_body_to_plain(reader, plain_writer, SessionControl::new())
+                .await
+                .expect("bridge body to plain");
+        });
+
+        let mut output = Vec::new();
+        let mut plain_reader = plain_reader;
+        plain_reader
+            .read_to_end(&mut output)
+            .await
+            .expect("read plain");
+        write.await.expect("join writer");
+        bridge.await.expect("join bridge");
+        assert_eq!(output, b"mux-bytes");
+    }
+
+    #[tokio::test]
+    async fn bridges_plain_stream_to_vmess_mux_body() {
+        let mut options = crypto::RequestOptions::default();
+        options.set_chunk_stream();
+        let config = crypto::BodyConfig::new(
+            SecurityType::None,
+            options,
+            [0x11; 16],
+            [0x22; 16],
+            [0x11; 16],
+            [0x22; 16],
+        )
+        .expect("body config");
+        let (plain_writer, plain_reader) = duplex(4096);
+        let (server_io, client_io) = duplex(4096);
+
+        let write = tokio::spawn(async move {
+            let mut plain_writer = plain_writer;
+            plain_writer
+                .write_all(b"mux-response")
+                .await
+                .expect("write plain");
+        });
+        let bridge = tokio::spawn(async move {
+            let writer = BodyWriter::new(server_io, config).expect("writer");
+            relay_plain_to_body(plain_reader, writer, SessionControl::new())
+                .await
+                .expect("bridge plain to body");
+        });
+
+        let mut reader = BodyReader::new(client_io, config).expect("reader");
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 64];
+        loop {
+            let read = reader.read_plain(&mut buffer).await.expect("read body");
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+        write.await.expect("join writer");
+        bridge.await.expect("join bridge");
+        assert_eq!(output, b"mux-response");
     }
 
     #[test]
