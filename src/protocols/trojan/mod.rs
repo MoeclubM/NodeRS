@@ -1862,7 +1862,11 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn connects_abstract_unix_fallback() {
-        let public_name = format!("@noders-trojan-test-{}", std::process::id());
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let public_name = format!("@noders-trojan-test-{suffix}");
         let bind_name = public_name.replacen('@', "\0", 1);
         let listener = tokio::net::UnixListener::bind(bind_name).expect("bind abstract listener");
         let mut client = connect_unix_fallback(&public_name)
