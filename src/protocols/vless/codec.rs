@@ -6,6 +6,7 @@ use crate::protocols::shared::socksaddr::SocksAddr;
 
 pub const VERSION: u8 = 0x00;
 const ADDONS_LEN_NONE: u8 = 0x00;
+pub const RESPONSE_HEADER: [u8; 2] = [VERSION, ADDONS_LEN_NONE];
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
 const CMD_MUX: u8 = 0x03;
@@ -79,7 +80,7 @@ where
     W: AsyncWrite + Unpin,
 {
     writer
-        .write_all(&[VERSION, ADDONS_LEN_NONE])
+        .write_all(&RESPONSE_HEADER)
         .await
         .context("write VLESS response header")
 }
@@ -155,10 +156,24 @@ where
             let length = read_u8_recorded(reader, consumed, "read VLESS domain length").await?;
             let mut domain = vec![0u8; length as usize];
             read_exact_recorded(reader, &mut domain, consumed, "read VLESS domain").await?;
-            Ok(SocksAddr::Domain(
-                String::from_utf8(domain).context("decode VLESS domain")?,
-                port,
-            ))
+            let domain = String::from_utf8(domain).context("decode VLESS domain")?;
+            ensure!(!domain.is_empty(), "empty VLESS domain");
+            let ip = domain.parse::<IpAddr>().ok().or_else(|| {
+                domain
+                    .strip_prefix('[')
+                    .and_then(|value| value.strip_suffix(']'))
+                    .and_then(|value| value.parse::<IpAddr>().ok())
+            });
+            if let Some(ip) = ip {
+                return Ok(SocksAddr::Ip(SocketAddr::new(ip, port)));
+            }
+            ensure!(
+                domain
+                    .chars()
+                    .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '.' | '_')),
+                "invalid VLESS domain name: {domain}"
+            );
+            Ok(SocksAddr::Domain(domain, port))
         }
         other => bail!("unsupported VLESS address type {other:#x}"),
     }
@@ -353,6 +368,45 @@ mod tests {
             request.destination,
             SocksAddr::Ip(SocketAddr::from(([1, 2, 3, 4], 53)))
         );
+    }
+
+    #[tokio::test]
+    async fn reads_vless_domain_ip_literal_as_ip() {
+        let mut bytes = Vec::new();
+        bytes.push(VERSION);
+        bytes.extend_from_slice(&USER_UUID);
+        bytes.push(0);
+        bytes.push(CMD_TCP);
+        bytes.extend_from_slice(&443u16.to_be_bytes());
+        bytes.push(ATYP_DOMAIN);
+        bytes.push(7);
+        bytes.extend_from_slice(b"1.2.3.4");
+
+        let request = read_request(&mut bytes.as_slice(), &mut Vec::new())
+            .await
+            .expect("read request");
+        assert_eq!(
+            request.destination,
+            SocksAddr::Ip(SocketAddr::from(([1, 2, 3, 4], 443)))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_vless_domain_name() {
+        let mut bytes = Vec::new();
+        bytes.push(VERSION);
+        bytes.extend_from_slice(&USER_UUID);
+        bytes.push(0);
+        bytes.push(CMD_TCP);
+        bytes.extend_from_slice(&443u16.to_be_bytes());
+        bytes.push(ATYP_DOMAIN);
+        bytes.push(8);
+        bytes.extend_from_slice(b"bad/name");
+
+        let error = read_request(&mut bytes.as_slice(), &mut Vec::new())
+            .await
+            .expect_err("invalid domain should be rejected");
+        assert!(error.to_string().contains("domain"));
     }
 
     #[tokio::test]

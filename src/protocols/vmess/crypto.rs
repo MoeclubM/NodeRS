@@ -173,18 +173,22 @@ impl RequestOptions {
         self.0 & !SUPPORTED_OPTION_BITS != 0
     }
 
+    #[cfg(test)]
     pub fn set_chunk_stream(&mut self) {
         self.0 |= REQUEST_OPTION_CHUNK_STREAM;
     }
 
+    #[cfg(test)]
     pub fn set_chunk_masking(&mut self) {
         self.0 |= REQUEST_OPTION_CHUNK_MASKING;
     }
 
+    #[cfg(test)]
     pub fn set_global_padding(&mut self) {
         self.0 |= REQUEST_OPTION_GLOBAL_PADDING;
     }
 
+    #[cfg(test)]
     pub fn set_authenticated_length(&mut self) {
         self.0 |= REQUEST_OPTION_AUTHENTICATED_LENGTH;
     }
@@ -195,6 +199,10 @@ impl RequestOptions {
 
     pub fn clear_chunk_masking(&mut self) {
         self.0 &= !REQUEST_OPTION_CHUNK_MASKING;
+    }
+
+    pub fn clear_authenticated_length(&mut self) {
+        self.0 &= !REQUEST_OPTION_AUTHENTICATED_LENGTH;
     }
 }
 
@@ -249,13 +257,16 @@ impl BodyConfig {
 
     pub fn new(
         security: SecurityType,
-        options: RequestOptions,
+        mut options: RequestOptions,
         payload_key: [u8; 16],
         payload_iv: [u8; 16],
         length_key: [u8; 16],
         length_iv: [u8; 16],
     ) -> anyhow::Result<Self> {
         let security = security.normalized();
+        if security == SecurityType::None {
+            options.clear_authenticated_length();
+        }
         ensure!(
             !options.has_unknown_bits(),
             "unsupported VMess request option bits: 0x{:02x}",
@@ -279,8 +290,8 @@ impl BodyConfig {
                 "VMess global padding requires chunk stream"
             );
             ensure!(
-                options.chunk_masking() || options.authenticated_length(),
-                "VMess global padding requires chunk masking or authenticated length"
+                options.chunk_masking(),
+                "VMess global padding requires chunk masking"
             );
         }
         if options.chunk_masking() {
@@ -353,6 +364,7 @@ pub fn kdf16(key: &[u8], salt: &str, path: &[&[u8]]) -> [u8; 16] {
     out
 }
 
+#[cfg(test)]
 pub fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64) -> anyhow::Result<[u8; 16]> {
     let mut plain = [0u8; 16];
     plain[..8].copy_from_slice(&timestamp.to_be_bytes());
@@ -1375,5 +1387,46 @@ mod tests {
         assert_eq!(reader.read_packet().await.unwrap(), Some(b"gamma".to_vec()));
         assert_eq!(reader.read_packet().await.unwrap(), None);
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn none_security_ignores_authenticated_length_option() {
+        let mut options = RequestOptions::default();
+        options.set_chunk_stream();
+        options.set_authenticated_length();
+
+        let config = BodyConfig::new(
+            SecurityType::None,
+            options,
+            [0x11; 16],
+            [0x22; 16],
+            [0x11; 16],
+            [0x22; 16],
+        )
+        .unwrap();
+
+        let mut state = ChunkState::new(config);
+        assert_eq!(state.size_field_len(), 2);
+        assert_eq!(state.decode_size(&5u16.to_be_bytes()).unwrap(), 5);
+    }
+
+    #[test]
+    fn rejects_global_padding_without_chunk_masking() {
+        let mut options = RequestOptions::default();
+        options.set_chunk_stream();
+        options.set_global_padding();
+        options.set_authenticated_length();
+
+        let error = BodyConfig::new(
+            SecurityType::Aes128Gcm,
+            options,
+            [0x11; 16],
+            [0x22; 16],
+            [0x11; 16],
+            [0x22; 16],
+        )
+        .expect_err("global padding without masking should be rejected");
+
+        assert!(error.to_string().contains("chunk masking"));
     }
 }

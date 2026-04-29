@@ -63,14 +63,6 @@ impl<S> PrefixedIo<S> {
         &self.inner
     }
 
-    pub fn get_mut(&mut self) -> &mut S {
-        &mut self.inner
-    }
-
-    pub fn into_inner(self) -> S {
-        self.inner
-    }
-
     pub fn prepend_prefix(mut self, prefix: Vec<u8>) -> Self {
         if prefix.is_empty() {
             return self;

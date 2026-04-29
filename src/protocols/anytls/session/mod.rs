@@ -1332,9 +1332,7 @@ mod tests {
             .await
             .expect("payload should arrive")
             .expect("inbound message");
-        let InboundMessage::Data(first) = first else {
-            panic!("expected data payload");
-        };
+        let InboundMessage::Data(first) = first;
         assert_eq!(first.len(), payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 7));
     }
@@ -1372,9 +1370,7 @@ mod tests {
             .await
             .expect("payload should arrive")
             .expect("inbound message");
-        let InboundMessage::Data(first) = first else {
-            panic!("expected data payload");
-        };
+        let InboundMessage::Data(first) = first;
         assert_eq!(first.len(), payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 7));
     }
@@ -1403,9 +1399,7 @@ mod tests {
             .await
             .expect("first queued payload should arrive")
             .expect("first inbound message");
-        let InboundMessage::Data(first) = first else {
-            panic!("expected first data payload");
-        };
+        let InboundMessage::Data(first) = first;
         assert_eq!(first.len(), first_payload_len);
         drop(first);
 
@@ -1413,9 +1407,7 @@ mod tests {
             .await
             .expect("whole payload should arrive once budget is released")
             .expect("second inbound message");
-        let InboundMessage::Data(second) = second else {
-            panic!("expected second data payload");
-        };
+        let InboundMessage::Data(second) = second;
         assert_eq!(second.len(), payload_len);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
 
@@ -1480,9 +1472,7 @@ mod tests {
             .await
             .expect("first queued payload should arrive")
             .expect("first inbound message");
-        let InboundMessage::Data(first) = first else {
-            panic!("expected first data payload");
-        };
+        let InboundMessage::Data(first) = first;
         assert_eq!(first.len(), first_payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 3));
 
@@ -1492,9 +1482,7 @@ mod tests {
             .await
             .expect("whole payload should arrive")
             .expect("second inbound message");
-        let InboundMessage::Data(second) = second else {
-            panic!("expected second data payload");
-        };
+        let InboundMessage::Data(second) = second;
         assert_eq!(second.len(), payload_len);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
 
@@ -1528,9 +1516,7 @@ mod tests {
             .await
             .expect("first queued payload should arrive")
             .expect("first inbound message");
-        let InboundMessage::Data(first) = first else {
-            panic!("expected first data payload");
-        };
+        let InboundMessage::Data(first) = first;
         assert_eq!(first.len(), first_payload_len);
         drop(first);
 
@@ -1538,9 +1524,7 @@ mod tests {
             .await
             .expect("whole payload should arrive after grace retry")
             .expect("second inbound message");
-        let InboundMessage::Data(second) = second else {
-            panic!("expected second data payload");
-        };
+        let InboundMessage::Data(second) = second;
         assert_eq!(second.len(), payload_len);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
 
@@ -1573,11 +1557,9 @@ mod tests {
 
         let first = match rx.recv().await.expect("receive first chunk") {
             InboundMessage::Data(chunk) => chunk,
-            InboundMessage::Fin => panic!("unexpected fin"),
         };
         let second = match rx.recv().await.expect("receive second chunk") {
             InboundMessage::Data(chunk) => chunk,
-            InboundMessage::Fin => panic!("unexpected fin"),
         };
         let mut chunks = std::collections::VecDeque::from([first, second]);
         let mut front_offset = 0usize;
@@ -1604,11 +1586,9 @@ mod tests {
 
         let first = match rx.recv().await.expect("receive first chunk") {
             InboundMessage::Data(chunk) => chunk,
-            InboundMessage::Fin => panic!("unexpected fin"),
         };
         let second = match rx.recv().await.expect("receive second chunk") {
             InboundMessage::Data(chunk) => chunk,
-            InboundMessage::Fin => panic!("unexpected fin"),
         };
         let mut chunks = std::collections::VecDeque::from([first, second]);
         let mut front_offset = 0usize;

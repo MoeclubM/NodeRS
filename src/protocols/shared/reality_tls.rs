@@ -416,7 +416,7 @@ async fn pump_inbound(
     control: UnboundedSender<OutboundControl>,
 ) -> anyhow::Result<()> {
     loop {
-        let Some(record) = read_tls_record(&mut stream).await? else {
+        let Some(mut record) = read_tls_record(&mut stream).await? else {
             let _ = control.send(OutboundControl::CloseNotify);
             sink.shutdown().await.ok();
             return Ok(());
@@ -437,27 +437,26 @@ async fn pump_inbound(
                 bail!("REALITY peer sent alert {:?}", record.payload);
             }
             TLS_CONTENT_TYPE_APPLICATION_DATA => {
-                let decrypted = cipher
-                    .decrypt_record(record.content_type, &record.payload)
+                let content_type = cipher
+                    .decrypt_record_in_place(record.content_type, &mut record.payload)
                     .context("decrypt REALITY application record")?;
-                match decrypted.content_type {
+                match content_type {
                     TLS_CONTENT_TYPE_APPLICATION_DATA => {
-                        sink.write_all(&decrypted.payload)
+                        sink.write_all(&record.payload)
                             .await
                             .context("write REALITY plaintext into pipe")?;
                     }
                     TLS_CONTENT_TYPE_ALERT => {
-                        if decrypted.payload.len() == 2
-                            && decrypted.payload[1] == TLS_ALERT_CLOSE_NOTIFY
+                        if record.payload.len() == 2 && record.payload[1] == TLS_ALERT_CLOSE_NOTIFY
                         {
                             let _ = control.send(OutboundControl::CloseNotify);
                             sink.shutdown().await.ok();
                             return Ok(());
                         }
-                        bail!("REALITY peer sent encrypted alert {:?}", decrypted.payload);
+                        bail!("REALITY peer sent encrypted alert {:?}", record.payload);
                     }
                     TLS_CONTENT_TYPE_HANDSHAKE => {
-                        let mut handshake_messages = decrypted.payload.as_slice();
+                        let mut handshake_messages = record.payload.as_slice();
                         while !handshake_messages.is_empty() {
                             let consumed = handle_post_handshake_message(
                                 &mut cipher,
@@ -645,7 +644,7 @@ async fn read_finished_message(
     let mut handshake = Vec::new();
     let mut expected = None;
     loop {
-        let Some(record) = read_tls_record(stream).await? else {
+        let Some(mut record) = read_tls_record(stream).await? else {
             bail!("unexpected EOF before REALITY client Finished");
         };
         match record.content_type {
@@ -656,14 +655,14 @@ async fn read_finished_message(
                 );
             }
             TLS_CONTENT_TYPE_APPLICATION_DATA => {
-                let decrypted = cipher
-                    .decrypt_record(record.content_type, &record.payload)
+                let content_type = cipher
+                    .decrypt_record_in_place(record.content_type, &mut record.payload)
                     .context("decrypt REALITY client handshake record")?;
                 ensure!(
-                    decrypted.content_type == TLS_CONTENT_TYPE_HANDSHAKE,
+                    content_type == TLS_CONTENT_TYPE_HANDSHAKE,
                     "REALITY expected encrypted handshake record during client Finished"
                 );
-                handshake.extend_from_slice(&decrypted.payload);
+                handshake.extend_from_slice(&record.payload);
                 if handshake.len() >= 4 && expected.is_none() {
                     ensure!(
                         handshake[0] == TLS_HANDSHAKE_TYPE_FINISHED,
@@ -939,6 +938,7 @@ struct TlsRecord {
     payload: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct DecryptedRecord {
     content_type: u8,
@@ -1016,11 +1016,25 @@ impl RecordCipher {
         Ok(())
     }
 
+    #[cfg(test)]
     fn decrypt_record(
         &mut self,
         record_type: u8,
         payload: &[u8],
     ) -> anyhow::Result<DecryptedRecord> {
+        let mut payload = payload.to_vec();
+        let content_type = self.decrypt_record_in_place(record_type, &mut payload)?;
+        Ok(DecryptedRecord {
+            content_type,
+            payload,
+        })
+    }
+
+    fn decrypt_record_in_place(
+        &mut self,
+        record_type: u8,
+        payload: &mut Vec<u8>,
+    ) -> anyhow::Result<u8> {
         ensure!(
             record_type == TLS_CONTENT_TYPE_APPLICATION_DATA,
             "REALITY expected encrypted application_data record"
@@ -1032,22 +1046,21 @@ impl RecordCipher {
         let header = build_encrypted_record_header(payload.len())?;
         let nonce = build_nonce(self.iv, self.sequence);
         let ciphertext_len = payload.len() - self.suite.tag_len();
-        let mut ciphertext = payload[..ciphertext_len].to_vec();
+        let mut tag = [0u8; 16];
+        tag[..self.suite.tag_len()].copy_from_slice(&payload[ciphertext_len..]);
+        payload.truncate(ciphertext_len);
         self.context
-            .open_in_place(&nonce, &mut ciphertext, &payload[ciphertext_len..], &header)
+            .open_in_place(&nonce, payload, &tag[..self.suite.tag_len()], &header)
             .context("open REALITY TLS record")?;
         self.sequence += 1;
 
-        let content_type_offset = ciphertext
+        let content_type_offset = payload
             .iter()
             .rposition(|byte| *byte != 0)
             .context("REALITY decrypted record is missing content type")?;
-        let content_type = ciphertext[content_type_offset];
-        ciphertext.truncate(content_type_offset);
-        Ok(DecryptedRecord {
-            content_type,
-            payload: ciphertext,
-        })
+        let content_type = payload[content_type_offset];
+        payload.truncate(content_type_offset);
+        Ok(content_type)
     }
 
     fn update_key(&mut self) -> anyhow::Result<()> {

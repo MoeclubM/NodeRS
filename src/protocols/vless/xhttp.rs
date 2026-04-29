@@ -835,10 +835,8 @@ fn setting_bool(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Optio
     setting_value(object, keys).and_then(crate::panel::value_to_bool)
 }
 
-pub(super) async fn accept<S>(
-    stream: S,
-    config: &XhttpConfig,
-) -> anyhow::Result<AcceptResult<PrefixedIo<S>>>
+#[cfg(test)]
+async fn accept<S>(stream: S, config: &XhttpConfig) -> anyhow::Result<AcceptResult<PrefixedIo<S>>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {

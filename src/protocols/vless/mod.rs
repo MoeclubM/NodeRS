@@ -2,7 +2,8 @@ mod codec;
 mod grpc;
 mod http1;
 mod httpupgrade;
-mod mux;
+pub(crate) mod mux;
+mod vision;
 mod ws;
 mod xhttp;
 mod xudp;
@@ -11,6 +12,7 @@ use anyhow::{Context, anyhow, bail, ensure};
 use boring::ssl::NameType;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
@@ -35,6 +37,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const COPY_BUFFER_LEN: usize = 64 * 1024;
 const HTTP2_CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 
 enum TlsStream {
     Boring(tokio_boring::SslStream<http1::PrefixedIo<TcpStream>>),
@@ -141,6 +144,7 @@ pub struct EffectiveNodeConfig {
     pub tls: EffectiveTlsConfig,
     transport: TransportMode,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     pub routing: routing::RoutingTable,
     pub fallbacks: FallbackConfig,
 }
@@ -162,6 +166,7 @@ impl EffectiveNodeConfig {
             tls,
             transport,
             packet_encoding: parse_packet_encoding(remote)?,
+            flow: parse_flow_value(remote.flow.trim(), "Xboard flow")?,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
                 &remote.custom_outbounds,
@@ -191,6 +196,13 @@ enum PacketEncoding {
     #[default]
     None,
     Xudp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FlowMode {
+    #[default]
+    None,
+    XtlsRprxVision,
 }
 
 type PathFallbacks = HashMap<String, FallbackTarget>;
@@ -414,6 +426,7 @@ pub struct ServerController {
     users: Arc<RwLock<UserValidator>>,
     transport: Arc<RwLock<TransportMode>>,
     packet_encoding: Arc<RwLock<PacketEncoding>>,
+    flow: Arc<RwLock<FlowMode>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
     inner: Mutex<Option<RunningServer>>,
@@ -435,6 +448,7 @@ impl ServerController {
             users: Arc::new(RwLock::new(UserValidator::default())),
             transport: Arc::new(RwLock::new(TransportMode::Tcp)),
             packet_encoding: Arc::new(RwLock::new(PacketEncoding::None)),
+            flow: Arc::new(RwLock::new(FlowMode::None)),
             routing: Arc::new(RwLock::new(routing::RoutingTable::default())),
             fallbacks: Arc::new(RwLock::new(FallbackConfig::default())),
             inner: Mutex::new(None),
@@ -457,6 +471,7 @@ impl ServerController {
             .packet_encoding
             .write()
             .expect("vless packet encoding lock poisoned") = config.packet_encoding;
+        *self.flow.write().expect("vless flow lock poisoned") = config.flow;
         *self.routing.write().expect("vless routing lock poisoned") = config.routing;
         *self
             .fallbacks
@@ -491,6 +506,7 @@ impl ServerController {
         let users = self.users.clone();
         let transport = self.transport.clone();
         let packet_encoding = self.packet_encoding.clone();
+        let flow = self.flow.clone();
         let routing = self.routing.clone();
         let fallbacks = self.fallbacks.clone();
         let handle = tokio::spawn(async move {
@@ -503,6 +519,7 @@ impl ServerController {
                 let users = users.clone();
                 let transport = transport.clone();
                 let packet_encoding = packet_encoding.clone();
+                let flow = flow.clone();
                 let routing = routing.clone();
                 let fallbacks = fallbacks.clone();
                 accept_loops.spawn(async move {
@@ -514,6 +531,7 @@ impl ServerController {
                         users,
                         transport,
                         packet_encoding,
+                        flow,
                         routing,
                         fallbacks,
                     )
@@ -631,6 +649,7 @@ async fn accept_loop(
     users: Arc<RwLock<UserValidator>>,
     transport: Arc<RwLock<TransportMode>>,
     packet_encoding: Arc<RwLock<PacketEncoding>>,
+    flow: Arc<RwLock<FlowMode>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
 ) {
@@ -663,6 +682,7 @@ async fn accept_loop(
         let users = users.clone();
         let transport = transport.clone();
         let packet_encoding = packet_encoding.clone();
+        let flow = flow.clone();
         let routing = routing.clone();
         let fallbacks = fallbacks.clone();
         tokio::spawn(async move {
@@ -709,6 +729,7 @@ async fn accept_loop(
             let packet_encoding = *packet_encoding
                 .read()
                 .expect("vless packet encoding lock poisoned");
+            let flow = *flow.read().expect("vless flow lock poisoned");
             let routing = routing.read().expect("vless routing lock poisoned").clone();
             let fallbacks = fallbacks
                 .read()
@@ -722,6 +743,7 @@ async fn accept_loop(
                         accounting,
                         users,
                         packet_encoding,
+                        flow,
                         routing,
                         fallbacks,
                     )
@@ -734,6 +756,7 @@ async fn accept_loop(
                         accounting,
                         users,
                         packet_encoding,
+                        flow,
                         routing,
                         config,
                     )
@@ -746,6 +769,7 @@ async fn accept_loop(
                         accounting,
                         users,
                         packet_encoding,
+                        flow,
                         routing,
                         config,
                     )
@@ -758,6 +782,7 @@ async fn accept_loop(
                         accounting,
                         users,
                         packet_encoding,
+                        flow,
                         routing,
                         config,
                     )
@@ -770,6 +795,7 @@ async fn accept_loop(
                         accounting,
                         users,
                         packet_encoding,
+                        flow,
                         routing,
                         config,
                     )
@@ -1147,6 +1173,7 @@ async fn serve_connection(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     fallbacks: FallbackConfig,
 ) -> anyhow::Result<()> {
@@ -1192,17 +1219,7 @@ async fn serve_connection(
             return Err(anyhow!("VLESS request header timed out"));
         }
     };
-    if let Err(error) = validate_request_addons(&request) {
-        if let Some(target) = fallbacks.select(
-            fallback.server_name.as_deref(),
-            fallback.alpn.as_deref(),
-            &fallback.first_packet,
-        ) {
-            proxy_fallback(stream, source, fallback.local_addr, target, consumed).await?;
-            return Ok(());
-        }
-        return Err(error);
-    }
+    validate_request_addons(&request, flow)?;
 
     let user = match users.get(&request.user) {
         Some(user) => user,
@@ -1227,6 +1244,7 @@ async fn serve_connection(
         user,
         request,
         packet_encoding,
+        flow,
         routing,
     )
     .await
@@ -1238,6 +1256,7 @@ async fn serve_grpc_connection(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     config: grpc::GrpcConfig,
 ) -> anyhow::Result<()> {
@@ -1246,8 +1265,16 @@ async fn serve_grpc_connection(
         let users = users.clone();
         let routing = routing.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_grpc_stream(stream, source, accounting, users, packet_encoding, routing).await
+            if let Err(error) = serve_grpc_stream(
+                stream,
+                source,
+                accounting,
+                users,
+                packet_encoding,
+                flow,
+                routing,
+            )
+            .await
             {
                 warn!(%error, %source, "VLESS gRPC session terminated with error");
             }
@@ -1262,6 +1289,7 @@ async fn serve_grpc_stream(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
 ) -> anyhow::Result<()> {
     let request = timeout(
@@ -1270,7 +1298,7 @@ async fn serve_grpc_stream(
     )
     .await
     .map_err(|_| anyhow!("VLESS request header timed out"))??;
-    validate_request_addons(&request)?;
+    validate_request_addons(&request, flow)?;
     let user = users
         .get(&request.user)
         .ok_or_else(|| anyhow!("unknown VLESS user"))?;
@@ -1282,6 +1310,7 @@ async fn serve_grpc_stream(
         user,
         request,
         packet_encoding,
+        flow,
         routing,
     )
     .await
@@ -1293,6 +1322,7 @@ async fn serve_ws_connection(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     config: ws::WsConfig,
 ) -> anyhow::Result<()> {
@@ -1305,7 +1335,7 @@ async fn serve_ws_connection(
     )
     .await
     .map_err(|_| anyhow!("VLESS request header timed out"))??;
-    validate_request_addons(&request)?;
+    validate_request_addons(&request, flow)?;
     let user = users
         .get(&request.user)
         .ok_or_else(|| anyhow!("unknown VLESS user"))?;
@@ -1317,6 +1347,7 @@ async fn serve_ws_connection(
         user,
         request,
         packet_encoding,
+        flow,
         routing,
     )
     .await
@@ -1328,6 +1359,7 @@ async fn serve_httpupgrade_connection(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     config: httpupgrade::HttpUpgradeConfig,
 ) -> anyhow::Result<()> {
@@ -1340,7 +1372,7 @@ async fn serve_httpupgrade_connection(
     )
     .await
     .map_err(|_| anyhow!("VLESS request header timed out"))??;
-    validate_request_addons(&request)?;
+    validate_request_addons(&request, flow)?;
     let user = users
         .get(&request.user)
         .ok_or_else(|| anyhow!("unknown VLESS user"))?;
@@ -1352,6 +1384,7 @@ async fn serve_httpupgrade_connection(
         user,
         request,
         packet_encoding,
+        flow,
         routing,
     )
     .await
@@ -1363,6 +1396,7 @@ async fn serve_xhttp_connection(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     config: xhttp::XhttpConfig,
 ) -> anyhow::Result<()> {
@@ -1386,6 +1420,7 @@ async fn serve_xhttp_connection(
             accounting,
             users,
             packet_encoding,
+            flow,
             routing,
             config,
         )
@@ -1398,6 +1433,7 @@ async fn serve_xhttp_connection(
         accounting,
         users,
         packet_encoding,
+        flow,
         routing,
         config,
     )
@@ -1410,6 +1446,7 @@ async fn serve_xhttp_http1_connection(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     config: xhttp::XhttpConfig,
 ) -> anyhow::Result<()> {
@@ -1423,6 +1460,7 @@ async fn serve_xhttp_http1_connection(
                     accounting,
                     users,
                     packet_encoding,
+                    flow,
                     routing,
                 )
                 .await;
@@ -1441,6 +1479,7 @@ async fn serve_xhttp_h2_connection<S>(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
     config: xhttp::XhttpConfig,
 ) -> anyhow::Result<()>
@@ -1452,9 +1491,16 @@ where
         let users = users.clone();
         let routing = routing.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_xhttp_stream(stream, source, accounting, users, packet_encoding, routing)
-                    .await
+            if let Err(error) = serve_xhttp_stream(
+                stream,
+                source,
+                accounting,
+                users,
+                packet_encoding,
+                flow,
+                routing,
+            )
+            .await
             {
                 warn!(%error, %source, "VLESS XHTTP h2 session terminated with error");
             }
@@ -1493,6 +1539,7 @@ async fn serve_xhttp_stream(
     accounting: Arc<Accounting>,
     users: UserValidator,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
 ) -> anyhow::Result<()> {
     let request = timeout(
@@ -1501,7 +1548,7 @@ async fn serve_xhttp_stream(
     )
     .await
     .map_err(|_| anyhow!("VLESS request header timed out"))??;
-    validate_request_addons(&request)?;
+    validate_request_addons(&request, flow)?;
     let user = users
         .get(&request.user)
         .ok_or_else(|| anyhow!("unknown VLESS user"))?;
@@ -1513,6 +1560,7 @@ async fn serve_xhttp_stream(
         user,
         request,
         packet_encoding,
+        flow,
         routing,
     )
     .await
@@ -1525,6 +1573,7 @@ async fn serve_authenticated_connection<S>(
     user: UserEntry,
     request: codec::Request,
     packet_encoding: PacketEncoding,
+    flow: FlowMode,
     routing: routing::RoutingTable,
 ) -> anyhow::Result<()>
 where
@@ -1537,6 +1586,8 @@ where
                 accounting,
                 lease,
                 user,
+                request.user,
+                flow,
                 request.destination,
                 routing,
             )
@@ -1577,6 +1628,8 @@ async fn serve_connect<S>(
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
+    request_user: [u8; 16],
+    flow: FlowMode,
     destination: SocksAddr,
     routing: routing::RoutingTable,
 ) -> anyhow::Result<()>
@@ -1590,22 +1643,181 @@ where
     let upload = TrafficRecorder::upload(accounting.clone(), user.id);
     let download = TrafficRecorder::download(accounting, user.id);
     let (mut client_reader, mut client_writer) = split(stream);
-    codec::write_response_header(&mut client_writer).await?;
     let (mut remote_reader, mut remote_writer) = split(remote);
 
-    let client_to_remote = copy_with_traffic(
-        &mut client_reader,
-        &mut remote_writer,
-        control.clone(),
-        Some(upload),
-    );
-    let remote_to_client = copy_with_traffic(
-        &mut remote_reader,
-        &mut client_writer,
-        control,
-        Some(download),
-    );
-    let _ = tokio::try_join!(client_to_remote, remote_to_client)?;
+    if flow == FlowMode::XtlsRprxVision {
+        let mut vision_reader = vision::VisionReader::new(client_reader, request_user);
+        let client_to_remote = copy_with_traffic(
+            &mut vision_reader,
+            &mut remote_writer,
+            control.clone(),
+            Some(upload),
+        );
+        let remote_to_client = copy_with_response_header(
+            &mut remote_reader,
+            &mut client_writer,
+            control,
+            download,
+            flow,
+            request_user,
+        );
+        let _ = tokio::try_join!(client_to_remote, remote_to_client)?;
+    } else {
+        let client_to_remote = copy_with_traffic(
+            &mut client_reader,
+            &mut remote_writer,
+            control.clone(),
+            Some(upload),
+        );
+        let remote_to_client = copy_with_response_header(
+            &mut remote_reader,
+            &mut client_writer,
+            control,
+            download,
+            flow,
+            request_user,
+        );
+        let _ = tokio::try_join!(client_to_remote, remote_to_client)?;
+    }
+    Ok(())
+}
+
+async fn copy_with_response_header<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    control: Arc<SessionControl>,
+    traffic: TrafficRecorder,
+    flow: FlowMode,
+    request_user: [u8; 16],
+) -> anyhow::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![
+        0u8;
+        if flow == FlowMode::XtlsRprxVision {
+            u16::MAX as usize
+        } else {
+            COPY_BUFFER_LEN
+        }
+    ];
+    let mut total = 0u64;
+    let read = tokio::select! {
+        _ = control.cancelled() => return Ok(total),
+        read = reader.read(&mut buffer) => match read {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                let _ = writer.shutdown().await;
+                return Ok(total);
+            }
+            Err(error) => return Err(error).context("read proxied VLESS chunk"),
+        },
+    };
+    if read == 0 {
+        match writer.write_all(&codec::RESPONSE_HEADER).await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(total);
+            }
+            Err(error) => return Err(error).context("write VLESS response header"),
+        }
+        let _ = writer.shutdown().await;
+        return Ok(total);
+    }
+
+    tokio::select! {
+        _ = control.cancelled() => return Ok(total),
+        result = write_response_header_and_chunk(writer, flow, request_user, &buffer[..read]) => match result {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) => return Ok(total),
+            Err(error) => return Err(error).context("write proxied VLESS chunk"),
+        },
+    }
+    let transferred = read as u64;
+    total += transferred;
+    traffic.record(transferred);
+
+    let remaining = copy_with_traffic(reader, writer, control, Some(traffic)).await?;
+    Ok(total + remaining)
+}
+
+fn encode_response_header(
+    flow: FlowMode,
+    request_user: [u8; 16],
+    chunk: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::with_capacity(codec::RESPONSE_HEADER.len() + chunk.len() + 21);
+    response.extend_from_slice(&codec::RESPONSE_HEADER);
+    if flow == FlowMode::XtlsRprxVision {
+        response.extend_from_slice(&vision::encode_end_frame(&request_user, chunk)?);
+    } else {
+        response.extend_from_slice(chunk);
+    }
+    Ok(response)
+}
+
+async fn write_response_header_and_chunk<W>(
+    writer: &mut W,
+    flow: FlowMode,
+    request_user: [u8; 16],
+    chunk: &[u8],
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if flow == FlowMode::XtlsRprxVision {
+        let response = encode_response_header(flow, request_user, chunk)?;
+        writer.write_all(&response).await?;
+        return Ok(());
+    }
+
+    if writer.is_write_vectored() {
+        let mut header_offset = 0usize;
+        let mut chunk_offset = 0usize;
+        while header_offset < codec::RESPONSE_HEADER.len() || chunk_offset < chunk.len() {
+            let mut slices = [IoSlice::new(&[]), IoSlice::new(&[])];
+            let mut count = 0usize;
+            if header_offset < codec::RESPONSE_HEADER.len() {
+                slices[count] = IoSlice::new(&codec::RESPONSE_HEADER[header_offset..]);
+                count += 1;
+            }
+            if chunk_offset < chunk.len() {
+                slices[count] = IoSlice::new(&chunk[chunk_offset..]);
+                count += 1;
+            }
+            let written = writer.write_vectored(&slices[..count]).await?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            let header_remaining = codec::RESPONSE_HEADER.len() - header_offset;
+            if written <= header_remaining {
+                header_offset += written;
+            } else {
+                header_offset = codec::RESPONSE_HEADER.len();
+                chunk_offset += written - header_remaining;
+            }
+        }
+    } else {
+        let mut buffer = Vec::with_capacity(codec::RESPONSE_HEADER.len() + chunk.len());
+        buffer.extend_from_slice(&codec::RESPONSE_HEADER);
+        buffer.extend_from_slice(chunk);
+        writer.write_all(&buffer).await?;
+    }
     Ok(())
 }
 
@@ -1926,6 +2138,7 @@ fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEn
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     let transport_mode = parse_transport_mode(remote)?;
     parse_packet_encoding(remote)?;
+    let flow = parse_flow_value(remote.flow.trim(), "Xboard flow")?;
     if remote.tls.is_some() && !matches!(remote.tls_mode(), 1 | 2) {
         bail!(
             "Xboard tls mode {} is not supported by NodeRS VLESS server yet",
@@ -1953,7 +2166,10 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if !decryption.is_empty() && !decryption.eq_ignore_ascii_case("none") {
         bail!("Xboard decryption must be none for VLESS nodes");
     }
-    validate_flow_value(remote.flow.trim(), "Xboard flow")?;
+    ensure!(
+        flow != FlowMode::XtlsRprxVision || matches!(transport_mode, TransportMode::Tcp),
+        "Xboard flow xtls-rprx-vision currently only supports VLESS tcp transport"
+    );
     Ok(())
 }
 
@@ -2179,20 +2395,31 @@ fn parse_uuid(value: &str) -> anyhow::Result<[u8; 16]> {
     Ok(uuid)
 }
 
-fn validate_request_addons(request: &codec::Request) -> anyhow::Result<()> {
+fn validate_request_addons(request: &codec::Request, allowed_flow: FlowMode) -> anyhow::Result<()> {
     ensure!(
         request.addons.seed.is_empty(),
         "VLESS addons seed is not supported by NodeRS VLESS server yet"
     );
-    validate_flow_value(request.addons.flow.trim(), "VLESS addons flow")?;
+    let request_flow = parse_flow_value(request.addons.flow.trim(), "VLESS addons flow")?;
+    ensure!(
+        request_flow == allowed_flow,
+        "VLESS addons flow does not match configured Xboard flow"
+    );
+    ensure!(
+        request_flow != FlowMode::XtlsRprxVision || request.command == Command::Tcp,
+        "VLESS xtls-rprx-vision flow currently only supports TCP requests"
+    );
     Ok(())
 }
 
-fn validate_flow_value(value: &str, field: &str) -> anyhow::Result<()> {
+fn parse_flow_value(value: &str, field: &str) -> anyhow::Result<FlowMode> {
     if value.is_empty() {
-        return Ok(());
+        return Ok(FlowMode::None);
     }
-    bail!("{field} is not supported by NodeRS VLESS server yet")
+    if value == FLOW_XTLS_RPRX_VISION {
+        return Ok(FlowMode::XtlsRprxVision);
+    }
+    bail!("unsupported {field}: {value}")
 }
 
 fn default_grpc_alpn() -> Vec<String> {
@@ -2766,8 +2993,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn writes_response_header_with_first_payload() {
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let write = tokio::spawn(async move {
+            write_response_header_and_chunk(&mut writer, FlowMode::None, [0; 16], b"pong")
+                .await
+                .expect("write response header and payload");
+        });
+
+        let mut output = [0u8; 6];
+        reader
+            .read_exact(&mut output)
+            .await
+            .expect("read combined response");
+        write.await.expect("join write");
+
+        assert_eq!(&output, &[0, 0, b'p', b'o', b'n', b'g']);
+    }
+
     #[test]
-    fn still_rejects_runtime_vless_flow_addons() {
+    fn validates_runtime_vless_flow_addons() {
         let request = codec::Request {
             user: [0u8; 16],
             addons: codec::Addons {
@@ -2778,8 +3024,10 @@ mod tests {
             destination: SocksAddr::Domain("example.com".to_string(), 443),
         };
 
-        let error = validate_request_addons(&request).expect_err("flow should be rejected");
-        assert!(error.to_string().contains("addons flow"));
+        validate_request_addons(&request, FlowMode::XtlsRprxVision).expect("matching flow");
+        let error = validate_request_addons(&request, FlowMode::None)
+            .expect_err("mismatched flow should be rejected");
+        assert!(error.to_string().contains("flow"));
 
         let request = codec::Request {
             addons: codec::Addons {
@@ -2788,8 +3036,63 @@ mod tests {
             },
             ..request
         };
-        let error = validate_request_addons(&request).expect_err("seed should be rejected");
+        let error =
+            validate_request_addons(&request, FlowMode::None).expect_err("seed should be rejected");
         assert!(error.to_string().contains("addons seed"));
+    }
+
+    #[test]
+    fn rejects_vless_vision_for_non_tcp_request() {
+        let request = codec::Request {
+            user: [0u8; 16],
+            addons: codec::Addons {
+                flow: "xtls-rprx-vision".to_string(),
+                seed: Vec::new(),
+            },
+            command: Command::Udp,
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+        };
+
+        let error = validate_request_addons(&request, FlowMode::XtlsRprxVision)
+            .expect_err("Vision UDP should be rejected");
+        assert!(error.to_string().contains("TCP"));
+    }
+
+    #[test]
+    fn parses_xboard_vless_vision_flow_for_tcp_only() {
+        let remote = NodeConfigResponse {
+            flow: "xtls-rprx-vision".to_string(),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("vision config");
+        assert_eq!(config.flow, FlowMode::XtlsRprxVision);
+
+        let remote = NodeConfigResponse {
+            flow: "xtls-rprx-vision".to_string(),
+            network: "xhttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("non-tcp vision");
+        assert!(error.to_string().contains("tcp transport"));
+    }
+
+    #[test]
+    fn encodes_vless_vision_response_header_and_first_payload() {
+        let user = [7u8; 16];
+        let response = encode_response_header(FlowMode::XtlsRprxVision, user, b"pong")
+            .expect("encode vision response");
+
+        assert_eq!(&response[..2], &codec::RESPONSE_HEADER);
+        assert_eq!(&response[2..18], &user);
+        assert_eq!(response[18], 1);
+        assert_eq!(&response[19..21], &4u16.to_be_bytes());
+        assert_eq!(&response[21..23], &0u16.to_be_bytes());
+        assert_eq!(&response[23..], b"pong");
     }
 
     #[test]

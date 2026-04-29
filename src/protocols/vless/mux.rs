@@ -89,7 +89,7 @@ impl SessionEntry {
     }
 }
 
-pub async fn relay<S>(
+pub(crate) async fn relay<S>(
     stream: S,
     routing: RoutingTable,
     control: Arc<SessionControl>,
@@ -174,7 +174,7 @@ where
             Ok(false)
         }
         STATUS_KEEPALIVE => Ok(false),
-        other => bail!("unsupported VLESS mux status {other:#x}"),
+        other => bail!("unsupported mux status {other:#x}"),
     }
 }
 
@@ -192,7 +192,7 @@ where
     let target = frame
         .target
         .clone()
-        .ok_or_else(|| anyhow!("VLESS mux new frame is missing its destination"))?;
+        .ok_or_else(|| anyhow!("mux new frame is missing its destination"))?;
 
     if let Some(previous) = take_session(sessions, frame.session_id) {
         previous.shutdown().await;
@@ -297,7 +297,7 @@ where
     let generation = next_session_generation();
     let remote = transport::connect_tcp_destination(&destination, routing)
         .await
-        .with_context(|| format!("connect VLESS mux TCP destination {destination}"))?;
+        .with_context(|| format!("connect mux TCP destination {destination}"))?;
     let (remote_reader, remote_writer) = split(remote);
     let remote_writer = Arc::new(AsyncMutex::new(remote_writer));
 
@@ -395,12 +395,12 @@ async fn send_frame_to_session(
         SessionKind::Tcp { writer } => {
             ensure!(
                 target_override.is_none(),
-                "VLESS mux TCP session does not accept per-frame target overrides"
+                "mux TCP session does not accept per-frame target overrides"
             );
             let mut writer = writer.lock().await;
             tokio::select! {
                 _ = control.cancelled() => Ok(()),
-                result = writer.write_all(payload) => result.context("write VLESS mux TCP payload"),
+                result = writer.write_all(payload) => result.context("write mux TCP payload"),
             }
         }
         SessionKind::Udp(session) => {
@@ -420,7 +420,7 @@ async fn send_udp_payload(
         Some(target) => {
             ensure!(
                 target.network == TargetNetwork::Udp,
-                "VLESS mux UDP session received a non-UDP target override"
+                "mux UDP session received a non-UDP target override"
             );
             &target.destination
         }
@@ -430,11 +430,11 @@ async fn send_udp_payload(
     let target = transport::normalize_udp_target(&session.socket, target);
     let sent = tokio::select! {
         _ = control.cancelled() => return Ok(()),
-        sent = session.socket.send_to(payload, target) => sent.with_context(|| format!("send VLESS mux UDP payload to {target}"))?,
+        sent = session.socket.send_to(payload, target) => sent.with_context(|| format!("send mux UDP payload to {target}"))?,
     };
     ensure!(
         sent == payload.len(),
-        "short VLESS mux UDP send: expected {}, wrote {}",
+        "short mux UDP send: expected {}, wrote {}",
         payload.len(),
         sent
     );
@@ -455,7 +455,7 @@ where
     loop {
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            read = reader.read(&mut buffer) => read.context("read VLESS mux TCP response")?,
+            read = reader.read(&mut buffer) => read.context("read mux TCP response")?,
         };
         if read == 0 {
             return Ok(());
@@ -486,7 +486,7 @@ where
     loop {
         let (payload_len, source) = tokio::select! {
             _ = control.cancelled() => return Ok(()),
-            read = socket.recv_from(&mut buffer) => read.context("receive VLESS mux UDP response")?,
+            read = socket.recv_from(&mut buffer) => read.context("receive mux UDP response")?,
         };
         let source = transport::normalize_udp_source(source);
         write_data_frame(

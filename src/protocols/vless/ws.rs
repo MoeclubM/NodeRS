@@ -156,11 +156,19 @@ where
         .request
         .header("Sec-WebSocket-Key")
         .ok_or_else(|| anyhow!("missing Sec-WebSocket-Key"))?;
+    let protocol = parsed.request.header("Sec-WebSocket-Protocol");
+    let early_data = websocket_early_data(protocol);
 
     let accept_key = websocket_accept_key(key);
-    let response = format!(
+    let mut response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
     );
+    if let Some(protocol) = protocol.filter(|_| early_data.is_some()) {
+        response.insert_str(
+            response.len() - 2,
+            &format!("Sec-WebSocket-Protocol: {}\r\n", protocol.trim()),
+        );
+    }
     stream
         .write_all(response.as_bytes())
         .await
@@ -173,7 +181,7 @@ where
     let (socket_writer, socket_reader) = websocket.split();
 
     let request_task = tokio::spawn(async move {
-        let result = pump_request(socket_reader, request_sink).await;
+        let result = pump_request(socket_reader, request_sink, early_data).await;
         match result {
             Ok(()) => Ok(()),
             Err(error) if is_closed_error(&error) => Ok(()),
@@ -200,10 +208,16 @@ where
 async fn pump_request<S>(
     mut reader: SplitStream<WebSocketStream<PrefixedIo<S>>>,
     mut sink: DuplexStream,
+    early_data: Option<Vec<u8>>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    if let Some(early_data) = early_data {
+        sink.write_all(&early_data)
+            .await
+            .context("write WebSocket early data into VLESS pipe")?;
+    }
     while let Some(message) = reader.next().await {
         match message.context("read WebSocket frame")? {
             Message::Binary(payload) => sink
@@ -249,6 +263,21 @@ fn websocket_accept_key(key: &str) -> String {
     sha1.update(key.trim().as_bytes());
     sha1.update(WEBSOCKET_GUID.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(sha1.finalize())
+}
+
+fn websocket_early_data(protocol: Option<&str>) -> Option<Vec<u8>> {
+    let protocol = protocol?.trim();
+    if protocol.is_empty() {
+        return None;
+    }
+    let encoded = protocol
+        .replace('+', "-")
+        .replace('/', "_")
+        .replace('=', "");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .ok()
+        .filter(|data| !data.is_empty())
 }
 
 fn matches_header_value(value: Option<&str>, expected: &str) -> bool {
@@ -350,6 +379,55 @@ mod tests {
             .expect("response exists")
             .expect("response frame");
         assert_eq!(response.into_data().as_ref(), b"world");
+
+        server_task.await.expect("join server task");
+    }
+
+    #[tokio::test]
+    async fn accepts_websocket_early_data_protocol_header() {
+        let config = WsConfig::from_network_settings(Some(&serde_json::json!({
+            "path": "/ws",
+            "headers": {
+                "Host": "example.com"
+            }
+        })))
+        .expect("parse config");
+        let (mut client, server) = duplex(8192);
+
+        let server_task = tokio::spawn(async move {
+            let Some(mut stream) = accept(server, &config).await.expect("accept") else {
+                panic!("expected WebSocket stream");
+            };
+            let mut request = [0u8; 5];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("read early data");
+            assert_eq!(&request, b"hello");
+        });
+
+        let key = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        let early_data = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"hello");
+        let request = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Protocol: {early_data}\r\n\r\n"
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let read = client.read(&mut buffer).await.expect("read response");
+        response.extend_from_slice(&buffer[..read]);
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response header end")
+            + 4;
+        let text = String::from_utf8(response[..header_end].to_vec()).expect("utf8 response");
+        assert!(text.contains("101 Switching Protocols"));
+        assert!(text.contains("Sec-WebSocket-Protocol"));
 
         server_task.await.expect("join server task");
     }

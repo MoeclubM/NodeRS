@@ -4,6 +4,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha224};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -30,6 +31,7 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const TROJAN_AUTH_HEX_LEN: usize = 56;
+const MAX_UDP_PAYLOAD_LEN: usize = 8192;
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
@@ -81,6 +83,35 @@ struct FallbackTarget {
     server_port: u16,
     #[serde(default)]
     xver: u8,
+    #[serde(skip)]
+    kind: FallbackTargetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FallbackTargetKind {
+    #[default]
+    Tcp,
+    Unix,
+}
+
+impl FallbackTarget {
+    fn tcp(server: impl Into<String>, server_port: u16) -> Self {
+        Self {
+            server: server.into(),
+            server_port,
+            xver: 0,
+            kind: FallbackTargetKind::Tcp,
+        }
+    }
+
+    fn unix(path: impl Into<String>) -> Self {
+        Self {
+            server: path.into(),
+            server_port: 0,
+            xver: 0,
+            kind: FallbackTargetKind::Unix,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -546,14 +577,13 @@ async fn serve_connection(
         .selected_alpn_protocol()
         .map(|value| value.to_vec());
     let mut consumed = Vec::with_capacity(128);
-    let handshake = timeout(
+    let auth = match timeout(
         AUTHENTICATION_TIMEOUT,
-        read_handshake(&mut stream, &users, &mut consumed),
+        read_auth_token(&mut stream, &mut consumed),
     )
-    .await;
-
-    let (user, command) = match handshake {
-        Ok(Ok(value)) => value,
+    .await
+    {
+        Ok(Ok(auth)) => auth,
         Ok(Err(error)) => {
             if let Some(target) = fallbacks.select(
                 server_name.as_deref(),
@@ -576,6 +606,29 @@ async fn serve_connection(
             }
             return Err(anyhow!("Trojan authentication timed out"));
         }
+    };
+    let user = match users.get(&auth) {
+        Some(user) => user,
+        None => {
+            if let Some(target) = fallbacks.select(
+                server_name.as_deref(),
+                negotiated_alpn.as_deref(),
+                &consumed,
+            ) {
+                proxy_fallback(stream, source, target, consumed).await?;
+                return Ok(());
+            }
+            return Err(anyhow!("unknown Trojan user"));
+        }
+    };
+    let command = match timeout(
+        AUTHENTICATION_TIMEOUT,
+        read_request(&mut stream, &mut consumed),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(anyhow!("Trojan request timed out")),
     };
 
     let lease = accounting.open_session(&user, source)?;
@@ -673,15 +726,7 @@ async fn proxy_fallback(
         .get_ref()
         .local_addr()
         .context("read Trojan fallback local address")?;
-    let fallback = TcpStream::connect((target.server.as_str(), target.server_port))
-        .await
-        .with_context(|| {
-            format!(
-                "connect Trojan fallback {}:{}",
-                target.server, target.server_port
-            )
-        })?;
-    configure_tcp_stream(&fallback);
+    let fallback = connect_fallback_target(target).await?;
     let control = SessionControl::new();
     let (mut client_reader, mut client_writer) = split(stream);
     let (mut fallback_reader, mut fallback_writer) = split(fallback);
@@ -709,6 +754,112 @@ async fn proxy_fallback(
         copy_with_traffic(&mut fallback_reader, &mut client_writer, control, None);
     let _ = tokio::try_join!(client_to_fallback, fallback_to_client)?;
     Ok(())
+}
+
+async fn connect_fallback_target(target: &FallbackTarget) -> anyhow::Result<FallbackStream> {
+    match target.kind {
+        FallbackTargetKind::Tcp => {
+            let fallback = TcpStream::connect((target.server.as_str(), target.server_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "connect Trojan fallback {}:{}",
+                        target.server, target.server_port
+                    )
+                })?;
+            configure_tcp_stream(&fallback);
+            Ok(FallbackStream::Tcp(fallback))
+        }
+        FallbackTargetKind::Unix => connect_unix_fallback(&target.server).await,
+    }
+}
+
+enum FallbackStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl AsyncRead for FallbackStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for FallbackStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn connect_unix_fallback(path: &str) -> anyhow::Result<FallbackStream> {
+    #[cfg(unix)]
+    {
+        let connect_path = unix_fallback_connect_path(path)?;
+        let stream = tokio::net::UnixStream::connect(connect_path.as_str())
+            .await
+            .with_context(|| format!("connect Trojan unix fallback {path}"))?;
+        Ok(FallbackStream::Unix(stream))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("Trojan unix fallback is not supported on this platform")
+    }
+}
+
+#[cfg(unix)]
+fn unix_fallback_connect_path(path: &str) -> anyhow::Result<String> {
+    if let Some(name) = path.strip_prefix('@') {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            return Ok(format!("\0{name}"));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = name;
+            bail!("Trojan abstract unix fallback is only supported on Linux and Android")
+        }
+    }
+    Ok(path.to_string())
 }
 
 async fn relay_client_to_udp(
@@ -839,19 +990,6 @@ struct TrojanUdpPacket {
     wire_len: usize,
 }
 
-async fn read_handshake(
-    stream: &mut TlsStream,
-    users: &UserValidator,
-    consumed: &mut Vec<u8>,
-) -> anyhow::Result<(UserEntry, TrojanCommand)> {
-    let auth = read_auth_token(stream, consumed).await?;
-    let user = users
-        .get(&auth)
-        .ok_or_else(|| anyhow!("unknown Trojan user"))?;
-    let command = read_request(stream, consumed).await?;
-    Ok((user, command))
-}
-
 async fn read_auth_token<R>(
     reader: &mut R,
     consumed: &mut Vec<u8>,
@@ -907,6 +1045,12 @@ where
         return Ok(None);
     };
     let length = read_u16(reader, "read Trojan UDP payload length").await?;
+    ensure!(
+        length as usize <= MAX_UDP_PAYLOAD_LEN,
+        "Trojan UDP payload length {} exceeds limit {}",
+        length,
+        MAX_UDP_PAYLOAD_LEN
+    );
     ensure_crlf_plain(reader, "read Trojan UDP delimiter").await?;
     let mut payload = vec![0u8; length as usize];
     reader
@@ -1005,9 +1149,11 @@ where
 }
 
 fn encode_udp_packet(source: &SocksAddr, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if payload.len() > u16::MAX as usize {
-        bail!("Trojan UDP payload too large: {}", payload.len());
-    }
+    ensure!(
+        payload.len() <= MAX_UDP_PAYLOAD_LEN,
+        "Trojan UDP payload too large: {}",
+        payload.len()
+    );
 
     let mut encoded = Vec::with_capacity(address_wire_len(source) + 2 + CRLF.len() + payload.len());
     write_socks_addr(&mut encoded, source)?;
@@ -1317,13 +1463,14 @@ fn parse_fallback_map(
 }
 
 fn parse_fallback_target(value: &serde_json::Value) -> anyhow::Result<FallbackTarget> {
-    let target: FallbackTarget =
+    let mut target: FallbackTarget =
         serde_json::from_value(value.clone()).context("parse Trojan fallback target")?;
     ensure!(
         !target.server.trim().is_empty() && target.server_port > 0,
         "Trojan fallback target requires server and server_port"
     );
     ensure!(target.xver <= 2, "Trojan fallback xver must be 0, 1 or 2");
+    target.kind = FallbackTargetKind::Tcp;
     Ok(target)
 }
 
@@ -1361,15 +1508,11 @@ fn parse_xboard_fallback_entry(value: &serde_json::Value) -> anyhow::Result<Pars
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    ensure!(
-        fallback_type.is_empty() || fallback_type.eq_ignore_ascii_case("tcp"),
-        "Xboard Trojan fallback type is not supported yet"
-    );
 
     let dest = object
         .get("dest")
         .ok_or_else(|| anyhow!("Xboard Trojan fallback entry requires dest"))?;
-    let mut target = parse_xboard_fallback_dest(dest)?;
+    let mut target = parse_xboard_fallback_dest(dest, fallback_type)?;
     target.xver = xver;
 
     let alpn = object
@@ -1400,9 +1543,16 @@ fn parse_u8_json(value: &serde_json::Value) -> anyhow::Result<u8> {
     }
 }
 
-fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<FallbackTarget> {
+fn parse_xboard_fallback_dest(
+    value: &serde_json::Value,
+    fallback_type: &str,
+) -> anyhow::Result<FallbackTarget> {
     match value {
         serde_json::Value::Number(number) => {
+            ensure!(
+                fallback_type.is_empty() || fallback_type.eq_ignore_ascii_case("tcp"),
+                "Xboard Trojan fallback type is not supported yet"
+            );
             let port = number
                 .as_u64()
                 .ok_or_else(|| anyhow!("Xboard Trojan fallback dest must be a TCP port"))?;
@@ -1412,17 +1562,27 @@ fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<Fallb
                 server_port > 0,
                 "Xboard Trojan fallback port must be non-zero"
             );
-            Ok(FallbackTarget {
-                server: "127.0.0.1".to_string(),
-                server_port,
-                xver: 0,
-            })
+            Ok(FallbackTarget::tcp("localhost", server_port))
         }
         serde_json::Value::String(text) => {
             let compact = text.trim();
+            ensure!(!compact.is_empty(), "Xboard Trojan fallback dest is empty");
+            if compact == "serve-ws-none" || fallback_type.eq_ignore_ascii_case("serve") {
+                bail!("Xboard Trojan fallback serve type is not supported by NodeRS");
+            }
+            if fallback_type.eq_ignore_ascii_case("unix")
+                || (fallback_type.is_empty()
+                    && (compact.starts_with('/') || compact.starts_with('@')))
+            {
+                ensure!(
+                    compact.starts_with('/') || compact.starts_with('@'),
+                    "Xboard Trojan unix fallback dest must be an absolute path or abstract socket"
+                );
+                return Ok(FallbackTarget::unix(compact));
+            }
             ensure!(
-                !compact.is_empty() && !compact.starts_with('/') && !compact.starts_with('@'),
-                "Xboard Trojan fallback dest must be tcp host:port or port"
+                fallback_type.is_empty() || fallback_type.eq_ignore_ascii_case("tcp"),
+                "Xboard Trojan fallback type is not supported yet"
             );
             if compact.chars().all(|ch| ch.is_ascii_digit()) {
                 let server_port = compact
@@ -1432,11 +1592,7 @@ fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<Fallb
                     server_port > 0,
                     "Xboard Trojan fallback port must be non-zero"
                 );
-                return Ok(FallbackTarget {
-                    server: "127.0.0.1".to_string(),
-                    server_port,
-                    xver: 0,
-                });
+                return Ok(FallbackTarget::tcp("localhost", server_port));
             }
 
             let (server, port) = compact
@@ -1454,11 +1610,7 @@ fn parse_xboard_fallback_dest(value: &serde_json::Value) -> anyhow::Result<Fallb
                 server_port > 0,
                 "Xboard Trojan fallback port must be non-zero"
             );
-            Ok(FallbackTarget {
-                server: server.trim().to_string(),
-                server_port,
-                xver: 0,
-            })
+            Ok(FallbackTarget::tcp(server.trim(), server_port))
         }
         _ => bail!("Xboard Trojan fallback dest must be a string or number"),
     }
@@ -1624,17 +1776,16 @@ mod tests {
         };
 
         let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        let default = config
+            .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
+            .expect("default fallback");
+        assert_eq!(default.server, "localhost");
+        assert_eq!(default.server_port, 80);
         assert_eq!(
             config
                 .select(None, Some(b"h2"), b"GET / HTTP/1.1\r\n\r\n")
                 .map(|target| target.server_port),
             Some(8443)
-        );
-        assert_eq!(
-            config
-                .select(None, Some(b"http/1.1"), b"GET / HTTP/1.1\r\n\r\n")
-                .map(|target| target.server_port),
-            Some(80)
         );
     }
 
@@ -1670,6 +1821,72 @@ mod tests {
                 .map(|target| target.server_port),
             Some(80)
         );
+    }
+
+    #[test]
+    fn parses_xboard_unix_fallback_dest() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "type": "unix", "dest": "/run/trojan-fallback.sock" }
+            ])),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        let target = config
+            .select(None, None, b"GET / HTTP/1.1\r\n\r\n")
+            .expect("unix fallback");
+        assert_eq!(target.kind, FallbackTargetKind::Unix);
+        assert_eq!(target.server, "/run/trojan-fallback.sock");
+        assert_eq!(target.server_port, 0);
+    }
+
+    #[test]
+    fn parses_xboard_abstract_unix_fallback_dest() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "type": "unix", "dest": "@trojan-fallback" }
+            ])),
+            ..base_remote()
+        };
+
+        let config = FallbackConfig::from_remote(&remote).expect("fallback config");
+        let target = config
+            .select(None, None, b"GET / HTTP/1.1\r\n\r\n")
+            .expect("abstract unix fallback");
+        assert_eq!(target.kind, FallbackTargetKind::Unix);
+        assert_eq!(target.server, "@trojan-fallback");
+        assert_eq!(target.server_port, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn connects_abstract_unix_fallback() {
+        let public_name = format!("@noders-trojan-test-{}", std::process::id());
+        let bind_name = public_name.replacen('@', "\0", 1);
+        let listener = tokio::net::UnixListener::bind(bind_name).expect("bind abstract listener");
+        let mut client = connect_unix_fallback(&public_name)
+            .await
+            .expect("connect abstract fallback");
+        let (mut server, _) = listener.accept().await.expect("accept abstract client");
+
+        client.write_all(b"ping").await.expect("write client");
+        let mut payload = [0u8; 4];
+        server.read_exact(&mut payload).await.expect("read server");
+        assert_eq!(&payload, b"ping");
+    }
+
+    #[test]
+    fn rejects_xboard_serve_fallback_type() {
+        let remote = NodeConfigResponse {
+            fallbacks: Some(serde_json::json!([
+                { "dest": "serve-ws-none" }
+            ])),
+            ..base_remote()
+        };
+
+        let error = FallbackConfig::from_remote(&remote).expect_err("serve fallback");
+        assert!(error.to_string().contains("serve"));
     }
 
     #[test]
@@ -1791,12 +2008,36 @@ mod tests {
         assert_eq!(packet.wire_len, 1 + 1 + 11 + 2 + 2 + 2 + 5);
     }
 
+    #[tokio::test]
+    async fn rejects_oversized_trojan_udp_packet() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x01\x01\x02\x03\x04\x005");
+        bytes.extend_from_slice(&((MAX_UDP_PAYLOAD_LEN + 1) as u16).to_be_bytes());
+
+        let error = read_udp_packet(&mut bytes.as_slice())
+            .await
+            .expect_err("oversized packet should fail");
+        assert!(error.to_string().contains("exceeds limit"));
+    }
+
     #[test]
     fn encodes_trojan_udp_packet() {
         let encoded =
             encode_udp_packet(&SocksAddr::Ip(SocketAddr::from(([1, 2, 3, 4], 53))), b"abc")
                 .expect("encode packet");
         assert_eq!(encoded, b"\x01\x01\x02\x03\x04\x005\x00\x03\r\nabc");
+    }
+
+    #[test]
+    fn rejects_oversized_trojan_udp_encode() {
+        let payload = vec![0u8; MAX_UDP_PAYLOAD_LEN + 1];
+        let error = encode_udp_packet(
+            &SocksAddr::Ip(SocketAddr::from(([1, 2, 3, 4], 53))),
+            &payload,
+        )
+        .expect_err("oversized payload should fail");
+
+        assert!(error.to_string().contains("too large"));
     }
 
     #[test]
