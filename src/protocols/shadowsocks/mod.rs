@@ -1847,9 +1847,9 @@ mod tests {
     async fn starts_sip003_plugin_and_loopback_tcp_listener() {
         let plugin_path = dummy_plugin_path();
         let script = if cfg!(windows) {
-            "@echo off\r\nset > %SS_PLUGIN_OPTIONS%\r\nping -n 6 127.0.0.1 > nul\r\n"
+            "@echo off\r\n(\r\necho SS_REMOTE_HOST=%SS_REMOTE_HOST%\r\necho SS_REMOTE_PORT=%SS_REMOTE_PORT%\r\necho SS_LOCAL_HOST=%SS_LOCAL_HOST%\r\necho SS_LOCAL_PORT=%SS_LOCAL_PORT%\r\n) > \"%SS_PLUGIN_OPTIONS%\"\r\nping -n 6 127.0.0.1 > nul\r\n"
         } else {
-            "#!/bin/sh\nset > \"$SS_PLUGIN_OPTIONS\"\nsleep 5\n"
+            "#!/bin/sh\nprintf 'SS_REMOTE_HOST=%s\nSS_REMOTE_PORT=%s\nSS_LOCAL_HOST=%s\nSS_LOCAL_PORT=%s\n' \"$SS_REMOTE_HOST\" \"$SS_REMOTE_PORT\" \"$SS_LOCAL_HOST\" \"$SS_LOCAL_PORT\" > \"$SS_PLUGIN_OPTIONS\"\nsleep 5\n"
         };
         tokio::fs::write(&plugin_path, script)
             .await
