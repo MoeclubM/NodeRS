@@ -932,6 +932,10 @@ where
             let _ = writer.shutdown().await;
             return Ok(());
         }
+        traffic.limit(read as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
             result = writer.write_all(&buffer[..read]) => match result {
@@ -979,6 +983,10 @@ where
             writer.finish().await?;
             return Ok(());
         }
+        traffic.limit(read as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
             result = writer.write_all_plain(&buffer[..read]) => result?,
@@ -1013,6 +1021,10 @@ where
         let Some(frame) = frame else {
             return Ok(());
         };
+        traffic.limit(frame.len() as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         let sent = tokio::select! {
             _ = control.cancelled() => return Ok(()),
             sent = socket.send(&frame) => sent.context("send VMess UDP payload")?,
@@ -1042,6 +1054,10 @@ where
             _ = control.cancelled() => return Ok(()),
             read = socket.recv(&mut buffer) => read.context("receive VMess UDP payload")?,
         };
+        traffic.limit(payload_len as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
             result = writer.write_packet_plain(&buffer[..payload_len]) => result?,
@@ -1062,13 +1078,9 @@ fn flatten_join(
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    parse_transport_mode(remote)?;
-    if remote
-        .transport
-        .as_ref()
-        .is_some_and(crate::panel::json_value_is_enabled)
-    {
-        bail!("Xboard transport is not supported by NodeRS VMess server yet");
+    let transport_mode = parse_transport_mode(remote)?;
+    if let Some(transport) = remote.transport.as_ref() {
+        validate_transport_field(transport, &transport_mode)?;
     }
     if !matches!(remote.tls_mode(), 0 | 1) {
         bail!(
@@ -1130,6 +1142,38 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
         ));
     }
     bail!("Xboard network must be tcp, grpc, ws, httpupgrade or xhttp for VMess nodes");
+}
+
+fn validate_transport_field(
+    value: &serde_json::Value,
+    transport_mode: &TransportMode,
+) -> anyhow::Result<()> {
+    if !crate::panel::json_value_is_enabled(value) {
+        return Ok(());
+    }
+    let expected: &[&str] = match transport_mode {
+        TransportMode::Tcp => &["tcp"],
+        TransportMode::Grpc(_) => &["grpc"],
+        TransportMode::Ws(_) => &["ws"],
+        TransportMode::HttpUpgrade(_) => &["httpupgrade"],
+        TransportMode::Xhttp(_) => &["xhttp"],
+    };
+    let transport_type = match value {
+        serde_json::Value::String(text) => text.trim(),
+        serde_json::Value::Object(object) => object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default(),
+        _ => bail!("Xboard transport must be a string or object when provided"),
+    };
+    if expected
+        .iter()
+        .any(|expected| transport_type.eq_ignore_ascii_case(expected))
+    {
+        return Ok(());
+    }
+    bail!("Xboard transport is not supported by NodeRS VMess server yet")
 }
 
 fn default_grpc_alpn() -> Vec<String> {
@@ -1277,6 +1321,9 @@ mod tests {
                     "Host": "cdn.example.com"
                 }
             })),
+            transport: Some(serde_json::json!({
+                "type": "ws"
+            })),
             ..base_remote()
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
@@ -1297,6 +1344,7 @@ mod tests {
             network_settings: Some(serde_json::json!({
                 "serviceName": "GunService"
             })),
+            transport: Some(serde_json::json!("grpc")),
             ..base_remote()
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
@@ -1311,6 +1359,9 @@ mod tests {
             network_settings: Some(serde_json::json!({
                 "path": "/upgrade",
                 "host": "cdn.example.com"
+            })),
+            transport: Some(serde_json::json!({
+                "type": "httpupgrade"
             })),
             ..base_remote()
         };
@@ -1333,6 +1384,9 @@ mod tests {
                 "path": "/x",
                 "host": "cdn.example.com",
                 "mode": "stream-one"
+            })),
+            transport: Some(serde_json::json!({
+                "type": "xhttp"
             })),
             ..base_remote()
         };
@@ -1369,6 +1423,31 @@ mod tests {
         };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network");
         assert!(error.to_string().contains("network"));
+    }
+
+    #[test]
+    fn rejects_transport_type_mismatching_selected_network() {
+        let remote = NodeConfigResponse {
+            transport: Some(serde_json::json!({
+                "type": "ws"
+            })),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("transport");
+        assert!(error.to_string().contains("transport"));
+    }
+
+    #[test]
+    fn rejects_enabled_transport_without_type() {
+        let remote = NodeConfigResponse {
+            transport: Some(serde_json::json!({
+                "enabled": true
+            })),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("transport");
+        assert!(error.to_string().contains("transport"));
     }
 
     #[test]

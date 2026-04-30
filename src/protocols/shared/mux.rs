@@ -148,6 +148,10 @@ where
         )
         .await?;
         if count_traffic {
+            upload.limit(wire_len as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(());
+            }
             upload.record(wire_len as u64);
         }
     }
@@ -539,6 +543,12 @@ async fn write_frame_bytes<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    if let Some(traffic) = traffic {
+        traffic.limit(frame.len() as u64, control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
+    }
     let mut writer = writer.lock().await;
     tokio::select! {
         _ = control.cancelled() => Ok(()),

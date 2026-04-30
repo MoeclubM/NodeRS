@@ -182,6 +182,13 @@ async fn relay_client_to_udp(
         let Some(packet) = packet else {
             return Ok(());
         };
+        context
+            .traffic
+            .limit(packet.wire_len as u64, &context.control)
+            .await;
+        if context.control.is_cancelled() {
+            return Ok(());
+        }
         let sent = match &context.mode {
             RelayMode::Connect { .. } => tokio::select! {
                 _ = context.control.cancelled() => return Ok(()),
@@ -237,6 +244,13 @@ async fn relay_udp_to_client(
             &SocksAddr::Ip(transport::normalize_udp_source(source)),
             &buffer[..payload_len],
         )?;
+        context
+            .traffic
+            .limit(encoded.len() as u64, &context.control)
+            .await;
+        if context.control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = context.control.cancelled() => return Ok(()),
             result = writer.write_all(&encoded) => result.context("write UOT response to AnyTLS stream")?,

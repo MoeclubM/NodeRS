@@ -336,7 +336,8 @@ impl MachineRuntime {
                 .insert(summary.id, node);
             info!(
                 node_id = summary.id,
-                protocol = protocol.as_str(),
+                machine_id = self.panel.machine_id(),
+                node_type = protocol.as_str(),
                 "started panel-managed node"
             );
         }

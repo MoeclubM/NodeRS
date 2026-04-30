@@ -1837,6 +1837,10 @@ where
         return Ok(total);
     }
 
+    traffic.limit(read as u64, &control).await;
+    if control.is_cancelled() {
+        return Ok(total);
+    }
     tokio::select! {
         _ = control.cancelled() => return Ok(total),
         result = write_response_header_and_chunk(writer, flow, request_user, &buffer[..read]) => match result {
@@ -2086,6 +2090,10 @@ where
             return Ok(());
         };
 
+        traffic.limit(frame.wire_len as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         let sent = tokio::select! {
             _ = control.cancelled() => return Ok(()),
             sent = socket.send(&frame.payload) => sent.context("send VLESS UDP payload")?,
@@ -2116,6 +2124,10 @@ where
             read = socket.recv(&mut buffer) => read.context("receive VLESS UDP payload")?,
         };
         let encoded = codec::encode_udp_frame(&buffer[..payload_len])?;
+        traffic.limit(encoded.len() as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
             result = writer.write_all(&encoded) => result.context("write VLESS UDP response")?,
@@ -2156,6 +2168,12 @@ where
         if read == 0 {
             let _ = writer.shutdown().await;
             return Ok(total);
+        }
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.limit(read as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
         }
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
@@ -2306,10 +2324,9 @@ fn validate_transport_field(
         }
     };
 
-    if transport_type.is_empty()
-        || expected
-            .iter()
-            .any(|expected| transport_type.eq_ignore_ascii_case(expected))
+    if expected
+        .iter()
+        .any(|expected| transport_type.eq_ignore_ascii_case(expected))
     {
         return Ok(());
     }
@@ -3012,6 +3029,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_xboard_vless_xhttp_reality_config() {
+        let remote: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "listen_ip": "0.0.0.0",
+            "server_port": 443,
+            "network": "xhttp",
+            "networkSettings": {
+                "path": "/xhttp",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            },
+            "tls": 2,
+            "flow": "",
+            "decryption": null,
+            "tls_settings": {
+                "server_name": "reality.example.com",
+                "server_port": "8443",
+                "public_key": REALITY_KEY_B64,
+                "private_key": REALITY_KEY_B64,
+                "short_id": "a1b2",
+                "allow_insecure": false
+            },
+            "multiplex": null
+        }))
+        .expect("parse Xboard VLESS XHTTP REALITY config");
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("effective config");
+        assert_eq!(config.server_port, 443);
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
+        let reality = config
+            .tls
+            .expect("tls config")
+            .reality
+            .expect("reality config");
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.server_port, 8443);
+        assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
+    }
+
+    #[test]
     fn accepts_xhttp_network_settings() {
         let remote = NodeConfigResponse {
             network: "xhttp".to_string(),
@@ -3270,6 +3327,19 @@ mod tests {
         };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("non-tcp vision");
         assert!(error.to_string().contains("tcp transport"));
+    }
+
+    #[test]
+    fn rejects_enabled_transport_without_type() {
+        let remote = NodeConfigResponse {
+            transport: Some(serde_json::json!({
+                "enabled": true
+            })),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("transport");
+        assert!(error.to_string().contains("transport"));
     }
 
     #[test]

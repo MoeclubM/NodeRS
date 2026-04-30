@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Notify;
+use tokio::time::{Duration, Instant};
 
 use crate::panel::PanelUser;
 
@@ -12,6 +13,7 @@ pub struct UserEntry {
     pub id: i64,
     pub uuid: String,
     pub password_sha256: [u8; 32],
+    pub speed_limit: i64,
     pub device_limit: i64,
 }
 
@@ -22,7 +24,54 @@ impl UserEntry {
             id: user.id,
             uuid: uuid.to_string(),
             password_sha256: sha256_bytes(uuid.as_bytes()),
+            speed_limit: user.speed_limit,
             device_limit: user.device_limit,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SpeedLimiter {
+    bytes_per_second: AtomicU64,
+    next: Mutex<Instant>,
+}
+
+impl SpeedLimiter {
+    fn new(bytes_per_second: u64) -> Arc<Self> {
+        Arc::new(Self {
+            bytes_per_second: AtomicU64::new(bytes_per_second),
+            next: Mutex::new(Instant::now()),
+        })
+    }
+
+    fn set_bytes_per_second(&self, bytes_per_second: u64) {
+        let previous = self
+            .bytes_per_second
+            .swap(bytes_per_second, Ordering::Relaxed);
+        if previous != bytes_per_second {
+            *self.next.lock().expect("speed limiter lock poisoned") = Instant::now();
+        }
+    }
+
+    pub async fn wait(&self, bytes: u64, control: &SessionControl) {
+        let bytes_per_second = self.bytes_per_second.load(Ordering::Relaxed);
+        if bytes == 0 || bytes_per_second == 0 || control.is_cancelled() {
+            return;
+        }
+
+        let wait_until = {
+            let mut next = self.next.lock().expect("speed limiter lock poisoned");
+            let now = Instant::now();
+            if *next < now {
+                *next = now;
+            }
+            *next += Duration::from_secs_f64(bytes as f64 / bytes_per_second as f64);
+            *next
+        };
+
+        tokio::select! {
+            _ = control.cancelled() => {}
+            _ = tokio::time::sleep_until(wait_until) => {}
         }
     }
 }
@@ -132,6 +181,7 @@ impl Drop for SessionLease {
 pub struct Accounting {
     users: RwLock<HashMap<[u8; 32], UserEntry>>,
     traffic: RwLock<HashMap<i64, Arc<UsageCounter>>>,
+    speed_limiters: RwLock<HashMap<i64, Arc<SpeedLimiter>>>,
     online: Mutex<HashMap<i64, HashMap<String, usize>>>,
     external_alive: Mutex<HashMap<i64, usize>>,
     sessions: Mutex<HashMap<i64, HashMap<u64, Arc<SessionControl>>>>,
@@ -186,6 +236,20 @@ impl Accounting {
                     .or_insert_with(|| Arc::new(UsageCounter::default()));
             }
             traffic.retain(|uid, _| valid_ids.contains(uid));
+        }
+        {
+            let mut speed_limiters = self
+                .speed_limiters
+                .write()
+                .expect("speed limiter lock poisoned");
+            for user in users {
+                let bytes_per_second = speed_limit_bytes_per_second(user.speed_limit);
+                speed_limiters
+                    .entry(user.id)
+                    .or_insert_with(|| SpeedLimiter::new(bytes_per_second))
+                    .set_bytes_per_second(bytes_per_second);
+            }
+            speed_limiters.retain(|uid, _| valid_ids.contains(uid));
         }
         self.online
             .lock()
@@ -268,6 +332,26 @@ impl Accounting {
         guard
             .entry(uid)
             .or_insert_with(|| Arc::new(UsageCounter::default()))
+            .clone()
+    }
+
+    pub fn speed_limiter(&self, uid: i64) -> Arc<SpeedLimiter> {
+        if let Some(limiter) = self
+            .speed_limiters
+            .read()
+            .expect("speed limiter lock poisoned")
+            .get(&uid)
+            .cloned()
+        {
+            return limiter;
+        }
+        let mut guard = self
+            .speed_limiters
+            .write()
+            .expect("speed limiter lock poisoned");
+        guard
+            .entry(uid)
+            .or_insert_with(|| SpeedLimiter::new(0))
             .clone()
     }
 
@@ -382,6 +466,12 @@ fn normalize_ip(ip: String) -> String {
     ip.trim_start_matches("::ffff:").to_string()
 }
 
+fn speed_limit_bytes_per_second(speed_limit: i64) -> u64 {
+    u64::try_from(speed_limit)
+        .unwrap_or(0)
+        .saturating_mul(125_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +559,28 @@ mod tests {
 
         accounting.restore_traffic(&snapshot);
         assert_eq!(accounting.snapshot_traffic(0).get(&1), Some(&[100, 40]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speed_limiter_waits_for_configured_user_rate() {
+        let accounting = Accounting::new();
+        accounting.replace_users(&[PanelUser {
+            id: 1,
+            uuid: "abc".to_string(),
+            speed_limit: 1,
+            ..Default::default()
+        }]);
+        let control = SessionControl::new();
+        let limiter = accounting.speed_limiter(1);
+        let wait = limiter.wait(125_000, &control);
+        tokio::pin!(wait);
+
+        tokio::select! {
+            _ = &mut wait => panic!("speed limiter completed before configured interval"),
+            _ = tokio::time::sleep(Duration::from_millis(999)) => {}
+        }
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait.await;
     }
 }

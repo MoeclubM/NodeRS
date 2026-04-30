@@ -1544,6 +1544,10 @@ async fn relay_client_to_udp(
         let target =
             resolve_udp_target(&packet.destination, &routing, &mut destination_cache).await?;
         let target = transport::normalize_udp_target(&socket, target);
+        traffic.limit(packet.wire_len as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         let sent = tokio::select! {
             _ = control.cancelled() => return Ok(()),
             sent = socket.send_to(&packet.payload, target) => sent.with_context(|| format!("send Trojan UDP payload to {target}"))?,
@@ -1575,6 +1579,10 @@ async fn relay_udp_to_client(
             &SocksAddr::Ip(transport::normalize_udp_source(source)),
             &buffer[..payload_len],
         )?;
+        traffic.limit(encoded.len() as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
             result = writer.write_all(&encoded) => result.context("write Trojan UDP response")?,
@@ -1615,6 +1623,12 @@ where
         if read == 0 {
             let _ = writer.shutdown().await;
             return Ok(total);
+        }
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.limit(read as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
         }
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
@@ -1975,7 +1989,7 @@ where
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    parse_transport_mode(remote)?;
+    let transport_mode = parse_transport_mode(remote)?;
     if remote.tls.is_some() && !matches!(remote.tls_mode(), 1 | 2) {
         anyhow::bail!(
             "Xboard tls mode {} is not supported by NodeRS Trojan server yet",
@@ -1989,7 +2003,7 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         anyhow::bail!("Trojan REALITY settings require Xboard tls mode 2");
     }
     if let Some(transport) = remote.transport.as_ref() {
-        validate_transport_field(transport)?;
+        validate_transport_field(transport, &transport_mode)?;
     }
     if remote.multiplex_enabled() {
         anyhow::bail!("Xboard multiplex is not supported by NodeRS Trojan server yet");
@@ -2042,10 +2056,20 @@ fn default_xhttp_alpn() -> Vec<String> {
     vec!["http/1.1".to_string(), "h2".to_string()]
 }
 
-fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
+fn validate_transport_field(
+    value: &serde_json::Value,
+    transport_mode: &TransportMode,
+) -> anyhow::Result<()> {
     if !crate::panel::json_value_is_enabled(value) {
         return Ok(());
     }
+    let expected: &[&str] = match transport_mode {
+        TransportMode::Tcp => &["tcp"],
+        TransportMode::Grpc(_) => &["grpc"],
+        TransportMode::Ws(_) => &["ws"],
+        TransportMode::HttpUpgrade(_) => &["httpupgrade"],
+        TransportMode::Xhttp(_) => &["xhttp"],
+    };
     let transport_type = match value {
         serde_json::Value::String(text) => text.trim(),
         serde_json::Value::Object(object) => object
@@ -2055,7 +2079,10 @@ fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
             .unwrap_or_default(),
         _ => bail!("Xboard transport must be a string or object when provided"),
     };
-    if transport_type.is_empty() || transport_type.eq_ignore_ascii_case("tcp") {
+    if expected
+        .iter()
+        .any(|expected| transport_type.eq_ignore_ascii_case(expected))
+    {
         return Ok(());
     }
     bail!("Xboard transport is not supported by NodeRS Trojan server yet")
@@ -2748,10 +2775,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_transport_extensions() {
+    fn rejects_transport_type_mismatching_selected_network() {
         let remote = NodeConfigResponse {
             transport: Some(serde_json::json!({
                 "type": "ws"
+            })),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("transport");
+        assert!(error.to_string().contains("transport"));
+    }
+
+    #[test]
+    fn rejects_enabled_transport_without_type() {
+        let remote = NodeConfigResponse {
+            transport: Some(serde_json::json!({
+                "enabled": true
             })),
             ..base_remote()
         };
@@ -2770,6 +2810,9 @@ mod tests {
                     "Host": "cdn.example.com"
                 }
             })),
+            transport: Some(serde_json::json!({
+                "type": "ws"
+            })),
             ..base_remote()
         };
 
@@ -2784,6 +2827,7 @@ mod tests {
             network_settings: Some(serde_json::json!({
                 "serviceName": "TunService"
             })),
+            transport: Some(serde_json::json!("grpc")),
             ..base_remote()
         };
 
@@ -2800,6 +2844,9 @@ mod tests {
                 "path": "/upgrade",
                 "host": "cdn.example.com"
             })),
+            transport: Some(serde_json::json!({
+                "type": "httpupgrade"
+            })),
             ..base_remote()
         };
 
@@ -2815,6 +2862,9 @@ mod tests {
                 "path": "/x",
                 "host": "cdn.example.com",
                 "mode": "stream-one"
+            })),
+            transport: Some(serde_json::json!({
+                "type": "xhttp"
             })),
             ..base_remote()
         };

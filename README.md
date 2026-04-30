@@ -1,6 +1,6 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, VLESS, Trojan, VMess, and Shadowsocks protocol handlers.
+NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, Hysteria2, Mieru, Shadowsocks, Trojan, VLESS, and VMess protocol handlers.
 
 ## Overview
 

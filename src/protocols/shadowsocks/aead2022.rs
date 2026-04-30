@@ -1365,6 +1365,7 @@ mod tests {
                 id: 1,
                 uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
                 password_sha256: [0u8; 32],
+                speed_limit: 0,
                 device_limit: 0,
             },
             method: super::super::crypto::Method::Aead2022(method),

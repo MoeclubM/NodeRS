@@ -89,6 +89,10 @@ where
         let target =
             resolve_udp_target(&packet.destination, &routing, &mut destination_cache).await?;
         let target = transport::normalize_udp_target(&socket, target);
+        traffic.limit(packet.wire_len as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         let sent = tokio::select! {
             _ = control.cancelled() => return Ok(()),
             sent = socket.send_to(&packet.payload, target) => sent.with_context(|| format!("send XUDP payload to {target}"))?,
@@ -122,6 +126,10 @@ where
             &SocksAddr::Ip(transport::normalize_udp_source(source)),
             &buffer[..payload_len],
         )?;
+        traffic.limit(encoded.len() as u64, &control).await;
+        if control.is_cancelled() {
+            return Ok(());
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(()),
             result = writer.write_all(&encoded) => result.context("write XUDP response")?,

@@ -112,7 +112,6 @@ pub struct NodeConfigResponse {
     #[serde(
         default,
         alias = "obfs-password",
-        alias = "obfsPassword",
         deserialize_with = "deserialize_default_on_null"
     )]
     pub obfs_password: String,

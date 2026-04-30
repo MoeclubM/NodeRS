@@ -45,9 +45,9 @@ impl ProtocolKind {
             Some(Self::Shadowsocks)
         } else if normalized == "trojan" {
             Some(Self::Trojan)
-        } else if matches!(normalized.as_str(), "vless" | "vlessreality" | "vlessxtls") {
+        } else if normalized == "vless" {
             Some(Self::Vless)
-        } else if matches!(normalized.as_str(), "vmess" | "v2ray") {
+        } else if normalized == "vmess" {
             Some(Self::Vmess)
         } else {
             None
@@ -76,7 +76,6 @@ mod tests {
         assert_eq!(ProtocolKind::parse("mieru"), Some(ProtocolKind::Mieru));
         assert_eq!(ProtocolKind::parse("hy2"), Some(ProtocolKind::Hysteria2));
         assert_eq!(ProtocolKind::parse("ss"), Some(ProtocolKind::Shadowsocks));
-        assert_eq!(ProtocolKind::parse("v2ray"), Some(ProtocolKind::Vmess));
         assert_eq!(
             ProtocolKind::parse("shadowsocks-2022"),
             Some(ProtocolKind::Shadowsocks)
@@ -84,10 +83,6 @@ mod tests {
         assert_eq!(
             ProtocolKind::parse("ss2022"),
             Some(ProtocolKind::Shadowsocks)
-        );
-        assert_eq!(
-            ProtocolKind::parse("vless_reality"),
-            Some(ProtocolKind::Vless)
         );
     }
 }
