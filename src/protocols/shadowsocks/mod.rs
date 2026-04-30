@@ -2,12 +2,19 @@ mod aead2022;
 mod crypto;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use futures_util::StreamExt;
+use rand::RngExt;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::ReadBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
@@ -33,6 +40,8 @@ pub struct EffectiveNodeConfig {
     pub method: Method,
     pub server_key: String,
     pub networks: EnabledNetworks,
+    pub plugin: Option<PluginConfig>,
+    pub multiplex: MultiplexConfig,
     pub routing: routing::RoutingTable,
 }
 
@@ -40,6 +49,24 @@ pub struct EffectiveNodeConfig {
 pub struct EnabledNetworks {
     tcp: bool,
     udp: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfig {
+    command: String,
+    opts: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiplexConfig {
+    enabled: bool,
+    protocol: SingMuxProtocol,
+    padding: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingMuxProtocol {
+    Yamux,
 }
 
 pub struct ServerController {
@@ -58,7 +85,10 @@ struct RunningServer {
     server_port: u16,
     method: Method,
     networks: EnabledNetworks,
+    plugin: Option<PluginConfig>,
+    multiplex: MultiplexConfig,
     handles: Vec<JoinHandle<()>>,
+    plugin_processes: Vec<Child>,
 }
 
 struct UdpSession {
@@ -86,6 +116,8 @@ impl EffectiveNodeConfig {
             method,
             server_key: remote.server_key.trim().to_string(),
             networks,
+            plugin: parse_plugin(remote)?,
+            multiplex: parse_multiplex(remote)?,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
                 &remote.custom_outbounds,
@@ -99,6 +131,16 @@ impl EffectiveNodeConfig {
 impl EnabledNetworks {
     fn any(self) -> bool {
         self.tcp || self.udp
+    }
+}
+
+impl Default for MultiplexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: SingMuxProtocol::Yamux,
+            padding: false,
+        }
     }
 }
 
@@ -168,6 +210,8 @@ impl ServerController {
                     || running.server_port != config.server_port
                     || running.method != config.method
                     || running.networks != config.networks
+                    || running.plugin != config.plugin
+                    || running.multiplex != config.multiplex
             });
             if !should_restart {
                 return Ok(());
@@ -179,13 +223,32 @@ impl ServerController {
             for handle in old.handles {
                 handle.abort();
             }
+            stop_plugin_processes(old.plugin_processes).await;
         }
 
         let mut handles = Vec::new();
         let mut bind_addrs = Vec::new();
+        let mut plugin_processes = Vec::new();
+        let tcp_listen_ip;
+        let tcp_port;
+        if config.plugin.is_some() {
+            tcp_listen_ip = loopback_listen_ip(&config.listen_ip).to_string();
+            tcp_port = reserve_loopback_port(&tcp_listen_ip)?;
+            let plugin = config.plugin.as_ref().expect("plugin checked");
+            plugin_processes = start_plugin_processes(
+                plugin,
+                &config.listen_ip,
+                config.server_port,
+                &tcp_listen_ip,
+                tcp_port,
+            )?;
+        } else {
+            tcp_listen_ip = config.listen_ip.clone();
+            tcp_port = config.server_port;
+        }
 
         if config.networks.tcp {
-            let listeners = bind_listeners(&config.listen_ip, config.server_port)?;
+            let listeners = bind_listeners(&tcp_listen_ip, tcp_port)?;
             bind_addrs.extend(
                 listeners
                     .iter()
@@ -197,8 +260,10 @@ impl ServerController {
                 let users = self.users.clone();
                 let routing = self.routing.clone();
                 let tcp_replay = self.tcp_replay.clone();
+                let multiplex = config.multiplex;
                 handles.push(tokio::spawn(async move {
-                    accept_tcp_loop(listener, accounting, users, routing, tcp_replay).await;
+                    accept_tcp_loop(listener, accounting, users, routing, tcp_replay, multiplex)
+                        .await;
                 }));
             }
         }
@@ -237,7 +302,10 @@ impl ServerController {
             server_port: config.server_port,
             method: config.method,
             networks: config.networks,
+            plugin: config.plugin,
+            multiplex: config.multiplex,
             handles,
+            plugin_processes,
         });
         Ok(())
     }
@@ -255,6 +323,7 @@ impl ServerController {
             for handle in old.handles {
                 handle.abort();
             }
+            stop_plugin_processes(old.plugin_processes).await;
             info!(port = old.server_port, "Shadowsocks listeners stopped");
         }
     }
@@ -266,6 +335,7 @@ async fn accept_tcp_loop(
     users: Arc<RwLock<Vec<UserCredential>>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     tcp_replay: Arc<aead2022::TcpReplayCache>,
+    multiplex: MultiplexConfig,
 ) {
     let listen = listener
         .local_addr()
@@ -293,8 +363,10 @@ async fn accept_tcp_loop(
                 .read()
                 .expect("shadowsocks routing lock poisoned")
                 .clone();
-            if let Err(error) =
-                serve_tcp_connection(stream, source, accounting, users, routing, tcp_replay).await
+            if let Err(error) = serve_tcp_connection(
+                stream, source, accounting, users, routing, tcp_replay, multiplex,
+            )
+            .await
             {
                 warn!(%error, %source, "Shadowsocks TCP session terminated with error");
             }
@@ -309,6 +381,7 @@ async fn serve_tcp_connection(
     users: Vec<UserCredential>,
     routing: routing::RoutingTable,
     tcp_replay: Arc<aead2022::TcpReplayCache>,
+    multiplex: MultiplexConfig,
 ) -> anyhow::Result<()> {
     let (reader, writer) = split(stream);
     enum AcceptedReader<R> {
@@ -404,6 +477,26 @@ async fn serve_tcp_connection(
             return Err(error).context("read Shadowsocks destination");
         }
     };
+
+    if is_sing_mux_destination(&destination) {
+        ensure!(
+            multiplex.enabled,
+            "Shadowsocks multiplex is not enabled for this node"
+        );
+        handle_sing_mux_connection(
+            client_plain_reader,
+            server_plain_writer,
+            routing,
+            control.clone(),
+            upload,
+            download,
+            multiplex,
+        )
+        .await?;
+        flatten_join(decrypt_task.await, "join Shadowsocks decrypt task")?;
+        flatten_join(encrypt_task.await, "join Shadowsocks encrypt task")?;
+        return Ok(());
+    }
 
     let remote = transport::connect_tcp_destination(&destination, &routing)
         .await
@@ -574,6 +667,12 @@ async fn handle_udp_request(
         .next()
         .ok_or_else(|| anyhow!("no UDP addresses resolved for {}", destination))?;
     let target = transport::normalize_udp_target(&session.outbound, target);
+    let upload = TrafficRecorder::upload(accounting, credential.user.id);
+    let control = session._lease.control();
+    upload.limit(wire_len as u64, &control).await;
+    if control.is_cancelled() {
+        return Ok(());
+    }
     let sent = session
         .outbound
         .send_to(&payload, target)
@@ -585,7 +684,7 @@ async fn handle_udp_request(
         payload.len(),
         sent
     );
-    TrafficRecorder::upload(accounting, credential.user.id).record(wire_len as u64);
+    upload.record(wire_len as u64);
     Ok(())
 }
 
@@ -683,10 +782,15 @@ async fn run_udp_session(
             }
         };
         let target = transport::normalize_udp_target(&inbound_socket, client_addr);
+        let download = TrafficRecorder::download(accounting.clone(), session.credential.user.id);
+        let control = session._lease.control();
+        download.limit(encoded.len() as u64, &control).await;
+        if control.is_cancelled() {
+            break;
+        }
         match inbound_socket.send_to(&encoded, target).await {
             Ok(sent) if sent == encoded.len() => {
-                TrafficRecorder::download(accounting.clone(), session.credential.user.id)
-                    .record(encoded.len() as u64);
+                download.record(encoded.len() as u64);
             }
             Ok(sent) => {
                 warn!(
@@ -740,6 +844,12 @@ where
             let _ = writer.shutdown().await;
             return Ok(total);
         }
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.limit(read as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
             result = writer.write_all(&buffer[..read]) => match result {
@@ -760,6 +870,601 @@ where
         if let Some(traffic) = traffic.as_ref() {
             traffic.record(transferred);
         }
+    }
+}
+
+async fn handle_sing_mux_connection<R, W>(
+    mut reader: R,
+    writer: W,
+    routing: routing::RoutingTable,
+    control: Arc<SessionControl>,
+    upload: TrafficRecorder,
+    download: TrafficRecorder,
+    config: MultiplexConfig,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let request = SingMuxRequest::read_from(&mut reader).await?;
+    ensure!(
+        request.protocol == config.protocol,
+        "unsupported Shadowsocks sing-mux protocol"
+    );
+    ensure!(
+        !request.padding || config.padding,
+        "Shadowsocks sing-mux padded connection is not enabled for this node"
+    );
+
+    let stream = PrefixedIo::new(reader, writer, request.remaining);
+    let stream = if request.padding {
+        SingMuxConnection::Padded(SingMuxPaddingIo::new(stream))
+    } else {
+        SingMuxConnection::Plain(stream)
+    };
+    let mut session = tokio_yamux::Session::new_server(stream, tokio_yamux::Config::default());
+    while let Some(stream) = session.next().await {
+        let stream = stream.context("accept Shadowsocks sing-mux stream")?;
+        let routing = routing.clone();
+        let control = control.clone();
+        let upload = upload.clone();
+        let download = download.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                handle_sing_mux_stream(stream, routing, control, upload, download).await
+            {
+                warn!(%error, "Shadowsocks sing-mux stream terminated with error");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_sing_mux_stream<S>(
+    mut stream: S,
+    routing: routing::RoutingTable,
+    control: Arc<SessionControl>,
+    upload: TrafficRecorder,
+    download: TrafficRecorder,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = SingMuxStreamRequest::read_from(&mut stream).await?;
+    ensure!(
+        matches!(request.network, SingMuxNetwork::Tcp),
+        "Shadowsocks sing-mux UDP stream is not implemented yet"
+    );
+    let remote = match transport::connect_tcp_destination(&request.destination, &routing).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            write_sing_mux_error(&mut stream, &error.to_string()).await?;
+            return Err(error).context("connect sing-mux destination");
+        }
+    };
+
+    stream.write_u8(SING_MUX_STATUS_SUCCESS).await?;
+    let (mut remote_reader, mut remote_writer) = split(remote);
+    let (mut stream_reader, mut stream_writer) = split(stream);
+    let result = tokio::try_join!(
+        copy_with_traffic(
+            &mut stream_reader,
+            &mut remote_writer,
+            control.clone(),
+            Some(upload),
+        ),
+        copy_with_traffic(
+            &mut remote_reader,
+            &mut stream_writer,
+            control.clone(),
+            Some(download),
+        )
+    );
+    result.map(|_| ())
+}
+
+fn is_sing_mux_destination(destination: &SocksAddr) -> bool {
+    matches!(
+        destination,
+        SocksAddr::Domain(host, 444) if host.eq_ignore_ascii_case("sp.mux.sing-box.arpa")
+    )
+}
+
+const SING_MUX_VERSION_0: u8 = 0;
+const SING_MUX_VERSION_1: u8 = 1;
+const SING_MUX_PROTOCOL_YAMUX: u8 = 1;
+const SING_MUX_STATUS_SUCCESS: u8 = 0;
+const SING_MUX_STATUS_ERROR: u8 = 1;
+const SING_MUX_FLAG_UDP: u16 = 1;
+const SING_MUX_FLAG_ADDR: u16 = 2;
+
+struct SingMuxRequest {
+    protocol: SingMuxProtocol,
+    padding: bool,
+    remaining: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SingMuxStreamRequest {
+    network: SingMuxNetwork,
+    destination: SocksAddr,
+    packet_addr: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SingMuxNetwork {
+    Tcp,
+    Udp,
+}
+
+impl SingMuxRequest {
+    async fn read_from<R>(reader: &mut R) -> anyhow::Result<Self>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let version = reader.read_u8().await.context("read sing-mux version")?;
+        ensure!(
+            matches!(version, SING_MUX_VERSION_0 | SING_MUX_VERSION_1),
+            "unsupported sing-mux version {version}"
+        );
+        let protocol = match reader.read_u8().await.context("read sing-mux protocol")? {
+            SING_MUX_PROTOCOL_YAMUX => SingMuxProtocol::Yamux,
+            other => bail!("unsupported sing-mux protocol {other}"),
+        };
+        let mut padding = false;
+        if version == SING_MUX_VERSION_1 {
+            padding = reader
+                .read_u8()
+                .await
+                .context("read sing-mux padding flag")?
+                != 0;
+            if padding {
+                let padding_len = reader
+                    .read_u16()
+                    .await
+                    .context("read sing-mux padding length")?;
+                let mut padding_bytes = vec![0u8; padding_len as usize];
+                reader
+                    .read_exact(&mut padding_bytes)
+                    .await
+                    .context("read sing-mux padding")?;
+            }
+        }
+        Ok(Self {
+            protocol,
+            padding,
+            remaining: Vec::new(),
+        })
+    }
+}
+
+impl SingMuxStreamRequest {
+    async fn read_from<R>(reader: &mut R) -> anyhow::Result<Self>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let flags = reader
+            .read_u16()
+            .await
+            .context("read sing-mux stream flags")?;
+        let destination = SocksAddr::read_from(reader)
+            .await
+            .context("read sing-mux stream destination")?;
+        let network = if flags & SING_MUX_FLAG_UDP == 0 {
+            SingMuxNetwork::Tcp
+        } else {
+            SingMuxNetwork::Udp
+        };
+        Ok(Self {
+            network,
+            destination,
+            packet_addr: flags & SING_MUX_FLAG_ADDR != 0,
+        })
+    }
+}
+
+enum SingMuxConnection<T> {
+    Plain(T),
+    Padded(SingMuxPaddingIo<T>),
+}
+
+impl<T> AsyncRead for SingMuxConnection<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(inner) => Pin::new(inner).poll_read(cx, buf),
+            Self::Padded(inner) => Pin::new(inner).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<T> AsyncWrite for SingMuxConnection<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Plain(inner) => Pin::new(inner).poll_write(cx, buf),
+            Self::Padded(inner) => Pin::new(inner).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(inner) => Pin::new(inner).poll_flush(cx),
+            Self::Padded(inner) => Pin::new(inner).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Plain(inner) => Pin::new(inner).poll_shutdown(cx),
+            Self::Padded(inner) => Pin::new(inner).poll_shutdown(cx),
+        }
+    }
+}
+
+struct SingMuxPaddingIo<T> {
+    inner: T,
+    read_padding_count: usize,
+    write_padding_count: usize,
+    read_remaining: VecDeque<u8>,
+    read_state: PaddingReadState,
+    write_state: Option<PaddingWriteState>,
+}
+
+enum PaddingReadState {
+    Header {
+        bytes: [u8; 4],
+        filled: usize,
+    },
+    Data {
+        data: Vec<u8>,
+        filled: usize,
+        padding_len: usize,
+    },
+    Padding {
+        remaining: usize,
+    },
+    Raw,
+}
+
+impl Default for PaddingReadState {
+    fn default() -> Self {
+        Self::Header {
+            bytes: [0; 4],
+            filled: 0,
+        }
+    }
+}
+
+struct PaddingWriteState {
+    frame: Vec<u8>,
+    written: usize,
+    data_len: usize,
+}
+
+impl<T> SingMuxPaddingIo<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            read_padding_count: 0,
+            write_padding_count: 0,
+            read_remaining: VecDeque::new(),
+            read_state: PaddingReadState::Header {
+                bytes: [0; 4],
+                filled: 0,
+            },
+            write_state: None,
+        }
+    }
+}
+
+impl<T> AsyncRead for SingMuxPaddingIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            while buf.remaining() > 0 {
+                let Some(byte) = self.read_remaining.pop_front() else {
+                    break;
+                };
+                buf.put_slice(&[byte]);
+            }
+            if !buf.filled().is_empty() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let state = std::mem::take(&mut self.read_state);
+            match state {
+                PaddingReadState::Raw => return Pin::new(&mut self.inner).poll_read(cx, buf),
+                PaddingReadState::Header {
+                    mut bytes,
+                    mut filled,
+                } => {
+                    let mut header_buf = ReadBuf::new(&mut bytes[filled..]);
+                    match Pin::new(&mut self.inner).poll_read(cx, &mut header_buf) {
+                        Poll::Ready(Ok(())) if header_buf.filled().is_empty() => {
+                            self.read_state = PaddingReadState::Header { bytes, filled };
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            filled += header_buf.filled().len();
+                            if filled < bytes.len() {
+                                self.read_state = PaddingReadState::Header { bytes, filled };
+                                continue;
+                            }
+                            let data_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+                            let padding_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+                            self.read_state = PaddingReadState::Data {
+                                data: vec![0u8; data_len],
+                                filled: 0,
+                                padding_len,
+                            };
+                        }
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => {
+                            self.read_state = PaddingReadState::Header { bytes, filled };
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                PaddingReadState::Data {
+                    mut data,
+                    mut filled,
+                    padding_len,
+                } => {
+                    let mut data_buf = ReadBuf::new(&mut data[filled..]);
+                    match Pin::new(&mut self.inner).poll_read(cx, &mut data_buf) {
+                        Poll::Ready(Ok(())) if data_buf.filled().is_empty() => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "short sing-mux padded data",
+                            )));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            filled += data_buf.filled().len();
+                            if filled < data.len() {
+                                self.read_state = PaddingReadState::Data {
+                                    data,
+                                    filled,
+                                    padding_len,
+                                };
+                                continue;
+                            }
+                            for byte in data {
+                                self.read_remaining.push_back(byte);
+                            }
+                            self.read_padding_count += 1;
+                            self.read_state = if padding_len > 0 {
+                                PaddingReadState::Padding {
+                                    remaining: padding_len,
+                                }
+                            } else if self.read_padding_count >= 16 {
+                                PaddingReadState::Raw
+                            } else {
+                                PaddingReadState::Header {
+                                    bytes: [0; 4],
+                                    filled: 0,
+                                }
+                            };
+                        }
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => {
+                            self.read_state = PaddingReadState::Data {
+                                data,
+                                filled,
+                                padding_len,
+                            };
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                PaddingReadState::Padding { mut remaining } => {
+                    let mut scratch = [0u8; 512];
+                    let take = remaining.min(scratch.len());
+                    let mut skip_buf = ReadBuf::new(&mut scratch[..take]);
+                    match Pin::new(&mut self.inner).poll_read(cx, &mut skip_buf) {
+                        Poll::Ready(Ok(())) if skip_buf.filled().is_empty() => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "short sing-mux padding",
+                            )));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            remaining -= skip_buf.filled().len();
+                            if remaining == 0 {
+                                self.read_state = if self.read_padding_count >= 16 {
+                                    PaddingReadState::Raw
+                                } else {
+                                    PaddingReadState::Header {
+                                        bytes: [0; 4],
+                                        filled: 0,
+                                    }
+                                };
+                            } else {
+                                self.read_state = PaddingReadState::Padding { remaining };
+                            }
+                        }
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => {
+                            self.read_state = PaddingReadState::Padding { remaining };
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T> AsyncWrite for SingMuxPaddingIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.write_padding_count >= 16 {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+        if self.write_state.is_none() {
+            let data_len = buf.len().min(u16::MAX as usize);
+            let padding_len = 256 + rand::rng().random_range(0..512usize);
+            let mut frame = Vec::with_capacity(4 + data_len + padding_len);
+            frame.extend_from_slice(&(data_len as u16).to_be_bytes());
+            frame.extend_from_slice(&(padding_len as u16).to_be_bytes());
+            frame.extend_from_slice(&buf[..data_len]);
+            frame.resize(4 + data_len + padding_len, 0);
+            self.write_state = Some(PaddingWriteState {
+                frame,
+                written: 0,
+                data_len,
+            });
+        }
+
+        let mut state = self.write_state.take().expect("padding write state");
+        loop {
+            match Pin::new(&mut self.inner).poll_write(cx, &state.frame[state.written..]) {
+                Poll::Ready(Ok(0)) => {
+                    self.write_state = Some(state);
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "short sing-mux padded write",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => {
+                    state.written += written;
+                    if state.written == state.frame.len() {
+                        let data_len = state.data_len;
+                        self.write_padding_count += 1;
+                        return Poll::Ready(Ok(data_len));
+                    }
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    self.write_state = Some(state);
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn write_sing_mux_error<W>(writer: &mut W, message: &str) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u8(SING_MUX_STATUS_ERROR).await?;
+    write_uvarint(writer, message.len() as u64).await?;
+    writer.write_all(message.as_bytes()).await?;
+    Ok(())
+}
+
+async fn write_uvarint<W>(writer: &mut W, mut value: u64) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    while value >= 0x80 {
+        writer.write_u8((value as u8) | 0x80).await?;
+        value >>= 7;
+    }
+    writer.write_u8(value as u8).await?;
+    Ok(())
+}
+
+struct PrefixedIo<R, W> {
+    reader: R,
+    writer: W,
+    prefetched: VecDeque<u8>,
+}
+
+impl<R, W> PrefixedIo<R, W> {
+    fn new(reader: R, writer: W, prefetched: Vec<u8>) -> Self {
+        Self {
+            reader,
+            writer,
+            prefetched: prefetched.into(),
+        }
+    }
+}
+
+impl<R, W> AsyncRead for PrefixedIo<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        while buf.remaining() > 0 {
+            let Some(byte) = self.prefetched.pop_front() else {
+                break;
+            };
+            buf.put_slice(&[byte]);
+        }
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
+
+impl<R, W> AsyncWrite for PrefixedIo<R, W>
+where
+    R: Unpin,
+    W: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }
 
@@ -875,6 +1580,55 @@ fn parse_networks(network: &str, method: &Method) -> anyhow::Result<EnabledNetwo
     Ok(networks)
 }
 
+fn parse_plugin(remote: &NodeConfigResponse) -> anyhow::Result<Option<PluginConfig>> {
+    let command = remote.plugin.trim();
+    let opts = remote.plugin_opts.trim();
+    if command.is_empty() && opts.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        !command.is_empty(),
+        "Xboard plugin is required when plugin_opts is set"
+    );
+    Ok(Some(PluginConfig {
+        command: command.to_string(),
+        opts: opts.to_string(),
+    }))
+}
+
+fn parse_multiplex(remote: &NodeConfigResponse) -> anyhow::Result<MultiplexConfig> {
+    let Some(value) = remote.multiplex.as_ref() else {
+        return Ok(MultiplexConfig::default());
+    };
+    if !crate::panel::json_value_is_enabled(value) {
+        return Ok(MultiplexConfig::default());
+    }
+    match value {
+        Value::Object(object) => {
+            let protocol = object
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("yamux")
+                .trim();
+            ensure!(
+                protocol.is_empty() || protocol.eq_ignore_ascii_case("yamux"),
+                "only Shadowsocks yamux multiplex is implemented"
+            );
+            Ok(MultiplexConfig {
+                enabled: true,
+                protocol: SingMuxProtocol::Yamux,
+                padding: object
+                    .get("padding")
+                    .is_some_and(crate::panel::json_value_is_enabled),
+            })
+        }
+        _ => Ok(MultiplexConfig {
+            enabled: true,
+            ..Default::default()
+        }),
+    }
+}
+
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if remote.tls.is_some()
         || remote.tls_settings.is_configured()
@@ -891,12 +1645,8 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     {
         bail!("XBoard networkSettings is not supported by NodeRS Shadowsocks server");
     }
-    if !remote.plugin.trim().is_empty() || !remote.plugin_opts.trim().is_empty() {
-        bail!("Shadowsocks SIP003 plugin is not implemented yet");
-    }
-    if remote.multiplex_enabled() {
-        bail!("Shadowsocks multiplex is not implemented yet");
-    }
+    parse_plugin(remote)?;
+    parse_multiplex(remote)?;
     if remote.transport.as_ref().is_some_and(value_enabled) {
         bail!("Shadowsocks transport is not supported");
     }
@@ -942,6 +1692,78 @@ fn value_enabled(value: &Value) -> bool {
     crate::panel::json_value_is_enabled(value)
 }
 
+fn loopback_listen_ip(listen_ip: &str) -> &'static str {
+    if listen_ip
+        .trim()
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_ipv6())
+    {
+        "::1"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+fn reserve_loopback_port(listen_ip: &str) -> anyhow::Result<u16> {
+    let addr = SocketAddr::new(
+        listen_ip
+            .parse::<IpAddr>()
+            .with_context(|| format!("parse loopback listen IP {listen_ip}"))?,
+        0,
+    );
+    let listener = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("reserve Shadowsocks plugin loopback port on {addr}"))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn start_plugin_processes(
+    plugin: &PluginConfig,
+    external_ip: &str,
+    external_port: u16,
+    local_ip: &str,
+    local_port: u16,
+) -> anyhow::Result<Vec<Child>> {
+    let external_addrs = plugin_external_addrs(external_ip, external_port)?;
+    let mut processes = Vec::new();
+    for external in external_addrs {
+        let child = tokio::process::Command::new(&plugin.command)
+            .env("SS_REMOTE_HOST", external.ip().to_string())
+            .env("SS_REMOTE_PORT", external.port().to_string())
+            .env("SS_LOCAL_HOST", local_ip)
+            .env("SS_LOCAL_PORT", local_port.to_string())
+            .env("SS_PLUGIN_OPTIONS", &plugin.opts)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("start Shadowsocks SIP003 plugin {}", plugin.command))?;
+        processes.push(child);
+    }
+    Ok(processes)
+}
+
+fn plugin_external_addrs(listen_ip: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    let listen_ip = listen_ip.trim();
+    if listen_ip.is_empty() || listen_ip == "0.0.0.0" || listen_ip == "::" || listen_ip == "[::]" {
+        return Ok(vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        ]);
+    }
+    let ip = listen_ip
+        .parse::<IpAddr>()
+        .with_context(|| format!("parse Shadowsocks plugin listen_ip {listen_ip}"))?;
+    Ok(vec![SocketAddr::new(ip, port)])
+}
+
+async fn stop_plugin_processes(processes: Vec<Child>) {
+    for mut process in processes {
+        let _ = process.start_kill();
+        let _ = process.wait().await;
+    }
+}
+
 fn normalize_option_key(key: &str) -> String {
     key.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -963,6 +1785,17 @@ fn flatten_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn dummy_plugin_path() -> PathBuf {
+        std::env::current_exe()
+            .expect("current exe")
+            .with_file_name(if cfg!(windows) {
+                "dummy_ss_plugin.bat"
+            } else {
+                "dummy_ss_plugin.sh"
+            })
+    }
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -994,14 +1827,97 @@ mod tests {
     }
 
     #[test]
-    fn rejects_plugin_configuration() {
+    fn accepts_plugin_configuration() {
         let remote = NodeConfigResponse {
             plugin: "obfs-local".to_string(),
             plugin_opts: "obfs=http".to_string(),
             ..base_remote()
         };
-        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("plugin");
-        assert!(error.to_string().contains("plugin"));
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("plugin");
+        let plugin = config.plugin.expect("plugin config");
+        assert_eq!(plugin.command, "obfs-local");
+        assert_eq!(plugin.opts, "obfs=http");
+    }
+
+    #[tokio::test]
+    async fn starts_sip003_plugin_and_loopback_tcp_listener() {
+        let plugin_path = dummy_plugin_path();
+        let script = if cfg!(windows) {
+            "@echo off\r\nset > %SS_PLUGIN_OPTIONS%\r\nping -n 6 127.0.0.1 > nul\r\n"
+        } else {
+            "#!/bin/sh\nset > \"$SS_PLUGIN_OPTIONS\"\nsleep 5\n"
+        };
+        tokio::fs::write(&plugin_path, script)
+            .await
+            .expect("write plugin");
+
+        let env_path = plugin_path.with_extension("env");
+        let controller = ServerController::new(Accounting::new());
+        controller
+            .replace_users(&[PanelUser {
+                id: 1,
+                password: "secret".to_string(),
+                ..Default::default()
+            }])
+            .expect("users");
+        let config = EffectiveNodeConfig {
+            listen_ip: "127.0.0.1".to_string(),
+            server_port: 0,
+            method: Method::Legacy(crypto::LegacyAeadMethod::Aes128Gcm),
+            server_key: String::new(),
+            networks: EnabledNetworks {
+                tcp: true,
+                udp: false,
+            },
+            plugin: Some(PluginConfig {
+                command: plugin_path.to_string_lossy().to_string(),
+                opts: env_path.to_string_lossy().to_string(),
+            }),
+            multiplex: MultiplexConfig::default(),
+            routing: routing::RoutingTable::default(),
+        };
+
+        controller.apply_config(config).await.expect("apply config");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let env = tokio::fs::read_to_string(&env_path)
+            .await
+            .expect("read plugin env");
+        assert!(env.contains("SS_REMOTE_HOST=127.0.0.1"));
+        assert!(env.contains("SS_REMOTE_PORT=0"));
+        assert!(env.contains("SS_LOCAL_HOST=127.0.0.1"));
+        assert!(env.contains("SS_LOCAL_PORT="));
+        controller.shutdown().await;
+        let _ = tokio::fs::remove_file(&plugin_path).await;
+        let _ = tokio::fs::remove_file(&env_path).await;
+    }
+
+    #[test]
+    fn parses_yamux_multiplex_configuration() {
+        let remote = NodeConfigResponse {
+            multiplex: Some(serde_json::json!({
+                "enabled": true,
+                "protocol": "yamux",
+                "padding": true
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("multiplex");
+        assert!(config.multiplex.enabled);
+        assert_eq!(config.multiplex.protocol, SingMuxProtocol::Yamux);
+        assert!(config.multiplex.padding);
+    }
+
+    #[test]
+    fn rejects_non_yamux_multiplex_configuration() {
+        let remote = NodeConfigResponse {
+            multiplex: Some(serde_json::json!({
+                "enabled": true,
+                "protocol": "h2mux"
+            })),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("multiplex");
+        assert!(error.to_string().contains("yamux"));
     }
 
     #[test]
@@ -1169,5 +2085,95 @@ mod tests {
             ..base_remote()
         };
         EffectiveNodeConfig::from_remote(&remote).expect("config");
+    }
+
+    #[tokio::test]
+    async fn parses_sing_mux_request_and_stream_request() {
+        let mut request = &b"\x01\x01\x01\x00\x03abc"[..];
+        let parsed = SingMuxRequest::read_from(&mut request)
+            .await
+            .expect("sing-mux request");
+        assert_eq!(parsed.protocol, SingMuxProtocol::Yamux);
+        assert!(parsed.padding);
+
+        let mut stream_request = &b"\x00\x00\x03\x0bexample.com\x01\xbb"[..];
+        let parsed = SingMuxStreamRequest::read_from(&mut stream_request)
+            .await
+            .expect("stream request");
+        assert_eq!(parsed.network, SingMuxNetwork::Tcp);
+        assert_eq!(
+            parsed.destination,
+            SocksAddr::Domain("example.com".to_string(), 443)
+        );
+        assert!(!parsed.packet_addr);
+    }
+
+    #[tokio::test]
+    async fn serves_yamux_sing_mux_tcp_stream() {
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.expect("target accept");
+            let mut buffer = [0u8; 4];
+            stream.read_exact(&mut buffer).await.expect("target read");
+            assert_eq!(&buffer, b"ping");
+            stream.write_all(b"pong").await.expect("target write");
+        });
+
+        let (client, server) = tokio::io::duplex(COPY_BUFFER_LEN);
+        let control = SessionControl::new();
+        let accounting = Accounting::new();
+        let upload = TrafficRecorder::upload(accounting.clone(), 1);
+        let download = TrafficRecorder::download(accounting, 1);
+        let (server_reader, server_writer) = split(server);
+        let server_task = tokio::spawn(handle_sing_mux_connection(
+            server_reader,
+            server_writer,
+            routing::RoutingTable::default(),
+            control.clone(),
+            upload,
+            download,
+            MultiplexConfig {
+                enabled: true,
+                protocol: SingMuxProtocol::Yamux,
+                padding: false,
+            },
+        ));
+
+        let mut client = client;
+        client
+            .write_all(&[SING_MUX_VERSION_0, SING_MUX_PROTOCOL_YAMUX])
+            .await
+            .expect("write mux request");
+        let mut session = tokio_yamux::Session::new_client(client, tokio_yamux::Config::default());
+        let mut control_stream = session.control();
+        let driver = tokio::spawn(async move { while session.next().await.is_some() {} });
+        let mut stream = control_stream.open_stream().await.expect("open stream");
+        write_socksaddr_for_test(&mut stream, &SocksAddr::Ip(target_addr))
+            .await
+            .expect("write destination");
+        stream.write_all(b"ping").await.expect("write payload");
+        let status = stream.read_u8().await.expect("read status");
+        assert_eq!(status, SING_MUX_STATUS_SUCCESS);
+        let mut response = [0u8; 4];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("read response");
+        assert_eq!(&response, b"pong");
+
+        control.cancel();
+        drop(stream);
+        driver.abort();
+        let _ = target_task.await;
+        let _ = server_task.await.expect("server task");
+    }
+
+    async fn write_socksaddr_for_test<W>(writer: &mut W, addr: &SocksAddr) -> anyhow::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        writer.write_u16(0).await?;
+        addr.write_to(writer).await
     }
 }

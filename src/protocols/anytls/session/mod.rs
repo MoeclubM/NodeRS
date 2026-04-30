@@ -700,6 +700,13 @@ async fn handle_stream(
                 let mut initial_download_bytes = 0u64;
                 if context.send_synack {
                     if let Some(prefetched) = prefetched_download.take() {
+                        context
+                            .download_traffic
+                            .limit(prefetched.len() as u64, &context.control)
+                            .await;
+                        if context.control.is_cancelled() {
+                            return Ok((0, 0));
+                        }
                         write_frame_pair_immediate(
                             &context.writer,
                             CMD_SYNACK,

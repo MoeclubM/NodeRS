@@ -713,7 +713,14 @@ async fn handle_session_payload(
         return Ok(());
     }
 
-    {
+    if session.remote_writer.lock().await.is_some() {
+        session
+            .upload
+            .limit(payload.len() as u64, &session.control)
+            .await;
+        if session.control.is_cancelled() {
+            return Ok(());
+        }
         let mut guard = session.remote_writer.lock().await;
         if let Some(remote) = guard.as_mut() {
             tokio::select! {
@@ -721,8 +728,8 @@ async fn handle_session_payload(
                 result = remote.write_all(&payload) => result.context("write Mieru proxied upload")?,
             }
             session.upload.record(payload.len() as u64);
-            return Ok(());
         }
+        return Ok(());
     }
 
     let request = {
@@ -781,6 +788,13 @@ async fn handle_session_payload(
 
             let (mut remote_reader, mut remote_writer) = split(remote);
             if !remaining.is_empty() {
+                session
+                    .upload
+                    .limit(remaining.len() as u64, &session.control)
+                    .await;
+                if session.control.is_cancelled() {
+                    return Ok(());
+                }
                 remote_writer
                     .write_all(&remaining)
                     .await
@@ -1149,7 +1163,14 @@ async fn handle_packet_session_payload(
         return Ok(());
     }
 
-    {
+    if session.remote_writer.lock().await.is_some() {
+        session
+            .upload
+            .limit(payload.len() as u64, &session.control)
+            .await;
+        if session.control.is_cancelled() {
+            return Ok(());
+        }
         let mut guard = session.remote_writer.lock().await;
         if let Some(remote) = guard.as_mut() {
             tokio::select! {
@@ -1157,8 +1178,8 @@ async fn handle_packet_session_payload(
                 result = remote.write_all(&payload) => result.context("write Mieru UDP proxied upload")?,
             }
             session.upload.record(payload.len() as u64);
-            return Ok(());
         }
+        return Ok(());
     }
 
     let request = {
@@ -1219,6 +1240,13 @@ async fn open_packet_tcp_session(
     write_packet_socks_response(&session, codec::SOCKS_REPLY_SUCCESS, bind).await?;
     let (mut remote_reader, mut remote_writer) = split(remote);
     if !remaining.is_empty() {
+        session
+            .upload
+            .limit(remaining.len() as u64, &session.control)
+            .await;
+        if session.control.is_cancelled() {
+            return Ok(());
+        }
         remote_writer
             .write_all(&remaining)
             .await
@@ -1248,6 +1276,10 @@ async fn relay_remote_to_packet_session(
             read = remote_reader.read(&mut buffer) => read.context("read Mieru UDP proxied download")?,
         };
         if read == 0 {
+            return Ok(());
+        }
+        session.download.limit(read as u64, &session.control).await;
+        if session.control.is_cancelled() {
             return Ok(());
         }
         session.download.record(read as u64);
@@ -1465,6 +1497,10 @@ async fn relay_remote_to_session(
         if read == 0 {
             return Ok(());
         }
+        session.download.limit(read as u64, &session.control).await;
+        if session.control.is_cancelled() {
+            return Ok(());
+        }
         session.download.record(read as u64);
         write_data_segment(
             &session.writer,
@@ -1659,9 +1695,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         bail!("Xboard networkSettings is not supported by NodeRS Mieru server yet");
     }
     parse_transport(remote.transport.as_ref())?;
-    if remote.multiplex_enabled() {
-        bail!("Xboard multiplex is not supported by NodeRS Mieru server yet");
-    }
     if remote.tls.is_some()
         || remote.tls_settings.is_configured()
         || remote.tls_settings.has_reality_key_material()
@@ -1723,6 +1756,17 @@ mod tests {
             Some(user.name.clone()),
             traffic_pattern::NoncePattern::default(),
         );
+        Ok((
+            key,
+            encrypt_client_open_frame(&mut cipher, session_id, payload)?,
+        ))
+    }
+
+    fn encrypt_client_open_frame(
+        cipher: &mut crypto::CipherState,
+        session_id: u32,
+        payload: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let metadata = codec::encode_session_metadata(
             ProtocolType::OpenSessionRequest,
             session_id,
@@ -1734,7 +1778,7 @@ mod tests {
         if !payload.is_empty() {
             frame.extend_from_slice(&cipher.encrypt(payload)?);
         }
-        Ok((key, frame))
+        Ok(frame)
     }
 
     async fn read_client_segment(
@@ -1872,6 +1916,19 @@ mod tests {
         assert_eq!(config.server_port, 8964);
     }
 
+    #[test]
+    fn accepts_xboard_multiplex_for_mieru() {
+        let remote = NodeConfigResponse {
+            multiplex: Some(serde_json::json!({
+                "enabled": true,
+                "protocol": "mieru"
+            })),
+            ..base_remote()
+        };
+
+        EffectiveNodeConfig::from_remote(&remote).expect("config");
+    }
+
     #[tokio::test]
     async fn serves_connect_session_over_mieru_tcp() {
         let user = UserCredential::from_panel_user(&PanelUser {
@@ -1967,5 +2024,117 @@ mod tests {
         client_writer.shutdown().await.expect("client shutdown");
         let _ = target_task.await;
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn serves_multiple_sessions_over_one_mieru_tcp_underlay() {
+        let user = UserCredential::from_panel_user(&PanelUser {
+            id: 7,
+            uuid: "bf000d23-0752-40b4-affe-68f7707a9661".to_string(),
+            ..Default::default()
+        })
+        .expect("user");
+
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target.local_addr().expect("target addr");
+        let target_task = tokio::spawn(async move {
+            for expected in [b"one".as_slice(), b"two".as_slice()] {
+                let (mut stream, _) = target.accept().await.expect("target accept");
+                let mut buffer = vec![0u8; expected.len()];
+                stream.read_exact(&mut buffer).await.expect("target read");
+                assert_eq!(buffer, expected);
+                stream.write_all(expected).await.expect("target write");
+            }
+        });
+
+        let server = TcpListener::bind("127.0.0.1:0").await.expect("server bind");
+        let server_addr = server.local_addr().expect("server addr");
+        let accounting = Accounting::new();
+        let replay = Arc::new(ReplayCache::default());
+        let server_user = user.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, source) = server.accept().await.expect("server accept");
+            serve_underlay_connection(
+                stream,
+                source,
+                accounting,
+                UserValidator {
+                    users: vec![server_user],
+                },
+                traffic_pattern::TrafficPatternConfig::default(),
+                routing::RoutingTable::default(),
+                replay,
+            )
+            .await
+            .expect("serve underlay");
+        });
+
+        let client = TcpStream::connect(server_addr)
+            .await
+            .expect("client connect");
+        let (mut client_reader, mut client_writer) = split(client);
+        let request1 = socks_connect_request(target_addr, b"one");
+        let request2 = socks_connect_request(target_addr, b"two");
+        let key = crypto::derive_keys(&user.hashed_password, std::time::SystemTime::now())
+            .expect("keys")[1];
+        let mut client_send = crypto::CipherState::new(
+            key,
+            Some(user.name.clone()),
+            traffic_pattern::NoncePattern::default(),
+        );
+        let frame1 = encrypt_client_open_frame(&mut client_send, 1, &request1).expect("frame1");
+        let frame2 = encrypt_client_open_frame(&mut client_send, 2, &request2).expect("frame2");
+        client_writer
+            .write_all(&frame1)
+            .await
+            .expect("write frame1");
+        client_writer
+            .write_all(&frame2)
+            .await
+            .expect("write frame2");
+
+        let mut client_recv =
+            crypto::CipherState::new(key, None, traffic_pattern::NoncePattern::default());
+        let mut seen = HashMap::<u32, Vec<Vec<u8>>>::new();
+        while !seen
+            .get(&1)
+            .is_some_and(|payloads| payloads.iter().any(|payload| payload == b"one"))
+            || !seen
+                .get(&2)
+                .is_some_and(|payloads| payloads.iter().any(|payload| payload == b"two"))
+        {
+            let (metadata, payload) = timeout(
+                Duration::from_secs(2),
+                read_client_segment(&mut client_reader, &mut client_recv),
+            )
+            .await
+            .expect("client segment timeout")
+            .expect("client segment");
+            let session_id = match metadata {
+                Metadata::Session(value) => value.session_id,
+                Metadata::Data(value) => value.session_id,
+            };
+            seen.entry(session_id).or_default().push(payload);
+        }
+
+        assert!(
+            seen.get(&1)
+                .is_some_and(|payloads| payloads.iter().any(|payload| payload == b"one"))
+        );
+        assert!(
+            seen.get(&2)
+                .is_some_and(|payloads| payloads.iter().any(|payload| payload == b"two"))
+        );
+
+        client_writer.shutdown().await.expect("client shutdown");
+        let _ = target_task.await;
+        let _ = server_task.await;
+    }
+
+    fn socks_connect_request(target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut request = vec![codec::SOCKS_VERSION, 0x01, 0, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&target_addr.port().to_be_bytes());
+        request.extend_from_slice(payload);
+        request
     }
 }

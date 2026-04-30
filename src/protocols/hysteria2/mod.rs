@@ -1,16 +1,26 @@
 use anyhow::{Context, anyhow, bail, ensure};
+use blake2::Blake2bVar;
+use blake2::digest::{Update, VariableOutput};
 use bytes::Bytes;
-use quinn::{Endpoint, VarInt};
+use quinn::udp::{RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, Endpoint, UdpPoller, VarInt};
 use rustc_hash::FxHashMap;
+use std::fmt;
+use std::future::Future;
+use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context as TaskContext, Poll, ready};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
-use crate::accounting::{Accounting, SessionControl, UserEntry};
+use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser, RouteConfig};
 
 use super::shared::{
@@ -21,9 +31,14 @@ use super::shared::{
 const H3_ALPN: &str = "h3";
 const AUTH_PATH: &str = "/auth";
 const AUTH_HOST: &str = "hysteria";
-const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const COPY_BUFFER_LEN: usize = 64 * 1024;
+const SALAMANDER_SALT_LEN: usize = 8;
+const SALAMANDER_KEY_LEN: usize = 32;
+const SALAMANDER_MIN_PASSWORD_LEN: usize = 4;
+const UDP_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveNodeConfig {
@@ -32,6 +47,7 @@ pub struct EffectiveNodeConfig {
     pub tls: EffectiveTlsConfig,
     pub cc_rx: String,
     pub udp_enabled: bool,
+    obfs: Option<SalamanderConfig>,
     pub routes: Vec<RouteConfig>,
     pub custom_outbounds: Vec<serde_json::Value>,
     pub custom_routes: Vec<serde_json::Value>,
@@ -48,6 +64,7 @@ impl EffectiveNodeConfig {
             tls,
             cc_rx: hy2_cc_rx(remote.down_mbps.as_ref(), remote.ignore_client_bandwidth)?,
             udp_enabled: hy2_udp_enabled(&remote.udp_relay_mode),
+            obfs: parse_hy2_obfs(remote)?,
             routes: remote.routes.clone(),
             custom_outbounds: remote.custom_outbounds.clone(),
             custom_routes: remote.custom_routes.clone(),
@@ -94,8 +111,180 @@ pub struct ServerController {
 struct RunningServer {
     listen_ip: String,
     server_port: u16,
+    cc_rx: String,
+    udp_enabled: bool,
+    obfs: Option<SalamanderConfig>,
     endpoint: Endpoint,
     handle: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SalamanderConfig {
+    password: Vec<u8>,
+}
+
+impl SalamanderConfig {
+    fn new(password: &str) -> anyhow::Result<Self> {
+        let password = password.as_bytes().to_vec();
+        ensure!(
+            password.len() >= SALAMANDER_MIN_PASSWORD_LEN,
+            "HY2 salamander obfs password must be at least {SALAMANDER_MIN_PASSWORD_LEN} bytes"
+        );
+        Ok(Self { password })
+    }
+}
+
+#[derive(Debug)]
+struct SalamanderUdpSocket {
+    io: UdpSocket,
+    password: Vec<u8>,
+    recv_buffer: Mutex<Vec<u8>>,
+}
+
+impl SalamanderUdpSocket {
+    fn new(socket: std::net::UdpSocket, config: SalamanderConfig) -> io::Result<Self> {
+        Ok(Self {
+            io: UdpSocket::from_std(socket)?,
+            password: config.password,
+            recv_buffer: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl AsyncUdpSocket for SalamanderUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Box::pin(SalamanderUdpPoller {
+            socket: self,
+            future: None,
+        })
+    }
+
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        let mut salt = [0u8; SALAMANDER_SALT_LEN];
+        boring::rand::rand_bytes(&mut salt)
+            .map_err(|error| io::Error::other(format!("generate HY2 salamander salt: {error}")))?;
+        let mut packet = vec![0u8; SALAMANDER_SALT_LEN + transmit.contents.len()];
+        packet[..SALAMANDER_SALT_LEN].copy_from_slice(&salt);
+        salamander_xor(
+            &self.password,
+            &salt,
+            transmit.contents,
+            &mut packet[SALAMANDER_SALT_LEN..],
+        );
+        let written = self.io.try_send_to(&packet, transmit.destination)?;
+        if written == packet.len() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write full HY2 salamander packet",
+            ))
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            ready!(self.io.poll_recv_ready(cx))?;
+            let mut buffer = self
+                .recv_buffer
+                .lock()
+                .expect("hy2 salamander recv buffer poisoned");
+            buffer.resize(bufs[0].len() + SALAMANDER_SALT_LEN, 0);
+            match self.io.try_recv_from(&mut buffer) {
+                Ok((read, addr)) => {
+                    if read <= SALAMANDER_SALT_LEN {
+                        continue;
+                    }
+                    let mut salt = [0u8; SALAMANDER_SALT_LEN];
+                    salt.copy_from_slice(&buffer[..SALAMANDER_SALT_LEN]);
+                    let output_len = read - SALAMANDER_SALT_LEN;
+                    salamander_xor(
+                        &self.password,
+                        &salt,
+                        &buffer[SALAMANDER_SALT_LEN..read],
+                        &mut bufs[0][..output_len],
+                    );
+                    meta[0] = RecvMeta {
+                        addr,
+                        len: output_len,
+                        stride: output_len,
+                        ecn: None,
+                        dst_ip: None,
+                    };
+                    return Poll::Ready(Ok(1));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.io.local_addr()
+    }
+}
+
+type IoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
+
+struct SalamanderUdpPoller {
+    socket: Arc<SalamanderUdpSocket>,
+    future: Option<IoFuture>,
+}
+
+impl fmt::Debug for SalamanderUdpPoller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SalamanderUdpPoller")
+            .finish_non_exhaustive()
+    }
+}
+
+impl UdpPoller for SalamanderUdpPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.future.is_none() {
+            let socket = this.socket.clone();
+            this.future = Some(Box::pin(async move { socket.io.writable().await }));
+        }
+        let result = this
+            .future
+            .as_mut()
+            .expect("HY2 writable future set")
+            .as_mut()
+            .poll(cx);
+        if result.is_ready() {
+            this.future = None;
+        }
+        result
+    }
+}
+
+fn salamander_xor(
+    password: &[u8],
+    salt: &[u8; SALAMANDER_SALT_LEN],
+    input: &[u8],
+    output: &mut [u8],
+) {
+    debug_assert_eq!(input.len(), output.len());
+    let key = salamander_key(password, salt);
+    for (index, (plain, cipher)) in output.iter_mut().zip(input).enumerate() {
+        *plain = *cipher ^ key[index % SALAMANDER_KEY_LEN];
+    }
+}
+
+fn salamander_key(password: &[u8], salt: &[u8; SALAMANDER_SALT_LEN]) -> [u8; SALAMANDER_KEY_LEN] {
+    let mut key = [0u8; SALAMANDER_KEY_LEN];
+    let mut hasher = Blake2bVar::new(SALAMANDER_KEY_LEN).expect("valid BLAKE2b output length");
+    hasher.update(password);
+    hasher.update(salt);
+    hasher
+        .finalize_variable(&mut key)
+        .expect("valid BLAKE2b output buffer length");
+    key
 }
 
 impl ServerController {
@@ -118,7 +307,11 @@ impl ServerController {
         let old = {
             let mut guard = self.inner.lock().expect("hy2 server controller poisoned");
             let should_restart = guard.as_ref().is_none_or(|running| {
-                running.listen_ip != config.listen_ip || running.server_port != config.server_port
+                running.listen_ip != config.listen_ip
+                    || running.server_port != config.server_port
+                    || running.cc_rx != config.cc_rx
+                    || running.udp_enabled != config.udp_enabled
+                    || running.obfs != config.obfs
             });
             if !should_restart {
                 return Ok(());
@@ -185,6 +378,9 @@ impl ServerController {
         *guard = Some(RunningServer {
             listen_ip: config.listen_ip,
             server_port: config.server_port,
+            cc_rx: config.cc_rx,
+            udp_enabled: config.udp_enabled,
+            obfs: config.obfs,
             endpoint,
             handle,
         });
@@ -218,16 +414,29 @@ async fn build_endpoint(config: &EffectiveNodeConfig) -> anyhow::Result<Endpoint
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     server_config.transport_config(Arc::new(transport_config));
-    let listen_ip = config.listen_ip.trim();
-    let bind_addr: SocketAddr = format!("{listen_ip}:{}", config.server_port)
-        .parse()
-        .with_context(|| {
-            format!(
-                "parse HY2 listen address {listen_ip}:{}",
-                config.server_port
-            )
-        })?;
+    let bind_addr = hy2_bind_addr(&config.listen_ip, config.server_port)?;
+    if let Some(obfs) = config.obfs.clone() {
+        let socket = std::net::UdpSocket::bind(bind_addr).context("bind HY2 UDP endpoint")?;
+        socket
+            .set_nonblocking(true)
+            .context("set HY2 UDP endpoint nonblocking")?;
+        let socket = SalamanderUdpSocket::new(socket, obfs)?;
+        return Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            Arc::new(socket),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("bind HY2 salamander UDP endpoint");
+    }
     Endpoint::server(server_config, bind_addr).context("bind HY2 UDP endpoint")
+}
+
+fn hy2_bind_addr(listen_ip: &str, server_port: u16) -> anyhow::Result<SocketAddr> {
+    let listen_ip = listen_ip.trim();
+    format!("{listen_ip}:{server_port}")
+        .parse()
+        .with_context(|| format!("parse HY2 listen address {listen_ip}:{server_port}"))
 }
 
 async fn handle_connection(
@@ -238,22 +447,34 @@ async fn handle_connection(
     cc_rx: String,
     udp_enabled: bool,
 ) -> anyhow::Result<()> {
-    let Some(user) = authenticate_connection(&connection, users, cc_rx, udp_enabled).await? else {
+    let Some((user, lease)) =
+        authenticate_connection(&connection, accounting.clone(), users, cc_rx, udp_enabled).await?
+    else {
         return Ok(());
     };
+    let control = lease.control();
     if udp_enabled {
         let sessions = Arc::new(AsyncMutex::new(FxHashMap::default()));
+        let fragments = Arc::new(AsyncMutex::new(FxHashMap::default()));
         tokio::spawn(handle_udp_datagrams(
             connection.clone(),
             sessions,
+            fragments,
             routing.clone(),
             accounting.clone(),
             user.clone(),
+            control.clone(),
         ));
     }
 
     loop {
-        let (send, recv) = match connection.accept_bi().await {
+        let (send, recv) = match tokio::select! {
+            _ = control.cancelled() => {
+                connection.close(VarInt::from_u32(0), b"session cancelled");
+                return Ok(());
+            }
+            stream = connection.accept_bi() => stream
+        } {
             Ok(stream) => stream,
             Err(quinn::ConnectionError::ApplicationClosed(_))
             | Err(quinn::ConnectionError::LocallyClosed)
@@ -263,10 +484,10 @@ async fn handle_connection(
         let accounting = accounting.clone();
         let routing = routing.clone();
         let user = user.clone();
-        let remote = connection.remote_address();
+        let control = control.clone();
         tokio::spawn(async move {
             if let Err(error) =
-                handle_tcp_stream(send, recv, remote, accounting, user, routing).await
+                handle_tcp_stream(send, recv, accounting, user, routing, control).await
             {
                 warn!(%error, "HY2 TCP stream failed");
             }
@@ -276,10 +497,11 @@ async fn handle_connection(
 
 async fn authenticate_connection(
     connection: &quinn::Connection,
+    accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
     cc_rx: String,
     udp_enabled: bool,
-) -> anyhow::Result<Option<UserEntry>> {
+) -> anyhow::Result<Option<(UserEntry, SessionLease)>> {
     let h3_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3 = h3::server::builder()
         .build(h3_connection)
@@ -311,6 +533,7 @@ async fn authenticate_connection(
         send_h3_status(&mut stream, 404).await?;
         return Ok(None);
     };
+    let lease = accounting.open_session(&user, connection.remote_address())?;
 
     let response = http::Response::builder()
         .status(http::StatusCode::from_u16(233).context("build HY2 status code")?)
@@ -324,7 +547,7 @@ async fn authenticate_connection(
         .await
         .context("send HY2 auth response")?;
     stream.finish().await.context("finish HY2 auth stream")?;
-    Ok(Some(user))
+    Ok(Some((user, lease)))
 }
 
 fn is_auth_request(request: &http::Request<()>) -> bool {
@@ -362,10 +585,10 @@ where
 async fn handle_tcp_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    source: SocketAddr,
     accounting: Arc<Accounting>,
     user: UserEntry,
     routing: RoutingTable,
+    control: Arc<SessionControl>,
 ) -> anyhow::Result<()> {
     let destination = match read_tcp_request(&mut recv).await {
         Ok(destination) => destination,
@@ -384,8 +607,6 @@ async fn handle_tcp_stream(
         }
     };
     write_tcp_response(&mut send, 0, "").await?;
-    let lease = accounting.open_session(&user, source)?;
-    let control = lease.control();
     let upload = TrafficRecorder::upload(accounting.clone(), user.id);
     let download = TrafficRecorder::download(accounting, user.id);
     let (mut remote_reader, mut remote_writer) = remote.into_split();
@@ -398,9 +619,43 @@ async fn handle_tcp_stream(
 }
 
 type UdpSessions = Arc<AsyncMutex<FxHashMap<u32, Arc<UdpSession>>>>;
+type UdpFragments = Arc<AsyncMutex<FxHashMap<(u32, u16), UdpFragmentBuffer>>>;
 
 struct UdpSession {
     socket: Arc<UdpSocket>,
+    last_seen: Arc<Mutex<Instant>>,
+    response_handle: Mutex<JoinHandle<()>>,
+}
+
+struct UdpFragmentBuffer {
+    address: String,
+    created_at: Instant,
+    fragments: Vec<Option<Vec<u8>>>,
+}
+
+impl UdpSession {
+    fn touch(&self) {
+        *self
+            .last_seen
+            .lock()
+            .expect("HY2 UDP session time poisoned") = Instant::now();
+    }
+
+    fn is_idle(&self, now: Instant) -> bool {
+        now.saturating_duration_since(
+            *self
+                .last_seen
+                .lock()
+                .expect("HY2 UDP session time poisoned"),
+        ) >= UDP_SESSION_IDLE_TIMEOUT
+    }
+
+    fn abort_response_relay(&self) {
+        self.response_handle
+            .lock()
+            .expect("HY2 UDP response handle poisoned")
+            .abort();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,12 +671,23 @@ struct UdpMessage {
 async fn handle_udp_datagrams(
     connection: quinn::Connection,
     sessions: UdpSessions,
+    fragments: UdpFragments,
     routing: RoutingTable,
     accounting: Arc<Accounting>,
     user: UserEntry,
+    control: Arc<SessionControl>,
 ) {
+    let upload_traffic = TrafficRecorder::upload(accounting.clone(), user.id);
+    let mut cleanup = tokio::time::interval(UDP_FRAGMENT_TIMEOUT);
     loop {
-        let datagram = match connection.read_datagram().await {
+        let datagram = match tokio::select! {
+            _ = control.cancelled() => return,
+            _ = cleanup.tick() => {
+                cleanup_udp_state(&sessions, &fragments).await;
+                continue;
+            }
+            datagram = connection.read_datagram() => datagram,
+        } {
             Ok(datagram) => datagram,
             Err(error) => {
                 debug_connection_closed_as_udp_end(error);
@@ -436,16 +702,28 @@ async fn handle_udp_datagrams(
                 continue;
             }
         };
-        if message.fragment_count != 1 || message.fragment_id != 0 {
-            warn!(
-                session_id = message.session_id,
-                packet_id = message.packet_id,
-                fragment_id = message.fragment_id,
-                fragment_count = message.fragment_count,
-                "HY2 UDP fragmentation is not implemented yet; dropping fragmented packet"
-            );
-            continue;
-        }
+        let message = match reassemble_udp_message(message, &fragments).await {
+            Ok(Some(message)) => {
+                upload_traffic.limit(upload, &control).await;
+                if control.is_cancelled() {
+                    return;
+                }
+                upload_traffic.record(upload);
+                message
+            }
+            Ok(None) => {
+                upload_traffic.limit(upload, &control).await;
+                if control.is_cancelled() {
+                    return;
+                }
+                upload_traffic.record(upload);
+                continue;
+            }
+            Err(error) => {
+                warn!(%error, "invalid HY2 UDP fragment");
+                continue;
+            }
+        };
         let destination = match parse_host_port(&message.address) {
             Ok(destination) => destination,
             Err(error) => {
@@ -472,6 +750,7 @@ async fn handle_udp_datagrams(
             &sessions,
             accounting.clone(),
             user.clone(),
+            control.clone(),
         )
         .await
         {
@@ -486,7 +765,92 @@ async fn handle_udp_datagrams(
             warn!(%error, target = %target, "send HY2 UDP payload failed");
             continue;
         }
-        TrafficRecorder::upload(accounting.clone(), user.id).record(upload);
+    }
+}
+
+async fn reassemble_udp_message(
+    message: UdpMessage,
+    fragments: &UdpFragments,
+) -> anyhow::Result<Option<UdpMessage>> {
+    ensure!(
+        message.fragment_count > 0,
+        "HY2 UDP fragment_count must be positive"
+    );
+    ensure!(
+        message.fragment_id < message.fragment_count,
+        "HY2 UDP fragment_id must be less than fragment_count"
+    );
+    if message.fragment_count == 1 {
+        ensure!(
+            message.fragment_id == 0,
+            "HY2 UDP unfragmented packet must use fragment_id 0"
+        );
+        return Ok(Some(message));
+    }
+
+    let key = (message.session_id, message.packet_id);
+    let mut guard = fragments.lock().await;
+    let entry = guard.entry(key).or_insert_with(|| UdpFragmentBuffer {
+        address: message.address.clone(),
+        created_at: Instant::now(),
+        fragments: vec![None; usize::from(message.fragment_count)],
+    });
+    ensure!(
+        entry.fragments.len() == usize::from(message.fragment_count),
+        "HY2 UDP fragment_count changed for packet"
+    );
+    ensure!(
+        entry.address == message.address,
+        "HY2 UDP fragment address changed for packet"
+    );
+    let index = usize::from(message.fragment_id);
+    entry.fragments[index] = Some(message.payload);
+    if entry.fragments.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+
+    let entry = guard.remove(&key).expect("HY2 fragment buffer exists");
+    let mut payload = Vec::new();
+    for fragment in entry.fragments {
+        payload.extend(fragment.expect("HY2 fragment present"));
+    }
+    Ok(Some(UdpMessage {
+        session_id: key.0,
+        packet_id: key.1,
+        fragment_id: 0,
+        fragment_count: 1,
+        address: entry.address,
+        payload,
+    }))
+}
+
+async fn cleanup_udp_state(sessions: &UdpSessions, fragments: &UdpFragments) {
+    cleanup_udp_fragments(fragments).await;
+    cleanup_udp_sessions(sessions).await;
+}
+
+async fn cleanup_udp_fragments(fragments: &UdpFragments) {
+    let now = Instant::now();
+    fragments.lock().await.retain(|_, buffer| {
+        now.saturating_duration_since(buffer.created_at) < UDP_FRAGMENT_TIMEOUT
+    });
+}
+
+async fn cleanup_udp_sessions(sessions: &UdpSessions) {
+    let now = Instant::now();
+    let expired = {
+        let mut guard = sessions.lock().await;
+        let session_ids = guard
+            .iter()
+            .filter_map(|(session_id, session)| session.is_idle(now).then_some(*session_id))
+            .collect::<Vec<_>>();
+        session_ids
+            .into_iter()
+            .filter_map(|session_id| guard.remove(&session_id))
+            .collect::<Vec<_>>()
+    };
+    for session in expired {
+        session.abort_response_relay();
     }
 }
 
@@ -505,22 +869,38 @@ async fn get_or_create_udp_session(
     sessions: &UdpSessions,
     accounting: Arc<Accounting>,
     user: UserEntry,
+    control: Arc<SessionControl>,
 ) -> anyhow::Result<Arc<UdpSession>> {
     if let Some(session) = sessions.lock().await.get(&session_id).cloned() {
+        session.touch();
         return Ok(session);
     }
     let socket = Arc::new(transport::bind_udp_socket().await?);
-    let session = Arc::new(UdpSession {
-        socket: socket.clone(),
-    });
-    sessions.lock().await.insert(session_id, session.clone());
     let connection = connection.clone();
     let download = TrafficRecorder::download(accounting, user.id);
-    tokio::spawn(async move {
-        if let Err(error) = relay_udp_responses(session_id, socket, connection, download).await {
+    let last_seen = Arc::new(Mutex::new(Instant::now()));
+    let response_last_seen = last_seen.clone();
+    let response_socket = socket.clone();
+    let response_handle = tokio::spawn(async move {
+        if let Err(error) = relay_udp_responses(
+            session_id,
+            response_socket,
+            connection,
+            control,
+            download,
+            response_last_seen,
+        )
+        .await
+        {
             warn!(%error, session_id, "HY2 UDP response relay failed");
         }
     });
+    let session = Arc::new(UdpSession {
+        socket: socket.clone(),
+        last_seen,
+        response_handle: Mutex::new(response_handle),
+    });
+    sessions.lock().await.insert(session_id, session.clone());
     Ok(session)
 }
 
@@ -528,31 +908,98 @@ async fn relay_udp_responses(
     session_id: u32,
     socket: Arc<UdpSocket>,
     connection: quinn::Connection,
+    control: Arc<SessionControl>,
     traffic: TrafficRecorder,
+    last_seen: Arc<Mutex<Instant>>,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; u16::MAX as usize];
     loop {
         let (read, source) = tokio::select! {
+            _ = control.cancelled() => return Ok(()),
             closed = connection.closed() => {
                 debug_connection_closed_as_udp_end(closed);
                 return Ok(());
             }
             result = socket.recv_from(&mut buffer) => result.context("receive HY2 UDP response")?,
         };
-        let message = UdpMessage {
+        *last_seen.lock().expect("HY2 UDP session time poisoned") = Instant::now();
+        let messages = encode_udp_response_messages(
             session_id,
-            packet_id: 0,
-            fragment_id: 0,
-            fragment_count: 1,
-            address: source.to_string(),
-            payload: buffer[..read].to_vec(),
-        };
-        let encoded = encode_udp_message(&message)?;
-        match connection.send_datagram(Bytes::from(encoded.clone())) {
-            Ok(()) => traffic.record(encoded.len() as u64),
-            Err(error) => return Err(error).context("send HY2 UDP datagram"),
+            next_udp_packet_id(),
+            source.to_string(),
+            &buffer[..read],
+            connection.max_datagram_size(),
+        )?;
+        for message in messages {
+            let encoded = encode_udp_message(&message)?;
+            traffic.limit(encoded.len() as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(());
+            }
+            match connection.send_datagram(Bytes::from(encoded.clone())) {
+                Ok(()) => traffic.record(encoded.len() as u64),
+                Err(error) => return Err(error).context("send HY2 UDP datagram"),
+            }
         }
     }
+}
+
+fn encode_udp_response_messages(
+    session_id: u32,
+    packet_id: u16,
+    address: String,
+    payload: &[u8],
+    max_datagram_size: Option<usize>,
+) -> anyhow::Result<Vec<UdpMessage>> {
+    let max_datagram_size = max_datagram_size.unwrap_or(usize::MAX);
+    let header_len = encoded_udp_header_len(&address)?;
+    if header_len + payload.len() <= max_datagram_size {
+        return Ok(vec![UdpMessage {
+            session_id,
+            packet_id,
+            fragment_id: 0,
+            fragment_count: 1,
+            address,
+            payload: payload.to_vec(),
+        }]);
+    }
+    ensure!(
+        header_len < max_datagram_size,
+        "HY2 UDP datagram header exceeds peer limit"
+    );
+    let fragment_payload_len = max_datagram_size - header_len;
+    ensure!(
+        fragment_payload_len > 0,
+        "HY2 UDP fragment payload limit is zero"
+    );
+    let fragment_count = payload.len().div_ceil(fragment_payload_len);
+    ensure!(
+        fragment_count <= u8::MAX as usize,
+        "HY2 UDP packet requires too many fragments"
+    );
+    let mut messages = Vec::with_capacity(fragment_count);
+    for (index, chunk) in payload.chunks(fragment_payload_len).enumerate() {
+        messages.push(UdpMessage {
+            session_id,
+            packet_id,
+            fragment_id: index as u8,
+            fragment_count: fragment_count as u8,
+            address: address.clone(),
+            payload: chunk.to_vec(),
+        });
+    }
+    Ok(messages)
+}
+
+fn encoded_udp_header_len(address: &str) -> anyhow::Result<usize> {
+    let mut varint = Vec::new();
+    encode_varint(address.len() as u64, &mut varint)?;
+    Ok(8 + varint.len() + address.len())
+}
+
+fn next_udp_packet_id() -> u16 {
+    static NEXT_PACKET_ID: AtomicU16 = AtomicU16::new(0);
+    NEXT_PACKET_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 async fn read_tcp_request<R>(reader: &mut R) -> anyhow::Result<SocksAddr>
@@ -610,6 +1057,10 @@ where
         };
         if read == 0 {
             writer.shutdown().await.ok();
+            return Ok(total);
+        }
+        traffic.limit(read as u64, &control).await;
+        if control.is_cancelled() {
             return Ok(total);
         }
         tokio::select! {
@@ -752,14 +1203,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             || network.eq_ignore_ascii_case("hy2"),
         "HY2 network must be empty, udp, quic, hysteria2 or hy2"
     );
-    if remote
-        .obfs
-        .as_ref()
-        .is_some_and(crate::panel::json_value_is_enabled)
-        || !remote.obfs_password.trim().is_empty()
-    {
-        bail!("HY2 salamander obfs is not implemented yet");
-    }
     if remote.udp_over_stream {
         bail!("HY2 udp_over_stream is not supported by the HY2 protocol datagram relay");
     }
@@ -791,6 +1234,46 @@ fn hy2_cc_rx(
         return Ok("0".to_string());
     };
     Ok(mbps.saturating_mul(125_000).to_string())
+}
+
+fn parse_hy2_obfs(remote: &NodeConfigResponse) -> anyhow::Result<Option<SalamanderConfig>> {
+    let Some(obfs) = remote.obfs.as_ref() else {
+        ensure!(
+            remote.obfs_password.trim().is_empty(),
+            "HY2 obfs password requires salamander obfs"
+        );
+        return Ok(None);
+    };
+    if !crate::panel::json_value_is_enabled(obfs) {
+        ensure!(
+            remote.obfs_password.trim().is_empty(),
+            "HY2 obfs password requires salamander obfs"
+        );
+        return Ok(None);
+    }
+
+    let obfs_type = hy2_obfs_type(obfs).unwrap_or_default();
+    ensure!(
+        obfs_type.eq_ignore_ascii_case("salamander"),
+        "HY2 obfs must be salamander"
+    );
+    let password = remote.obfs_password.trim();
+    ensure!(
+        !password.is_empty(),
+        "HY2 salamander obfs password is required"
+    );
+    Ok(Some(SalamanderConfig::new(password)?))
+}
+
+fn hy2_obfs_type(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(text) => Some(text.trim()),
+        serde_json::Value::Object(object) => object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim),
+        _ => None,
+    }
 }
 
 fn value_to_u64(value: &serde_json::Value) -> anyhow::Result<u64> {
@@ -854,15 +1337,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hy2_obfs_until_salamander_is_supported() {
+    fn parses_hy2_salamander_obfs() {
         let remote = NodeConfigResponse {
-            obfs: Some(serde_json::json!("salamander")),
+            obfs: Some(serde_json::json!({ "type": "salamander" })),
             obfs_password: "secret".to_string(),
             ..base_remote()
         };
 
-        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("obfs");
-        assert!(error.to_string().contains("salamander obfs"));
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(
+            config.obfs,
+            Some(SalamanderConfig {
+                password: b"secret".to_vec()
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_hy2_salamander_short_password() {
+        let remote = NodeConfigResponse {
+            obfs: Some(serde_json::json!("salamander")),
+            obfs_password: "abc".to_string(),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("password");
+        assert!(error.to_string().contains("at least 4 bytes"));
+    }
+
+    #[test]
+    fn hy2_salamander_xor_roundtrips() {
+        let salt = [7u8; SALAMANDER_SALT_LEN];
+        let payload = b"hello hysteria";
+        let mut encrypted = vec![0u8; payload.len()];
+        let mut decrypted = vec![0u8; payload.len()];
+
+        salamander_xor(b"secret", &salt, payload, &mut encrypted);
+        assert_ne!(encrypted, payload);
+        salamander_xor(b"secret", &salt, &encrypted, &mut decrypted);
+
+        assert_eq!(decrypted, payload);
     }
 
     #[test]
@@ -897,6 +1411,126 @@ mod tests {
         let decoded = decode_udp_message(&encoded).expect("decode");
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn reassembles_hy2_udp_fragments() {
+        let fragments = Arc::new(AsyncMutex::new(FxHashMap::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(async {
+                let first = reassemble_udp_message(
+                    UdpMessage {
+                        session_id: 7,
+                        packet_id: 9,
+                        fragment_id: 0,
+                        fragment_count: 2,
+                        address: "example.com:53".to_string(),
+                        payload: b"hel".to_vec(),
+                    },
+                    &fragments,
+                )
+                .await?;
+                assert!(first.is_none());
+                reassemble_udp_message(
+                    UdpMessage {
+                        session_id: 7,
+                        packet_id: 9,
+                        fragment_id: 1,
+                        fragment_count: 2,
+                        address: "example.com:53".to_string(),
+                        payload: b"lo".to_vec(),
+                    },
+                    &fragments,
+                )
+                .await
+            })
+            .expect("reassemble")
+            .expect("complete message");
+
+        assert_eq!(result.fragment_count, 1);
+        assert_eq!(result.payload, b"hello");
+    }
+
+    #[test]
+    fn cleans_expired_hy2_udp_fragments() {
+        let fragments = Arc::new(AsyncMutex::new(FxHashMap::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            fragments.lock().await.insert(
+                (7, 9),
+                UdpFragmentBuffer {
+                    address: "example.com:53".to_string(),
+                    created_at: Instant::now() - UDP_FRAGMENT_TIMEOUT - Duration::from_secs(1),
+                    fragments: vec![Some(b"hel".to_vec()), None],
+                },
+            );
+
+            cleanup_udp_fragments(&fragments).await;
+
+            assert!(fragments.lock().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn cleans_idle_hy2_udp_sessions() {
+        let sessions = Arc::new(AsyncMutex::new(FxHashMap::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("socket"));
+            let session = Arc::new(UdpSession {
+                socket,
+                last_seen: Arc::new(Mutex::new(
+                    Instant::now() - UDP_SESSION_IDLE_TIMEOUT - Duration::from_secs(1),
+                )),
+                response_handle: Mutex::new(tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                })),
+            });
+            sessions.lock().await.insert(7, session);
+
+            cleanup_udp_sessions(&sessions).await;
+
+            assert!(sessions.lock().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn fragments_hy2_udp_responses_to_peer_datagram_size() {
+        let address = "example.com:53".to_string();
+        let header_len = encoded_udp_header_len(&address).expect("header len");
+        let payload: Vec<u8> = (0..25).collect();
+
+        let messages =
+            encode_udp_response_messages(7, 9, address.clone(), &payload, Some(header_len + 10))
+                .expect("fragments");
+
+        assert_eq!(messages.len(), 3);
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message.session_id, 7);
+            assert_eq!(message.packet_id, 9);
+            assert_eq!(message.fragment_id, index as u8);
+            assert_eq!(message.fragment_count, 3);
+            assert_eq!(message.address, address);
+            assert!(encode_udp_message(message).expect("encode").len() <= header_len + 10);
+        }
+        let combined: Vec<u8> = messages
+            .iter()
+            .flat_map(|message| message.payload.iter().copied())
+            .collect();
+        assert_eq!(combined, payload);
     }
 
     #[test]

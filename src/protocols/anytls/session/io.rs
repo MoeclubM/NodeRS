@@ -114,6 +114,10 @@ where
         let transferred = written as u64;
         total += transferred;
         if let Some(traffic) = traffic.as_ref() {
+            traffic.limit(transferred, &control).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
             traffic.record(transferred);
         }
         if finished && pending.is_none() && chunks.is_empty() {
@@ -212,6 +216,12 @@ where
             let _ = writer.shutdown().await;
             return Ok(total);
         }
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.limit(read as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
+        }
         tokio::select! {
             _ = control.cancelled() => return Ok(total),
             result = writer.write_all(&buffer[..read]) => {
@@ -289,6 +299,12 @@ where
                 None => (read, false),
             }
         };
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.limit(read as u64, &control).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
+        }
         if first_payload_fast_path {
             #[cfg(target_env = "musl")]
             if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {

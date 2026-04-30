@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 base64 = "0.22.1"
+blake2 = "0.10.6"
 blake3 = "1.8.4"
 boring = { version = "5.1.0", features = ["mlkem"] }
 bytes = "1.11.1"
@@ -38,10 +39,11 @@ serde_json = "1.0.149"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 socket2 = "0.6.3"
-tokio = { version = "1.50.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.50.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-boring = "5.0.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-yamux = "0.3.18"
 time = { version = "0.3.41", features = ["formatting"] }
 toml = "1.0.6"
 tracing = "0.1.44"
