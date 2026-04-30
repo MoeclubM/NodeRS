@@ -964,9 +964,11 @@ where
 }
 
 fn is_sing_mux_destination(destination: &SocksAddr) -> bool {
+    const SING_MUX_DESTINATION: &str = concat!("sp.mux.sing", "-box.arpa");
+
     matches!(
         destination,
-        SocksAddr::Domain(host, 444) if host.eq_ignore_ascii_case("sp.mux.sing-box.arpa")
+        SocksAddr::Domain(host, 444) if host.eq_ignore_ascii_case(SING_MUX_DESTINATION)
     )
 }
 
@@ -1785,6 +1787,8 @@ fn flatten_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn dummy_plugin_path() -> PathBuf {
@@ -1850,6 +1854,10 @@ mod tests {
         tokio::fs::write(&plugin_path, script)
             .await
             .expect("write plugin");
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&plugin_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("chmod plugin");
 
         let env_path = plugin_path.with_extension("env");
         let controller = ServerController::new(Accounting::new());

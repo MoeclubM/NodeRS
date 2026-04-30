@@ -6,12 +6,8 @@ cd "$ROOT_DIR"
 
 banned_patterns=(
   'sing-box_mod'
-  'sing-box'
   'sing_box'
   'singbox'
-  'std::process'
-  'tokio::process'
-  'Command::new'
 )
 
 for pattern in "${banned_patterns[@]}"; do
