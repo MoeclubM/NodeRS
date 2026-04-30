@@ -5,6 +5,7 @@ use boring::pkey::PKey;
 use boring::ssl::{AlpnError, SslAcceptor, SslEchKeys, SslMethod, SslOptions, SslVersion};
 use boring::x509::X509;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -117,6 +118,30 @@ pub async fn load_tls_materials(
             .and_then(|(_, config)| config.as_ref().map(|config| digest(config))),
         acceptor,
     })
+}
+
+pub async fn load_rustls_server_config(
+    source: &TlsMaterialSource,
+    alpn_protocols: &[String],
+) -> anyhow::Result<rustls::ServerConfig> {
+    let (cert_pem, key_pem) = load_source_materials(source).await?;
+    let certificates = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .context("parse certificate PEM")?;
+    ensure!(!certificates.is_empty(), "certificate PEM is empty");
+    let private_key = PrivateKeyDer::from_pem_slice(&key_pem).context("parse private key PEM")?;
+    let provider = rustls::crypto::ring::default_provider();
+    let mut config = rustls::ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("build rustls TLS 1.3 config")?
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .context("set rustls certificate")?;
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|protocol| protocol.as_bytes().to_vec())
+        .collect();
+    Ok(config)
 }
 
 pub async fn reload_if_changed(

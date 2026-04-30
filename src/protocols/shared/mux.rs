@@ -12,9 +12,7 @@ use tokio::task::AbortHandle;
 
 use crate::accounting::SessionControl;
 
-use super::super::shared::{
-    routing::RoutingTable, socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
-};
+use super::{routing::RoutingTable, socksaddr::SocksAddr, traffic::TrafficRecorder, transport};
 
 const STATUS_NEW: u8 = 0x01;
 const STATUS_KEEP: u8 = 0x02;

@@ -5,13 +5,13 @@ mod traffic_pattern;
 use anyhow::{Context, anyhow, bail, ensure};
 use rand::RngExt;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
@@ -22,19 +22,28 @@ use crate::panel::{NodeConfigResponse, PanelUser};
 
 use self::codec::{Metadata, ProtocolType, SocksCommand};
 use super::shared::{
-    bind_listeners, configure_tcp_stream, effective_listen_ip, routing, socksaddr::SocksAddr,
-    traffic::TrafficRecorder, transport,
+    bind_listeners, bind_udp_sockets, configure_tcp_stream, effective_listen_ip, routing,
+    socksaddr::SocksAddr, traffic::TrafficRecorder, transport,
 };
 
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_RETRANSMIT_INTERVAL: Duration = Duration::from_secs(1);
 const COPY_BUFFER_LEN: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
+    transport: UnderlayTransport,
     pub traffic_pattern: traffic_pattern::TrafficPatternConfig,
     pub routing: routing::RoutingTable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnderlayTransport {
+    Tcp,
+    Udp,
 }
 
 pub struct ServerController {
@@ -50,6 +59,7 @@ pub struct ServerController {
 struct RunningServer {
     listen_ip: String,
     server_port: u16,
+    transport: UnderlayTransport,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -88,12 +98,47 @@ struct SessionState {
     closed: AtomicBool,
 }
 
+struct PacketSessionState {
+    id: u32,
+    source: Mutex<SocketAddr>,
+    socket: Arc<UdpSocket>,
+    key: [u8; crypto::KEY_LEN],
+    user: UserCredential,
+    nonce_pattern: traffic_pattern::NoncePatternState,
+    control: Arc<SessionControl>,
+    upload: TrafficRecorder,
+    download: TrafficRecorder,
+    _lease: SessionLease,
+    request_buffer: AsyncMutex<Vec<u8>>,
+    remote_writer: AsyncMutex<Option<WriteHalf<TcpStream>>>,
+    next_send_seq: AtomicU32,
+    next_recv_seq: AtomicU32,
+    recv_buffer: AsyncMutex<BTreeMap<u32, Vec<u8>>>,
+    sent_packets: AsyncMutex<BTreeMap<u32, SentPacket>>,
+    last_seen: AtomicI64,
+    closed: AtomicBool,
+}
+
+#[derive(Clone)]
+struct SentPacket {
+    bytes: Vec<u8>,
+}
+
+struct DecodedPacket {
+    metadata: Metadata,
+    payload: Vec<u8>,
+    user: UserCredential,
+    key: [u8; crypto::KEY_LEN],
+    nonce_prefix: [u8; 16],
+}
+
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
+            transport: parse_transport(remote.transport.as_ref())?,
             traffic_pattern: traffic_pattern::TrafficPatternConfig::decode(&remote.traffic_pattern)
                 .context("decode Mieru traffic_pattern")?,
             routing: routing::RoutingTable::from_remote(
@@ -148,7 +193,9 @@ impl ServerController {
         let old = {
             let mut guard = self.inner.lock().expect("mieru controller poisoned");
             let should_restart = guard.as_ref().is_none_or(|running| {
-                running.listen_ip != config.listen_ip || running.server_port != config.server_port
+                running.listen_ip != config.listen_ip
+                    || running.server_port != config.server_port
+                    || running.transport != config.transport
             });
             if !should_restart {
                 return Ok(());
@@ -162,31 +209,69 @@ impl ServerController {
             }
         }
 
-        let listeners = bind_listeners(&config.listen_ip, config.server_port)?;
-        let bind_addrs = listeners
-            .iter()
-            .filter_map(|listener| listener.local_addr().ok())
-            .map(|addr| format!("tcp://{addr}"))
-            .collect::<Vec<_>>();
-
         let mut handles = Vec::new();
-        for listener in listeners {
-            let accounting = self.accounting.clone();
-            let users = self.users.clone();
-            let traffic_pattern = self.traffic_pattern.clone();
-            let routing = self.routing.clone();
-            let replay = self.replay.clone();
-            handles.push(tokio::spawn(async move {
-                accept_loop(
-                    listener,
-                    accounting,
-                    users,
-                    traffic_pattern,
-                    routing,
-                    replay,
-                )
-                .await;
-            }));
+        let mut bind_addrs = Vec::new();
+
+        match config.transport {
+            UnderlayTransport::Tcp => {
+                let listeners = bind_listeners(&config.listen_ip, config.server_port)?;
+                bind_addrs.extend(
+                    listeners
+                        .iter()
+                        .filter_map(|listener| listener.local_addr().ok())
+                        .map(|addr| format!("tcp://{addr}")),
+                );
+                for listener in listeners {
+                    let accounting = self.accounting.clone();
+                    let users = self.users.clone();
+                    let traffic_pattern = self.traffic_pattern.clone();
+                    let routing = self.routing.clone();
+                    let replay = self.replay.clone();
+                    handles.push(tokio::spawn(async move {
+                        accept_loop(
+                            listener,
+                            accounting,
+                            users,
+                            traffic_pattern,
+                            routing,
+                            replay,
+                        )
+                        .await;
+                    }));
+                }
+            }
+            UnderlayTransport::Udp => {
+                let sockets = bind_udp_sockets(&config.listen_ip, config.server_port)?;
+                bind_addrs.extend(
+                    sockets
+                        .iter()
+                        .filter_map(|socket| socket.local_addr().ok())
+                        .map(|addr| format!("udp://{addr}")),
+                );
+                for socket in sockets {
+                    let socket = Arc::new(socket);
+                    let accounting = self.accounting.clone();
+                    let users = self.users.clone();
+                    let traffic_pattern = self.traffic_pattern.clone();
+                    let routing = self.routing.clone();
+                    let replay = self.replay.clone();
+                    let sessions = Arc::new(AsyncMutex::new(
+                        HashMap::<u32, Arc<PacketSessionState>>::new(),
+                    ));
+                    handles.push(tokio::spawn(async move {
+                        packet_loop(
+                            socket,
+                            accounting,
+                            users,
+                            traffic_pattern,
+                            routing,
+                            replay,
+                            sessions,
+                        )
+                        .await;
+                    }));
+                }
+            }
         }
 
         info!(listen = ?bind_addrs, "Mieru listeners started");
@@ -194,6 +279,7 @@ impl ServerController {
         *guard = Some(RunningServer {
             listen_ip: config.listen_ip,
             server_port: config.server_port,
+            transport: config.transport,
             handles,
         });
         Ok(())
@@ -740,6 +826,632 @@ async fn handle_session_payload(
     Ok(())
 }
 
+async fn packet_loop(
+    socket: Arc<UdpSocket>,
+    accounting: Arc<Accounting>,
+    users: Arc<RwLock<UserValidator>>,
+    traffic_pattern: Arc<RwLock<traffic_pattern::TrafficPatternConfig>>,
+    routing: Arc<RwLock<routing::RoutingTable>>,
+    replay: Arc<ReplayCache>,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) {
+    let listen = socket
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let mut buffer = vec![0u8; 1500];
+    loop {
+        let (size, source) = match socket.recv_from(&mut buffer).await {
+            Ok(value) => value,
+            Err(error) => {
+                error!(%error, listen = %listen, "receive Mieru UDP packet failed");
+                continue;
+            }
+        };
+        let source = transport::normalize_udp_source(source);
+        let users = users.read().expect("mieru users lock poisoned").clone();
+        let traffic_pattern = traffic_pattern
+            .read()
+            .expect("mieru traffic pattern lock poisoned")
+            .clone();
+        let routing = routing.read().expect("mieru routing lock poisoned").clone();
+        if let Err(error) = handle_packet(
+            socket.clone(),
+            source,
+            &buffer[..size],
+            accounting.clone(),
+            users,
+            traffic_pattern,
+            routing,
+            replay.clone(),
+            sessions.clone(),
+        )
+        .await
+        {
+            warn!(%error, %source, "Mieru UDP packet handling failed");
+        }
+        cleanup_packet_sessions(&sessions).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_packet(
+    socket: Arc<UdpSocket>,
+    source: SocketAddr,
+    packet: &[u8],
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    traffic_pattern: traffic_pattern::TrafficPatternConfig,
+    routing: routing::RoutingTable,
+    replay: Arc<ReplayCache>,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) -> anyhow::Result<()> {
+    let decoded = decode_packet(packet, &users)?;
+    if matches!(decoded.metadata, Metadata::Session(_)) && replay.remember(decoded.nonce_prefix) {
+        bail!("replayed Mieru UDP session packet detected");
+    }
+
+    match decoded.metadata {
+        Metadata::Session(metadata) => match metadata.protocol {
+            ProtocolType::OpenSessionRequest => {
+                ensure!(metadata.session_id != 0, "Mieru session id 0 is reserved");
+                let session = get_or_create_packet_session(
+                    metadata.session_id,
+                    source,
+                    socket,
+                    accounting,
+                    decoded.user,
+                    decoded.key,
+                    traffic_pattern.effective().nonce.clone(),
+                    sessions.clone(),
+                )
+                .await?;
+                update_packet_session_source(&session, source);
+                handle_packet_open_session(session, metadata, decoded.payload, routing, sessions)
+                    .await?;
+            }
+            ProtocolType::CloseSessionRequest | ProtocolType::CloseSessionResponse => {
+                close_packet_session(&sessions, metadata.session_id).await;
+            }
+            ProtocolType::OpenSessionResponse => bail!("unexpected Mieru UDP openSessionResponse"),
+            _ => bail!(
+                "invalid Mieru UDP session protocol {}",
+                metadata.protocol as u8
+            ),
+        },
+        Metadata::Data(metadata) => match metadata.protocol {
+            ProtocolType::DataClientToServer | ProtocolType::AckClientToServer => {
+                let session = {
+                    let guard = sessions.lock().await;
+                    guard.get(&metadata.session_id).cloned()
+                }
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Mieru UDP session {} is not registered",
+                        metadata.session_id
+                    )
+                })?;
+                update_packet_session_source(&session, source);
+                ack_packet_segments(&session, metadata.unack_seq).await;
+                session.last_seen.store(now_micros(), Ordering::SeqCst);
+                if metadata.protocol == ProtocolType::DataClientToServer {
+                    enqueue_packet_payload(session, metadata, decoded.payload, routing, sessions)
+                        .await?;
+                }
+            }
+            ProtocolType::DataServerToClient | ProtocolType::AckServerToClient => {
+                bail!(
+                    "unexpected Mieru UDP server-bound data protocol {}",
+                    metadata.protocol as u8
+                )
+            }
+            _ => bail!(
+                "invalid Mieru UDP data protocol {}",
+                metadata.protocol as u8
+            ),
+        },
+    }
+    Ok(())
+}
+
+fn decode_packet(packet: &[u8], users: &UserValidator) -> anyhow::Result<DecodedPacket> {
+    ensure!(
+        packet.len() >= crypto::NONCE_LEN + codec::METADATA_LEN + crypto::TAG_LEN,
+        "Mieru UDP packet is too short"
+    );
+    let metadata_end = crypto::NONCE_LEN + codec::METADATA_LEN + crypto::TAG_LEN;
+    let encrypted_metadata = &packet[..metadata_end];
+    let mut nonce = [0u8; crypto::NONCE_LEN];
+    nonce.copy_from_slice(&encrypted_metadata[..crypto::NONCE_LEN]);
+    let mut nonce_prefix = [0u8; 16];
+    nonce_prefix.copy_from_slice(&nonce[..16]);
+
+    let mut candidates = users
+        .users
+        .iter()
+        .filter(|user| crypto::user_hint_matches(&user.name, &nonce))
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = users.users.clone();
+    }
+
+    for user in candidates {
+        for key in crypto::derive_keys(&user.hashed_password, std::time::SystemTime::now())? {
+            let Ok((_, metadata_bytes)) = crypto::decrypt_first_frame(key, encrypted_metadata)
+            else {
+                continue;
+            };
+            let Ok(metadata) = codec::decode_metadata(&metadata_bytes) else {
+                continue;
+            };
+            let payload = decrypt_packet_payload(&metadata, key, &nonce, &packet[metadata_end..])?;
+            return Ok(DecodedPacket {
+                metadata,
+                payload,
+                user,
+                key,
+                nonce_prefix,
+            });
+        }
+    }
+
+    bail!("failed to match Mieru UDP user")
+}
+
+fn decrypt_packet_payload(
+    metadata: &Metadata,
+    key: [u8; crypto::KEY_LEN],
+    nonce: &[u8; crypto::NONCE_LEN],
+    remaining: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let (prefix_len, payload_len, suffix_len) = match metadata {
+        Metadata::Session(value) => (
+            0usize,
+            usize::from(value.payload_len),
+            usize::from(value.suffix_len),
+        ),
+        Metadata::Data(value) => (
+            usize::from(value.prefix_len),
+            usize::from(value.payload_len),
+            usize::from(value.suffix_len),
+        ),
+    };
+    ensure!(
+        remaining.len() >= prefix_len,
+        "truncated Mieru UDP prefix padding"
+    );
+    if payload_len == 0 {
+        ensure!(
+            remaining.len() == prefix_len + suffix_len,
+            "Mieru UDP padding length mismatch"
+        );
+        return Ok(Vec::new());
+    }
+
+    let payload_start = prefix_len;
+    let payload_end = payload_start + payload_len + crypto::TAG_LEN;
+    ensure!(
+        remaining.len() >= payload_end,
+        "truncated Mieru UDP payload"
+    );
+    ensure!(
+        remaining.len() == payload_end + suffix_len,
+        "Mieru UDP padding length mismatch"
+    );
+    crypto::decrypt_packet_payload(key, nonce, &remaining[payload_start..payload_end])
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_or_create_packet_session(
+    session_id: u32,
+    source: SocketAddr,
+    socket: Arc<UdpSocket>,
+    accounting: Arc<Accounting>,
+    user: UserCredential,
+    key: [u8; crypto::KEY_LEN],
+    nonce_pattern: traffic_pattern::NoncePattern,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) -> anyhow::Result<Arc<PacketSessionState>> {
+    let mut guard = sessions.lock().await;
+    if let Some(session) = guard.get(&session_id) {
+        return Ok(session.clone());
+    }
+
+    let lease = accounting.open_session(&user.user, source)?;
+    let session = Arc::new(PacketSessionState {
+        id: session_id,
+        source: Mutex::new(source),
+        socket,
+        key,
+        user: user.clone(),
+        nonce_pattern: traffic_pattern::NoncePatternState::new(nonce_pattern),
+        control: lease.control(),
+        upload: TrafficRecorder::upload(accounting.clone(), user.user.id),
+        download: TrafficRecorder::download(accounting, user.user.id),
+        _lease: lease,
+        request_buffer: AsyncMutex::new(Vec::new()),
+        remote_writer: AsyncMutex::new(None),
+        next_send_seq: AtomicU32::new(0),
+        next_recv_seq: AtomicU32::new(0),
+        recv_buffer: AsyncMutex::new(BTreeMap::new()),
+        sent_packets: AsyncMutex::new(BTreeMap::new()),
+        last_seen: AtomicI64::new(now_micros()),
+        closed: AtomicBool::new(false),
+    });
+    guard.insert(session_id, session.clone());
+    tokio::spawn(retransmit_packet_segments(session.clone()));
+    Ok(session)
+}
+
+fn update_packet_session_source(session: &PacketSessionState, source: SocketAddr) {
+    *session
+        .source
+        .lock()
+        .expect("mieru UDP source lock poisoned") = source;
+}
+
+async fn handle_packet_open_session(
+    session: Arc<PacketSessionState>,
+    metadata: codec::SessionMetadata,
+    payload: Vec<u8>,
+    routing: routing::RoutingTable,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) -> anyhow::Result<()> {
+    let response_seq = session.next_send_seq.fetch_add(1, Ordering::SeqCst);
+    send_packet_session_segment(
+        &session,
+        ProtocolType::OpenSessionResponse,
+        response_seq,
+        0,
+        &[],
+    )
+    .await?;
+    session
+        .next_recv_seq
+        .store(metadata.seq + 1, Ordering::SeqCst);
+    if !payload.is_empty() {
+        handle_packet_session_payload(session, payload, routing, sessions).await?;
+    }
+    Ok(())
+}
+
+async fn enqueue_packet_payload(
+    session: Arc<PacketSessionState>,
+    metadata: codec::DataMetadata,
+    payload: Vec<u8>,
+    routing: routing::RoutingTable,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) -> anyhow::Result<()> {
+    {
+        let mut recv = session.recv_buffer.lock().await;
+        recv.insert(metadata.seq, payload);
+    }
+    loop {
+        let next = session.next_recv_seq.load(Ordering::SeqCst);
+        let Some(payload) = session.recv_buffer.lock().await.remove(&next) else {
+            break;
+        };
+        session.next_recv_seq.store(next + 1, Ordering::SeqCst);
+        handle_packet_session_payload(session.clone(), payload, routing.clone(), sessions.clone())
+            .await?;
+    }
+    send_packet_ack(&session, ProtocolType::AckServerToClient).await
+}
+
+async fn handle_packet_session_payload(
+    session: Arc<PacketSessionState>,
+    payload: Vec<u8>,
+    routing: routing::RoutingTable,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) -> anyhow::Result<()> {
+    if payload.is_empty() || session.control.is_cancelled() {
+        return Ok(());
+    }
+
+    {
+        let mut guard = session.remote_writer.lock().await;
+        if let Some(remote) = guard.as_mut() {
+            tokio::select! {
+                _ = session.control.cancelled() => return Ok(()),
+                result = remote.write_all(&payload) => result.context("write Mieru UDP proxied upload")?,
+            }
+            session.upload.record(payload.len() as u64);
+            return Ok(());
+        }
+    }
+
+    let request = {
+        let mut buffer = session.request_buffer.lock().await;
+        buffer.extend_from_slice(&payload);
+        match codec::parse_socks5_request(&buffer)? {
+            Some(request) => {
+                let consumed_len = request.consumed_len;
+                let request = (request, buffer[consumed_len..].to_vec());
+                buffer.clear();
+                request
+            }
+            None => return Ok(()),
+        }
+    };
+    let (request, remaining) = request;
+    match request.command {
+        SocksCommand::Connect => {
+            open_packet_tcp_session(session, request, remaining, routing, sessions).await
+        }
+        SocksCommand::UdpAssociate => {
+            write_packet_socks_response(
+                &session,
+                codec::SOCKS_REPLY_COMMAND_NOT_SUPPORTED,
+                SocksAddr::Ip(SocketAddr::from(([0, 0, 0, 0], 0))),
+            )
+            .await?;
+            close_packet_session(&sessions, session.id).await;
+            Ok(())
+        }
+    }
+}
+
+async fn open_packet_tcp_session(
+    session: Arc<PacketSessionState>,
+    request: codec::SocksRequest,
+    remaining: Vec<u8>,
+    routing: routing::RoutingTable,
+    sessions: Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) -> anyhow::Result<()> {
+    let remote = match transport::connect_tcp_destination(&request.destination, &routing).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            write_packet_socks_response(
+                &session,
+                codec::SOCKS_REPLY_HOST_UNREACHABLE,
+                SocksAddr::Ip(SocketAddr::from(([0, 0, 0, 0], 0))),
+            )
+            .await?;
+            close_packet_session(&sessions, session.id).await;
+            return Err(error).context("connect Mieru UDP TCP destination");
+        }
+    };
+    let bind = remote
+        .local_addr()
+        .map(SocksAddr::Ip)
+        .unwrap_or_else(|_| SocksAddr::Ip(SocketAddr::from(([0, 0, 0, 0], 0))));
+    write_packet_socks_response(&session, codec::SOCKS_REPLY_SUCCESS, bind).await?;
+    let (mut remote_reader, mut remote_writer) = split(remote);
+    if !remaining.is_empty() {
+        remote_writer
+            .write_all(&remaining)
+            .await
+            .context("write initial Mieru UDP TCP payload")?;
+        session.upload.record(remaining.len() as u64);
+    }
+    *session.remote_writer.lock().await = Some(remote_writer);
+    tokio::spawn(async move {
+        if let Err(error) =
+            relay_remote_to_packet_session(session.clone(), &mut remote_reader).await
+        {
+            warn!(%error, session_id = session.id, "Mieru UDP TCP relay terminated with error");
+        }
+        close_packet_session(&sessions, session.id).await;
+    });
+    Ok(())
+}
+
+async fn relay_remote_to_packet_session(
+    session: Arc<PacketSessionState>,
+    remote_reader: &mut ReadHalf<TcpStream>,
+) -> anyhow::Result<()> {
+    let mut buffer = vec![0u8; COPY_BUFFER_LEN];
+    loop {
+        let read = tokio::select! {
+            _ = session.control.cancelled() => return Ok(()),
+            read = remote_reader.read(&mut buffer) => read.context("read Mieru UDP proxied download")?,
+        };
+        if read == 0 {
+            return Ok(());
+        }
+        session.download.record(read as u64);
+        write_packet_data(&session, &buffer[..read]).await?;
+    }
+}
+
+async fn write_packet_socks_response(
+    session: &PacketSessionState,
+    reply: u8,
+    bind: SocksAddr,
+) -> anyhow::Result<()> {
+    let response = codec::encode_socks5_response(reply, &bind)?;
+    write_packet_data(session, &response).await
+}
+
+async fn write_packet_data(session: &PacketSessionState, payload: &[u8]) -> anyhow::Result<()> {
+    let seq = session.next_send_seq.fetch_add(1, Ordering::SeqCst);
+    send_packet_data_segment(session, ProtocolType::DataServerToClient, seq, payload).await
+}
+
+async fn send_packet_ack(
+    session: &PacketSessionState,
+    protocol: ProtocolType,
+) -> anyhow::Result<()> {
+    let seq = session
+        .next_send_seq
+        .load(Ordering::SeqCst)
+        .saturating_sub(1);
+    send_packet_data_segment(session, protocol, seq, &[]).await
+}
+
+async fn send_packet_session_segment(
+    session: &PacketSessionState,
+    protocol: ProtocolType,
+    seq: u32,
+    status_code: u8,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let metadata =
+        codec::encode_session_metadata(protocol, session.id, seq, status_code, payload.len())?;
+    let packet = encode_packet(session, &metadata, payload)?;
+    let source = *session
+        .source
+        .lock()
+        .expect("mieru UDP source lock poisoned");
+    send_packet_to_source(session, &packet, source).await?;
+    session
+        .sent_packets
+        .lock()
+        .await
+        .insert(seq, SentPacket { bytes: packet });
+    Ok(())
+}
+
+async fn send_packet_data_segment(
+    session: &PacketSessionState,
+    protocol: ProtocolType,
+    seq: u32,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let metadata = codec::encode_data_metadata_full(
+        protocol,
+        session.id,
+        seq,
+        session.next_recv_seq.load(Ordering::SeqCst),
+        1024,
+        0,
+        0,
+        payload.len(),
+        0,
+    )?;
+    let packet = encode_packet(session, &metadata, payload)?;
+    let source = *session
+        .source
+        .lock()
+        .expect("mieru UDP source lock poisoned");
+    send_packet_to_source(session, &packet, source).await?;
+    if matches!(protocol, ProtocolType::DataServerToClient) {
+        session
+            .sent_packets
+            .lock()
+            .await
+            .insert(seq, SentPacket { bytes: packet });
+    }
+    Ok(())
+}
+
+fn encode_packet(
+    session: &PacketSessionState,
+    metadata: &[u8; codec::METADATA_LEN],
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let (mut packet, nonce) = crypto::encrypt_packet_metadata(
+        session.key,
+        &session.user.name,
+        &session.nonce_pattern,
+        metadata,
+    )?;
+    if !payload.is_empty() {
+        packet.extend_from_slice(&crypto::encrypt_packet_payload(
+            session.key,
+            &nonce,
+            payload,
+        )?);
+    }
+    Ok(packet)
+}
+
+async fn send_packet_to_source(
+    session: &PacketSessionState,
+    packet: &[u8],
+    source: SocketAddr,
+) -> anyhow::Result<()> {
+    let target = transport::normalize_udp_target(&session.socket, source);
+    let sent = session
+        .socket
+        .send_to(packet, target)
+        .await
+        .with_context(|| format!("send Mieru UDP packet to {target}"))?;
+    ensure!(
+        sent == packet.len(),
+        "short Mieru UDP packet send: expected {}, wrote {}",
+        packet.len(),
+        sent
+    );
+    Ok(())
+}
+
+async fn retransmit_packet_segments(session: Arc<PacketSessionState>) {
+    loop {
+        tokio::time::sleep(UDP_RETRANSMIT_INTERVAL).await;
+        if session.control.is_cancelled() || session.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let packets = session
+            .sent_packets
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let source = *session
+            .source
+            .lock()
+            .expect("mieru UDP source lock poisoned");
+        for packet in packets {
+            if let Err(error) = send_packet_to_source(&session, &packet.bytes, source).await {
+                warn!(%error, session_id = session.id, "retransmit Mieru UDP packet failed");
+                return;
+            }
+        }
+    }
+}
+
+async fn ack_packet_segments(session: &PacketSessionState, unack_seq: u32) {
+    let mut sent = session.sent_packets.lock().await;
+    let acknowledged = sent
+        .keys()
+        .copied()
+        .filter(|seq| *seq < unack_seq)
+        .collect::<Vec<_>>();
+    for seq in acknowledged {
+        sent.remove(&seq);
+    }
+}
+
+async fn close_packet_session(
+    sessions: &Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+    session_id: u32,
+) {
+    let session = sessions.lock().await.remove(&session_id);
+    if let Some(session) = session {
+        session.closed.store(true, Ordering::SeqCst);
+        session.control.cancel();
+        let _ = session.remote_writer.lock().await.take();
+    }
+}
+
+async fn cleanup_packet_sessions(
+    sessions: &Arc<AsyncMutex<HashMap<u32, Arc<PacketSessionState>>>>,
+) {
+    let deadline = now_micros() - UDP_SESSION_IDLE_TIMEOUT.as_micros() as i64;
+    let stale = {
+        let guard = sessions.lock().await;
+        guard
+            .iter()
+            .filter_map(|(id, session)| {
+                (session.last_seen.load(Ordering::SeqCst) < deadline).then_some(*id)
+            })
+            .collect::<Vec<_>>()
+    };
+    for id in stale {
+        close_packet_session(sessions, id).await;
+    }
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as i64
+}
+
 async fn relay_remote_to_session(
     session: Arc<SessionState>,
     remote_reader: &mut ReadHalf<TcpStream>,
@@ -900,17 +1612,17 @@ async fn cancel_all_sessions(sessions: &Arc<AsyncMutex<HashMap<u32, Arc<SessionS
     }
 }
 
-fn parse_transport(value: Option<&Value>) -> anyhow::Result<()> {
+fn parse_transport(value: Option<&Value>) -> anyhow::Result<UnderlayTransport> {
     if value.is_some_and(|value| !crate::panel::json_value_is_enabled(value)) {
-        return Ok(());
+        return Ok(UnderlayTransport::Tcp);
     }
 
     match value {
-        None | Some(Value::Null) => Ok(()),
+        None | Some(Value::Null) => Ok(UnderlayTransport::Tcp),
         Some(Value::String(text))
             if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("tcp") =>
         {
-            Ok(())
+            Ok(UnderlayTransport::Tcp)
         }
         Some(Value::Object(object))
             if object
@@ -918,10 +1630,10 @@ fn parse_transport(value: Option<&Value>) -> anyhow::Result<()> {
                 .and_then(Value::as_str)
                 .is_some_and(|value| value.eq_ignore_ascii_case("tcp")) =>
         {
-            Ok(())
+            Ok(UnderlayTransport::Tcp)
         }
         Some(Value::String(text)) if text.trim().eq_ignore_ascii_case("udp") => {
-            bail!("Xboard Mieru UDP transport is not supported by NodeRS yet")
+            Ok(UnderlayTransport::Udp)
         }
         Some(Value::Object(object))
             if object
@@ -929,7 +1641,7 @@ fn parse_transport(value: Option<&Value>) -> anyhow::Result<()> {
                 .and_then(Value::as_str)
                 .is_some_and(|value| value.eq_ignore_ascii_case("udp")) =>
         {
-            bail!("Xboard Mieru UDP transport is not supported by NodeRS yet")
+            Ok(UnderlayTransport::Udp)
         }
         _ => bail!("Xboard Mieru transport is not supported by NodeRS yet"),
     }
@@ -1035,16 +1747,84 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tcp_transport_and_rejects_udp_transport() {
+    fn accepts_tcp_and_udp_transport() {
         let config = EffectiveNodeConfig::from_remote(&base_remote()).expect("config");
         assert_eq!(config.server_port, 8964);
+        assert_eq!(config.transport, UnderlayTransport::Tcp);
 
         let remote = NodeConfigResponse {
             transport: Some(Value::String("UDP".to_string())),
             ..base_remote()
         };
-        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("udp transport");
-        assert!(error.to_string().contains("UDP"));
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("udp config");
+        assert_eq!(config.transport, UnderlayTransport::Udp);
+    }
+
+    #[test]
+    fn decodes_udp_packet_payload_and_empty_ack() {
+        let user = UserCredential::from_panel_user(&PanelUser {
+            id: 7,
+            uuid: "bf000d23-0752-40b4-affe-68f7707a9661".to_string(),
+            ..Default::default()
+        })
+        .expect("user");
+        let validator = UserValidator {
+            users: vec![user.clone()],
+        };
+        let key = crypto::derive_keys(&user.hashed_password, std::time::SystemTime::now())
+            .expect("keys")[1];
+        let nonce_pattern = traffic_pattern::NoncePatternState::new(Default::default());
+
+        let metadata = codec::encode_data_metadata_full(
+            ProtocolType::DataClientToServer,
+            11,
+            3,
+            2,
+            1024,
+            0,
+            0,
+            4,
+            0,
+        )
+        .expect("metadata");
+        let (mut packet, nonce) =
+            crypto::encrypt_packet_metadata(key, &user.name, &nonce_pattern, &metadata)
+                .expect("metadata encrypt");
+        packet.extend_from_slice(
+            &crypto::encrypt_packet_payload(key, &nonce, b"ping").expect("payload encrypt"),
+        );
+        let decoded = decode_packet(&packet, &validator).expect("decode data packet");
+        assert_eq!(decoded.payload, b"ping");
+        let Metadata::Data(data) = decoded.metadata else {
+            panic!("expected data metadata");
+        };
+        assert_eq!(data.protocol, ProtocolType::DataClientToServer);
+        assert_eq!(data.session_id, 11);
+        assert_eq!(data.seq, 3);
+        assert_eq!(data.unack_seq, 2);
+
+        let metadata = codec::encode_data_metadata_full(
+            ProtocolType::AckClientToServer,
+            11,
+            3,
+            5,
+            1024,
+            0,
+            0,
+            0,
+            0,
+        )
+        .expect("ack metadata");
+        let (packet, _) =
+            crypto::encrypt_packet_metadata(key, &user.name, &nonce_pattern, &metadata)
+                .expect("ack metadata encrypt");
+        let decoded = decode_packet(&packet, &validator).expect("decode ack packet");
+        assert!(decoded.payload.is_empty());
+        let Metadata::Data(data) = decoded.metadata else {
+            panic!("expected ack metadata");
+        };
+        assert_eq!(data.protocol, ProtocolType::AckClientToServer);
+        assert_eq!(data.unack_seq, 5);
     }
 
     #[test]

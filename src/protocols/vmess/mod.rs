@@ -1,8 +1,6 @@
 mod codec;
 mod crypto;
 
-use super::vless::mux;
-
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,20 +23,22 @@ use self::crypto::{
     encode_response_header, parse_uuid,
 };
 use super::shared::{
-    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing, tls,
-    traffic::TrafficRecorder, transport,
+    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, grpc, http1,
+    httpupgrade, mux, routing, tls, traffic::TrafficRecorder, transport, ws, xhttp,
 };
 
 const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_ID_SKEW: Duration = Duration::from_secs(120);
 const COPY_BUFFER_LEN: usize = 64 * 1024;
+const HTTP2_CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
     pub tls: Option<EffectiveTlsConfig>,
+    transport: TransportMode,
     #[cfg(test)]
     pub security: SecurityType,
     #[cfg(test)]
@@ -51,6 +51,18 @@ pub struct EffectiveNodeConfig {
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
+        let transport = parse_transport_mode(remote)?;
+        let mut tls = (remote.tls_mode() == 1)
+            .then(|| EffectiveTlsConfig::from_remote(remote))
+            .transpose()?;
+        if let Some(tls) = tls.as_mut() {
+            if matches!(transport, TransportMode::Grpc(_)) && tls.alpn.is_empty() {
+                tls.alpn = default_grpc_alpn();
+            }
+            if matches!(transport, TransportMode::Xhttp(_)) && tls.alpn.is_empty() {
+                tls.alpn = default_xhttp_alpn();
+            }
+        }
         #[cfg(test)]
         let security = SecurityType::from_remote(&remote.cipher)?;
         #[cfg(not(test))]
@@ -58,9 +70,8 @@ impl EffectiveNodeConfig {
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
-            tls: (remote.tls_mode() == 1)
-                .then(|| EffectiveTlsConfig::from_remote(remote))
-                .transpose()?,
+            tls,
+            transport,
             #[cfg(test)]
             security,
             #[cfg(test)]
@@ -109,6 +120,15 @@ impl EffectiveNodeConfig {
         request.response_body_config()?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TransportMode {
+    Tcp,
+    Grpc(grpc::GrpcConfig),
+    Ws(ws::WsConfig),
+    HttpUpgrade(httpupgrade::HttpUpgradeConfig),
+    Xhttp(xhttp::XhttpConfig),
 }
 
 struct VmessUser {
@@ -385,19 +405,176 @@ async fn accept_loop(
                 .await
                 {
                     Ok(Ok(stream)) => {
-                        serve_connection(stream, source, accounting, users, runtime).await
+                        serve_transport(stream, source, accounting, users, runtime).await
                     }
                     Ok(Err(error)) => Err(error).context("VMess TLS handshake failed"),
                     Err(_) => Err(anyhow!("VMess TLS handshake timed out")),
                 }
             } else {
-                serve_connection(stream, source, accounting, users, runtime).await
+                serve_transport(stream, source, accounting, users, runtime).await
             };
             if let Err(error) = result {
                 warn!(%error, %source, "VMess session terminated with error");
             }
         });
     }
+}
+
+async fn serve_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: Arc<RwLock<UserValidator>>,
+    runtime: EffectiveNodeConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match runtime.transport.clone() {
+        TransportMode::Tcp => serve_connection(stream, source, accounting, users, runtime).await,
+        TransportMode::Grpc(config) => {
+            serve_grpc_transport(stream, source, accounting, users, runtime, config).await
+        }
+        TransportMode::Ws(config) => {
+            let Some(stream) = ws::accept(stream, &config).await? else {
+                return Ok(());
+            };
+            serve_connection(stream, source, accounting, users, runtime).await
+        }
+        TransportMode::HttpUpgrade(config) => {
+            let Some(stream) = httpupgrade::accept(stream, &config).await? else {
+                return Ok(());
+            };
+            serve_connection(stream, source, accounting, users, runtime).await
+        }
+        TransportMode::Xhttp(config) => {
+            serve_xhttp_transport(stream, source, accounting, users, runtime, config).await
+        }
+    }
+}
+
+async fn serve_grpc_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: Arc<RwLock<UserValidator>>,
+    runtime: EffectiveNodeConfig,
+    config: grpc::GrpcConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let on_stream: Arc<dyn Fn(grpc::GrpcStream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_connection(stream, source, accounting, users, runtime).await {
+                warn!(%error, %source, "VMess gRPC session terminated with error");
+            }
+        });
+    });
+    grpc::serve_h2(stream, config, on_stream).await
+}
+
+async fn serve_xhttp_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: Arc<RwLock<UserValidator>>,
+    runtime: EffectiveNodeConfig,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream = http1::PrefixedIo::new(stream, Vec::new()).capture_inner_reads();
+    let is_h2 = timeout(
+        REQUEST_HEADER_TIMEOUT,
+        sniff_http2_connection_preface(&mut stream),
+    )
+    .await
+    .map_err(|_| anyhow!("XHTTP connection preface timed out"))??;
+    let (stream, prefetched) = stream.into_parts();
+    let stream = http1::PrefixedIo::new(stream, prefetched);
+    if is_h2 {
+        return serve_xhttp_h2_transport(stream, source, accounting, users, runtime, config).await;
+    }
+
+    serve_xhttp_http1_transport(stream, source, accounting, users, runtime, config).await
+}
+
+async fn serve_xhttp_http1_transport<S>(
+    mut stream: http1::PrefixedIo<S>,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: Arc<RwLock<UserValidator>>,
+    runtime: EffectiveNodeConfig,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        let wrapped = xhttp::accept_prefixed(stream, &config).await?;
+        match wrapped {
+            xhttp::AcceptResult::Stream(stream) => {
+                return serve_connection(stream, source, accounting, users, runtime).await;
+            }
+            xhttp::AcceptResult::Responded(xhttp::ResponseState::Continue(next_stream)) => {
+                stream = next_stream;
+            }
+            xhttp::AcceptResult::Responded(xhttp::ResponseState::Closed) => return Ok(()),
+        }
+    }
+}
+
+async fn serve_xhttp_h2_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: Arc<RwLock<UserValidator>>,
+    runtime: EffectiveNodeConfig,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let on_stream: Arc<dyn Fn(xhttp::XhttpStream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_connection(stream, source, accounting, users, runtime).await {
+                warn!(%error, %source, "VMess XHTTP h2 session terminated with error");
+            }
+        });
+    });
+    xhttp::serve_h2(stream, config, on_stream).await
+}
+
+async fn sniff_http2_connection_preface<S>(
+    stream: &mut http1::PrefixedIo<S>,
+) -> anyhow::Result<bool>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut bytes = [0u8; HTTP2_CONNECTION_PREFACE.len()];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let read = stream
+            .read(&mut bytes[offset..])
+            .await
+            .context("read XHTTP connection preface")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        offset += read;
+        if bytes[..offset] != HTTP2_CONNECTION_PREFACE[..offset] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn serve_connection<S>(
@@ -885,16 +1062,7 @@ fn flatten_join(
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
-        bail!("Xboard network must be tcp for VMess nodes");
-    }
-    if remote
-        .network_settings
-        .as_ref()
-        .is_some_and(crate::panel::json_value_is_enabled)
-    {
-        bail!("Xboard networkSettings is not supported by NodeRS VMess server yet");
-    }
+    parse_transport_mode(remote)?;
     if remote
         .transport
         .as_ref()
@@ -925,6 +1093,51 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         bail!("Xboard decryption is not supported for VMess nodes");
     }
     Ok(())
+}
+
+fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<TransportMode> {
+    let network = remote.network.trim();
+    if network.is_empty() || network.eq_ignore_ascii_case("tcp") {
+        ensure!(
+            remote
+                .network_settings
+                .as_ref()
+                .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
+            "Xboard networkSettings is only supported for VMess grpc/ws/httpupgrade/xhttp nodes"
+        );
+        return Ok(TransportMode::Tcp);
+    }
+    if network.eq_ignore_ascii_case("grpc") {
+        return Ok(TransportMode::Grpc(
+            grpc::GrpcConfig::from_network_settings(remote.network_settings.as_ref())?,
+        ));
+    }
+    if network.eq_ignore_ascii_case("ws") {
+        return Ok(TransportMode::Ws(ws::WsConfig::from_network_settings(
+            remote.network_settings.as_ref(),
+        )?));
+    }
+    if network.eq_ignore_ascii_case("httpupgrade") {
+        return Ok(TransportMode::HttpUpgrade(
+            httpupgrade::HttpUpgradeConfig::from_network_settings(
+                remote.network_settings.as_ref(),
+            )?,
+        ));
+    }
+    if network.eq_ignore_ascii_case("xhttp") {
+        return Ok(TransportMode::Xhttp(
+            xhttp::XhttpConfig::from_network_settings(remote.network_settings.as_ref())?,
+        ));
+    }
+    bail!("Xboard network must be tcp, grpc, ws, httpupgrade or xhttp for VMess nodes");
+}
+
+fn default_grpc_alpn() -> Vec<String> {
+    vec!["h2".to_string()]
+}
+
+fn default_xhttp_alpn() -> Vec<String> {
+    vec!["http/1.1".to_string(), "h2".to_string()]
 }
 
 #[cfg(test)]
@@ -1055,7 +1268,84 @@ mod tests {
     }
 
     #[test]
-    fn rejects_meaningful_xboard_network_settings() {
+    fn accepts_xboard_websocket_transport() {
+        let remote = NodeConfigResponse {
+            network: "ws".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/vmess",
+                "headers": {
+                    "Host": "cdn.example.com"
+                }
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Ws(_)));
+    }
+
+    #[test]
+    fn accepts_xboard_grpc_transport() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            cert_config: Some(CertConfig {
+                cert_mode: "file".to_string(),
+                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
+                key_path: "/etc/ssl/private/privkey.pem".to_string(),
+                ..Default::default()
+            }),
+            network: "grpc".to_string(),
+            network_settings: Some(serde_json::json!({
+                "serviceName": "GunService"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Grpc(_)));
+        assert_eq!(config.tls.expect("tls config").alpn, vec!["h2".to_string()]);
+    }
+
+    #[test]
+    fn accepts_xboard_httpupgrade_transport() {
+        let remote = NodeConfigResponse {
+            network: "httpupgrade".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/upgrade",
+                "host": "cdn.example.com"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::HttpUpgrade(_)));
+    }
+
+    #[test]
+    fn accepts_xboard_xhttp_transport() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            cert_config: Some(CertConfig {
+                cert_mode: "file".to_string(),
+                cert_path: "/etc/ssl/private/fullchain.pem".to_string(),
+                key_path: "/etc/ssl/private/privkey.pem".to_string(),
+                ..Default::default()
+            }),
+            network: "xhttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
+        assert_eq!(
+            config.tls.expect("tls config").alpn,
+            vec!["http/1.1".to_string(), "h2".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_meaningful_xboard_network_settings_for_tcp() {
         let remote = NodeConfigResponse {
             network: "tcp".to_string(),
             network_settings: Some(serde_json::json!({
@@ -1065,6 +1355,20 @@ mod tests {
         };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network settings");
         assert!(error.to_string().contains("networkSettings"));
+    }
+
+    #[test]
+    fn rejects_unsupported_xboard_network() {
+        let remote = NodeConfigResponse {
+            network: "h2".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/h2",
+                "host": "cdn.example.com"
+            })),
+            ..base_remote()
+        };
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network");
+        assert!(error.to_string().contains("network"));
     }
 
     #[test]

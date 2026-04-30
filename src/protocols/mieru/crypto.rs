@@ -102,6 +102,37 @@ impl CipherState {
     }
 }
 
+pub fn encrypt_packet_metadata(
+    key: [u8; KEY_LEN],
+    user_name: &str,
+    nonce_pattern: &NoncePatternState,
+    plaintext: &[u8],
+) -> anyhow::Result<(Vec<u8>, [u8; NONCE_LEN])> {
+    let mut nonce = random_nonce()?;
+    nonce_pattern.rewrite_nonce(&mut nonce, false);
+    apply_user_hint(&mut nonce, user_name);
+    let encrypted = seal(&key, &nonce, plaintext)?;
+    let mut frame = nonce.to_vec();
+    frame.extend_from_slice(&encrypted);
+    Ok((frame, nonce))
+}
+
+pub fn encrypt_packet_payload(
+    key: [u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    seal(&key, nonce, plaintext)
+}
+
+pub fn decrypt_packet_payload(
+    key: [u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    open(&key, nonce, ciphertext)
+}
+
 pub fn hash_password(user_name: &str, password: &str) -> [u8; 32] {
     let mut input = Vec::with_capacity(password.len() + 1 + user_name.len());
     input.extend_from_slice(password.as_bytes());

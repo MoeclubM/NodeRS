@@ -1,11 +1,5 @@
 mod codec;
-mod grpc;
-mod http1;
-mod httpupgrade;
-pub(crate) mod mux;
 mod vision;
-mod ws;
-mod xhttp;
 mod xudp;
 
 use anyhow::{Context, anyhow, bail, ensure};
@@ -29,8 +23,9 @@ use crate::panel::{NodeConfigResponse, PanelUser};
 
 use self::codec::Command;
 use super::shared::{
-    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing,
-    socksaddr::SocksAddr, tls, traffic::TrafficRecorder, transport,
+    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, grpc, http1,
+    http2, httpupgrade, mux, routing, socksaddr::SocksAddr, tls, traffic::TrafficRecorder,
+    transport, ws, xhttp,
 };
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,6 +35,7 @@ const HTTP2_CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 
 enum TlsStream {
+    Plain(http1::PrefixedIo<TcpStream>),
     Boring(tokio_boring::SslStream<http1::PrefixedIo<TcpStream>>),
     Reality(super::shared::reality_tls::RealityTlsStream),
 }
@@ -47,6 +43,10 @@ enum TlsStream {
 impl TlsStream {
     fn fallback_local_addr(&self) -> anyhow::Result<SocketAddr> {
         match self {
+            Self::Plain(stream) => stream
+                .get_ref()
+                .local_addr()
+                .context("read VLESS fallback local address"),
             Self::Boring(stream) => stream
                 .get_ref()
                 .get_ref()
@@ -58,6 +58,7 @@ impl TlsStream {
 
     fn fallback_server_name(&self) -> Option<&str> {
         match self {
+            Self::Plain(_) => None,
             Self::Boring(stream) => stream.ssl().servername(NameType::HOST_NAME),
             Self::Reality(stream) => stream.server_name(),
         }
@@ -65,6 +66,7 @@ impl TlsStream {
 
     fn selected_alpn_protocol(&self) -> Option<&[u8]> {
         match self {
+            Self::Plain(_) => None,
             Self::Boring(stream) => stream.ssl().selected_alpn_protocol(),
             Self::Reality(stream) => stream.selected_alpn_protocol(),
         }
@@ -72,6 +74,7 @@ impl TlsStream {
 
     fn fallback_alpn_protocol(&self) -> Option<&[u8]> {
         match self {
+            Self::Plain(_) => None,
             Self::Boring(stream) => stream.ssl().selected_alpn_protocol(),
             Self::Reality(stream) => stream.fallback_alpn_protocol(),
         }
@@ -87,6 +90,7 @@ impl AsyncRead for TlsStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
             Self::Boring(stream) => Pin::new(stream).poll_read(cx, buf),
             Self::Reality(stream) => Pin::new(stream).poll_read(cx, buf),
         }
@@ -100,6 +104,7 @@ impl AsyncWrite for TlsStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Boring(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Reality(stream) => Pin::new(stream).poll_write(cx, buf),
         }
@@ -107,6 +112,7 @@ impl AsyncWrite for TlsStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
             Self::Boring(stream) => Pin::new(stream).poll_flush(cx),
             Self::Reality(stream) => Pin::new(stream).poll_flush(cx),
         }
@@ -114,6 +120,7 @@ impl AsyncWrite for TlsStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Boring(stream) => Pin::new(stream).poll_shutdown(cx),
             Self::Reality(stream) => Pin::new(stream).poll_shutdown(cx),
         }
@@ -141,7 +148,7 @@ struct RealityHandshakeProfile {
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
-    pub tls: EffectiveTlsConfig,
+    pub tls: Option<EffectiveTlsConfig>,
     transport: TransportMode,
     packet_encoding: PacketEncoding,
     flow: FlowMode,
@@ -153,12 +160,19 @@ impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
         let transport = parse_transport_mode(remote)?;
-        let mut tls = EffectiveTlsConfig::from_remote(remote)?;
-        if matches!(transport, TransportMode::Grpc(_)) && tls.alpn.is_empty() {
-            tls.alpn = default_grpc_alpn();
-        }
-        if matches!(transport, TransportMode::Xhttp(_)) && tls.alpn.is_empty() {
-            tls.alpn = default_xhttp_alpn();
+        let mut tls = vless_tls_enabled(remote)
+            .then(|| EffectiveTlsConfig::from_remote(remote))
+            .transpose()?;
+        if let Some(tls) = tls.as_mut() {
+            if matches!(transport, TransportMode::Grpc(_)) && tls.alpn.is_empty() {
+                tls.alpn = default_grpc_alpn();
+            }
+            if matches!(transport, TransportMode::H2(_)) && tls.alpn.is_empty() {
+                tls.alpn = default_h2_alpn();
+            }
+            if matches!(transport, TransportMode::Xhttp(_)) && tls.alpn.is_empty() {
+                tls.alpn = default_xhttp_alpn();
+            }
         }
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
@@ -186,6 +200,7 @@ fn default_xhttp_alpn() -> Vec<String> {
 enum TransportMode {
     Tcp,
     Grpc(grpc::GrpcConfig),
+    H2(http2::H2Config),
     Ws(ws::WsConfig),
     HttpUpgrade(httpupgrade::HttpUpgradeConfig),
     Xhttp(xhttp::XhttpConfig),
@@ -477,7 +492,7 @@ impl ServerController {
             .fallbacks
             .write()
             .expect("vless fallback lock poisoned") = config.fallbacks;
-        self.update_tls_config(&config.tls).await?;
+        self.update_tls_config(config.tls.as_ref()).await?;
 
         let old = {
             let mut guard = self.inner.lock().expect("vless server controller poisoned");
@@ -584,8 +599,17 @@ impl ServerController {
         }
     }
 
-    async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
+    async fn update_tls_config(&self, tls: Option<&EffectiveTlsConfig>) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
+        let Some(tls) = tls else {
+            *self
+                .tls_config
+                .write()
+                .expect("vless tls config lock poisoned") = None;
+            *self.reality.write().expect("vless reality lock poisoned") = None;
+            *tls_materials = None;
+            return Ok(());
+        };
         let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
             server_name: reality.server_name.clone(),
             server_port: reality.server_port,
@@ -671,10 +695,6 @@ async fn accept_loop(
                 .read()
                 .expect("vless tls config lock poisoned")
                 .clone();
-            let Some(tls_config) = tls_config else {
-                warn!(listen = %listen, "VLESS TLS config is not ready; dropping connection");
-                continue;
-            };
             tls_config
         };
         let reality = reality.read().expect("vless reality lock poisoned").clone();
@@ -700,7 +720,7 @@ async fn accept_loop(
                         return;
                     }
                 }
-            } else {
+            } else if let Some(acceptor) = acceptor {
                 match timeout(
                     TLS_HANDSHAKE_TIMEOUT,
                     tokio_boring::accept(
@@ -720,6 +740,8 @@ async fn accept_loop(
                         return;
                     }
                 }
+            } else {
+                TlsStream::Plain(http1::PrefixedIo::new(stream, Vec::new()))
             };
             let users = users.read().expect("vless users lock poisoned").clone();
             let transport = transport
@@ -751,6 +773,19 @@ async fn accept_loop(
                 }
                 TransportMode::Grpc(config) => {
                     serve_grpc_connection(
+                        tls_stream,
+                        source,
+                        accounting,
+                        users,
+                        packet_encoding,
+                        flow,
+                        routing,
+                        config,
+                    )
+                    .await
+                }
+                TransportMode::H2(config) => {
+                    serve_h2_connection(
                         tls_stream,
                         source,
                         accounting,
@@ -1285,6 +1320,72 @@ async fn serve_grpc_connection(
 
 async fn serve_grpc_stream(
     mut stream: grpc::GrpcStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    flow: FlowMode,
+    routing: routing::RoutingTable,
+) -> anyhow::Result<()> {
+    let request = timeout(
+        REQUEST_HEADER_TIMEOUT,
+        codec::read_request(&mut stream, &mut Vec::new()),
+    )
+    .await
+    .map_err(|_| anyhow!("VLESS request header timed out"))??;
+    validate_request_addons(&request, flow)?;
+    let user = users
+        .get(&request.user)
+        .ok_or_else(|| anyhow!("unknown VLESS user"))?;
+    let lease = accounting.open_session(&user, source)?;
+    serve_authenticated_connection(
+        stream,
+        accounting,
+        lease,
+        user,
+        request,
+        packet_encoding,
+        flow,
+        routing,
+    )
+    .await
+}
+
+async fn serve_h2_connection(
+    stream: TlsStream,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    packet_encoding: PacketEncoding,
+    flow: FlowMode,
+    routing: routing::RoutingTable,
+    config: http2::H2Config,
+) -> anyhow::Result<()> {
+    let on_stream: Arc<dyn Fn(http2::H2Stream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let routing = routing.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_h2_stream(
+                stream,
+                source,
+                accounting,
+                users,
+                packet_encoding,
+                flow,
+                routing,
+            )
+            .await
+            {
+                warn!(%error, %source, "VLESS HTTP/2 session terminated with error");
+            }
+        });
+    });
+    http2::serve_h2(stream, config, on_stream).await
+}
+
+async fn serve_h2_stream(
+    mut stream: http2::H2Stream,
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
@@ -2104,6 +2205,11 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
             grpc::GrpcConfig::from_network_settings(remote.network_settings.as_ref())?,
         ));
     }
+    if network.eq_ignore_ascii_case("h2") || network.eq_ignore_ascii_case("http") {
+        return Ok(TransportMode::H2(http2::H2Config::from_network_settings(
+            remote.network_settings.as_ref(),
+        )?));
+    }
     if network.eq_ignore_ascii_case("ws") {
         return Ok(TransportMode::Ws(ws::WsConfig::from_network_settings(
             remote.network_settings.as_ref(),
@@ -2116,12 +2222,14 @@ fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<Transport
             )?,
         ));
     }
-    if network.eq_ignore_ascii_case("xhttp") {
+    if network.eq_ignore_ascii_case("xhttp") || network.eq_ignore_ascii_case("splithttp") {
         return Ok(TransportMode::Xhttp(
             xhttp::XhttpConfig::from_network_settings(remote.network_settings.as_ref())?,
         ));
     }
-    bail!("Xboard network must be tcp, grpc, ws, httpupgrade or xhttp for VLESS nodes");
+    bail!(
+        "Xboard network must be tcp, grpc, h2, ws, httpupgrade, xhttp or splithttp for VLESS nodes"
+    );
 }
 
 fn parse_packet_encoding(remote: &NodeConfigResponse) -> anyhow::Result<PacketEncoding> {
@@ -2139,7 +2247,7 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     let transport_mode = parse_transport_mode(remote)?;
     parse_packet_encoding(remote)?;
     let flow = parse_flow_value(remote.flow.trim(), "Xboard flow")?;
-    if remote.tls.is_some() && !matches!(remote.tls_mode(), 1 | 2) {
+    if remote.tls.is_some() && !matches!(remote.tls_mode(), 0 | 1 | 2) {
         bail!(
             "Xboard tls mode {} is not supported by NodeRS VLESS server yet",
             remote.tls_mode()
@@ -2150,14 +2258,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             || remote.tls_settings.has_reality_key_material())
     {
         bail!("REALITY settings require tls mode 2 for VLESS nodes");
-    }
-    if remote.tls_mode() == 2
-        && !matches!(transport_mode, TransportMode::Tcp | TransportMode::Xhttp(_))
-    {
-        bail!("REALITY currently only supports VLESS tcp or xhttp transport in NodeRS");
-    }
-    if remote.multiplex_enabled() {
-        bail!("Xboard multiplex is not supported by NodeRS VLESS server yet");
     }
     if let Some(transport) = remote.transport.as_ref() {
         validate_transport_field(transport, &transport_mode)?;
@@ -2173,6 +2273,10 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn vless_tls_enabled(remote: &NodeConfigResponse) -> bool {
+    remote.tls_mode() != 0 || remote.tls.is_none()
+}
+
 fn validate_transport_field(
     value: &serde_json::Value,
     transport_mode: &TransportMode,
@@ -2181,12 +2285,13 @@ fn validate_transport_field(
         return Ok(());
     }
 
-    let expected = match transport_mode {
-        TransportMode::Tcp => "tcp",
-        TransportMode::Grpc(_) => "grpc",
-        TransportMode::Ws(_) => "ws",
-        TransportMode::HttpUpgrade(_) => "httpupgrade",
-        TransportMode::Xhttp(_) => "xhttp",
+    let expected: &[&str] = match transport_mode {
+        TransportMode::Tcp => &["tcp"],
+        TransportMode::Grpc(_) => &["grpc"],
+        TransportMode::H2(_) => &["h2", "http"],
+        TransportMode::Ws(_) => &["ws"],
+        TransportMode::HttpUpgrade(_) => &["httpupgrade"],
+        TransportMode::Xhttp(_) => &["xhttp", "splithttp"],
     };
 
     let transport_type = match value {
@@ -2201,7 +2306,11 @@ fn validate_transport_field(
         }
     };
 
-    if transport_type.is_empty() || transport_type.eq_ignore_ascii_case(expected) {
+    if transport_type.is_empty()
+        || expected
+            .iter()
+            .any(|expected| transport_type.eq_ignore_ascii_case(expected))
+    {
         return Ok(());
     }
 
@@ -2232,6 +2341,19 @@ fn parse_fallback_map(
 }
 
 fn parse_fallback_target(value: &serde_json::Value) -> anyhow::Result<FallbackTarget> {
+    if let Some(object) = value.as_object()
+        && let Some(dest) = object.get("dest")
+    {
+        let mut target = parse_xboard_fallback_dest(dest)?;
+        target.xver = object
+            .get("xver")
+            .map(parse_u8_json)
+            .transpose()?
+            .unwrap_or(0);
+        ensure!(target.xver <= 2, "VLESS fallback xver must be 0, 1 or 2");
+        return Ok(target);
+    }
+
     let target: FallbackTarget =
         serde_json::from_value(value.clone()).context("parse VLESS fallback target")?;
     ensure!(
@@ -2423,6 +2545,10 @@ fn parse_flow_value(value: &str, field: &str) -> anyhow::Result<FlowMode> {
 }
 
 fn default_grpc_alpn() -> Vec<String> {
+    vec!["h2".to_string()]
+}
+
+fn default_h2_alpn() -> Vec<String> {
     vec!["h2".to_string()]
 }
 
@@ -2699,6 +2825,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_xray_style_fallback_dest() {
+        let target = parse_fallback_target(&serde_json::json!({
+            "dest": "127.0.0.1:8080",
+            "xver": "1"
+        }))
+        .expect("parse fallback dest");
+
+        assert_eq!(target.server, "127.0.0.1");
+        assert_eq!(target.server_port, 8080);
+        assert_eq!(target.xver, 1);
+    }
+
+    #[test]
     fn parses_fallback_string_port() {
         let target = parse_fallback_target(&serde_json::json!({
             "server": "127.0.0.1",
@@ -2761,16 +2900,30 @@ mod tests {
     }
 
     #[test]
-    fn accepts_disabled_multiplex_but_rejects_non_tls_mode() {
+    fn accepts_xboard_disabled_tls_mode() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(0)),
+            cert_config: None,
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(config.tls.is_none());
+        assert_eq!(config.server_port, 443);
+    }
+
+    #[test]
+    fn accepts_xboard_multiplex_but_rejects_unknown_tls_mode() {
         let remote = NodeConfigResponse {
             tls: Some(serde_json::json!(1)),
             multiplex: Some(serde_json::json!({
-                "enabled": false,
+                "enabled": true,
                 "protocol": "yamux"
             })),
             ..base_remote()
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(config.tls.is_some());
         assert_eq!(config.server_port, 443);
 
         let remote = NodeConfigResponse {
@@ -2796,7 +2949,11 @@ mod tests {
         };
 
         let config = EffectiveNodeConfig::from_remote(&remote).expect("reality config");
-        let reality = config.tls.reality.expect("reality config");
+        let reality = config
+            .tls
+            .expect("tls config")
+            .reality
+            .expect("reality config");
         assert_eq!(reality.server_name, "reality.example.com");
         assert_eq!(
             reality.server_names,
@@ -2806,7 +2963,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reality_with_unsupported_transport() {
+    fn accepts_reality_with_websocket_transport() {
         let remote = NodeConfigResponse {
             tls: Some(serde_json::json!(2)),
             network: "ws".to_string(),
@@ -2822,12 +2979,9 @@ mod tests {
             ..base_remote()
         };
 
-        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("REALITY ws transport");
-        assert!(
-            error
-                .to_string()
-                .contains("only supports VLESS tcp or xhttp transport")
-        );
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("REALITY ws transport");
+        assert!(matches!(config.transport, TransportMode::Ws(_)));
+        assert!(config.tls.expect("tls config").reality.is_some());
     }
 
     #[test]
@@ -2852,7 +3006,7 @@ mod tests {
         let config = EffectiveNodeConfig::from_remote(&remote).expect("REALITY xhttp transport");
         assert!(matches!(config.transport, TransportMode::Xhttp(_)));
         assert_eq!(
-            config.tls.alpn,
+            config.tls.expect("tls config").alpn,
             vec!["http/1.1".to_string(), "h2".to_string()]
         );
     }
@@ -2871,7 +3025,7 @@ mod tests {
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert!(matches!(config.transport, TransportMode::Xhttp(_)));
         assert_eq!(
-            config.tls.alpn,
+            config.tls.expect("tls config").alpn,
             vec!["http/1.1".to_string(), "h2".to_string()]
         );
     }
@@ -2887,7 +3041,41 @@ mod tests {
         };
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
         assert!(matches!(config.transport, TransportMode::Grpc(_)));
-        assert_eq!(config.tls.alpn, vec!["h2".to_string()]);
+        assert_eq!(config.tls.expect("tls config").alpn, vec!["h2".to_string()]);
+    }
+
+    #[test]
+    fn accepts_h2_network_settings() {
+        let remote = NodeConfigResponse {
+            network: "h2".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/h2",
+                "host": "cdn.example.com"
+            })),
+            ..base_remote()
+        };
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::H2(_)));
+        assert_eq!(config.tls.expect("tls config").alpn, vec!["h2".to_string()]);
+    }
+
+    #[test]
+    fn accepts_splithttp_as_xhttp_transport_alias() {
+        let remote = NodeConfigResponse {
+            network: "splithttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            transport: Some(serde_json::json!({
+                "type": "splithttp"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
     }
 
     #[test]
@@ -2904,7 +3092,10 @@ mod tests {
         };
 
         let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
-        assert_eq!(config.tls.alpn, vec!["http/1.1".to_string()]);
+        assert_eq!(
+            config.tls.expect("tls config").alpn,
+            vec!["http/1.1".to_string()]
+        );
     }
 
     #[tokio::test]
