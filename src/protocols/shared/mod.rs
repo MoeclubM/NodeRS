@@ -1,4 +1,9 @@
 pub(crate) mod dns;
+pub(crate) mod grpc;
+pub(crate) mod http1;
+pub(crate) mod http2;
+pub(crate) mod httpupgrade;
+pub(crate) mod mux;
 pub(crate) mod reality;
 pub(crate) mod reality_tls;
 pub(crate) mod routing;
@@ -7,6 +12,8 @@ pub(crate) mod socksaddr;
 pub(crate) mod tls;
 pub(crate) mod traffic;
 pub(crate) mod transport;
+pub(crate) mod ws;
+pub(crate) mod xhttp;
 
 use anyhow::{Context, ensure};
 use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};

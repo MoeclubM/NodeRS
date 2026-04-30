@@ -470,12 +470,12 @@ struct SessionCleanup {
     session_id: String,
 }
 
-pub(super) enum AcceptResult<S> {
+pub(crate) enum AcceptResult<S> {
     Stream(XhttpStream),
     Responded(ResponseState<S>),
 }
 
-pub(super) enum ResponseState<S> {
+pub(crate) enum ResponseState<S> {
     Continue(S),
     Closed,
 }
@@ -843,7 +843,7 @@ where
     accept_prefixed(PrefixedIo::new(stream, Vec::new()), config).await
 }
 
-pub(super) async fn accept_prefixed<S>(
+pub(crate) async fn accept_prefixed<S>(
     mut stream: PrefixedIo<S>,
     config: &XhttpConfig,
 ) -> anyhow::Result<AcceptResult<PrefixedIo<S>>>
@@ -1197,7 +1197,7 @@ where
     }))
 }
 
-pub(super) async fn serve_h2<S>(
+pub(crate) async fn serve_h2<S>(
     stream: S,
     config: XhttpConfig,
     on_stream: Arc<dyn Fn(XhttpStream) + Send + Sync>,

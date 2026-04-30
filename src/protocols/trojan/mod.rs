@@ -17,13 +17,15 @@ use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::panel::{NodeConfigResponse, PanelUser};
 
 use super::shared::{
-    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, routing,
-    socksaddr::SocksAddr, tls, traffic::TrafficRecorder, transport,
+    EffectiveTlsConfig, bind_listeners, configure_tcp_stream, effective_listen_ip, grpc, http1,
+    httpupgrade, routing, socksaddr::SocksAddr, tls, traffic::TrafficRecorder, transport, ws,
+    xhttp,
 };
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
 const COPY_BUFFER_LEN: usize = 64 * 1024;
+const HTTP2_CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const CRLF: [u8; 2] = *b"\r\n";
@@ -35,13 +37,108 @@ const MAX_UDP_PAYLOAD_LEN: usize = 8192;
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
-type TlsStream = tokio_boring::SslStream<TcpStream>;
+enum TlsStream {
+    Boring(tokio_boring::SslStream<TcpStream>),
+    Reality(super::shared::reality_tls::RealityTlsStream),
+}
+
+impl TlsStream {
+    fn local_addr(&self) -> anyhow::Result<SocketAddr> {
+        match self {
+            Self::Boring(stream) => stream
+                .get_ref()
+                .local_addr()
+                .context("read Trojan local address"),
+            Self::Reality(stream) => Ok(stream.local_addr()),
+        }
+    }
+
+    fn server_name(&self) -> Option<&str> {
+        match self {
+            Self::Boring(stream) => stream.ssl().servername(NameType::HOST_NAME),
+            Self::Reality(stream) => stream.server_name(),
+        }
+    }
+
+    fn selected_alpn_protocol(&self) -> Option<&[u8]> {
+        match self {
+            Self::Boring(stream) => stream.ssl().selected_alpn_protocol(),
+            Self::Reality(stream) => stream.selected_alpn_protocol(),
+        }
+    }
+}
+
+impl Unpin for TlsStream {}
+
+impl AsyncRead for TlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Reality(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Reality(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Reality(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Boring(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Reality(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RealityServerState {
+    config: tls::RealityTlsConfig,
+    cert_state: Arc<super::shared::reality::RealityCertificateState>,
+    alpn_protocols: Vec<Vec<u8>>,
+}
+
+struct ObservedRealityTarget {
+    stream: TcpStream,
+    server_hello: super::shared::reality::ObservedServerHello,
+}
+
+struct RealityHandshakeProfile {
+    cipher_suite: u16,
+    key_share_group: u16,
+}
 
 #[derive(Debug, Clone)]
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
     pub server_port: u16,
     pub tls: EffectiveTlsConfig,
+    transport: TransportMode,
     pub routing: routing::RoutingTable,
     pub fallbacks: FallbackConfig,
 }
@@ -49,10 +146,19 @@ pub struct EffectiveNodeConfig {
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
+        let transport = parse_transport_mode(remote)?;
+        let mut tls = EffectiveTlsConfig::from_remote(remote)?;
+        if matches!(transport, TransportMode::Grpc(_)) && tls.alpn.is_empty() {
+            tls.alpn = default_grpc_alpn();
+        }
+        if matches!(transport, TransportMode::Xhttp(_)) && tls.alpn.is_empty() {
+            tls.alpn = default_xhttp_alpn();
+        }
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
-            tls: EffectiveTlsConfig::from_remote(remote)?,
+            tls,
+            transport,
             routing: routing::RoutingTable::from_remote(
                 &remote.routes,
                 &remote.custom_outbounds,
@@ -62,6 +168,15 @@ impl EffectiveNodeConfig {
             fallbacks: FallbackConfig::from_remote(remote)?,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TransportMode {
+    Tcp,
+    Grpc(grpc::GrpcConfig),
+    Ws(ws::WsConfig),
+    HttpUpgrade(httpupgrade::HttpUpgradeConfig),
+    Xhttp(xhttp::XhttpConfig),
 }
 
 type PathFallbacks = HashMap<String, FallbackTarget>;
@@ -309,10 +424,12 @@ impl UserValidator {
 
 pub struct ServerController {
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
+    reality: Arc<RwLock<Option<RealityServerState>>>,
     tls_materials: AsyncMutex<Option<tls::LoadedTlsMaterials>>,
     accounting: Arc<Accounting>,
     panel_users: Arc<RwLock<Vec<PanelUser>>>,
     users: Arc<RwLock<UserValidator>>,
+    transport: Arc<RwLock<TransportMode>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
     inner: Mutex<Option<RunningServer>>,
@@ -328,10 +445,12 @@ impl ServerController {
     pub fn new(accounting: Arc<Accounting>) -> Self {
         Self {
             tls_config: Arc::new(RwLock::new(None)),
+            reality: Arc::new(RwLock::new(None)),
             tls_materials: AsyncMutex::new(None),
             accounting,
             panel_users: Arc::new(RwLock::new(Vec::new())),
             users: Arc::new(RwLock::new(UserValidator::default())),
+            transport: Arc::new(RwLock::new(TransportMode::Tcp)),
             routing: Arc::new(RwLock::new(routing::RoutingTable::default())),
             fallbacks: Arc::new(RwLock::new(FallbackConfig::default())),
             inner: Mutex::new(None),
@@ -368,6 +487,10 @@ impl ServerController {
     }
 
     pub async fn apply_config(&self, config: EffectiveNodeConfig) -> anyhow::Result<()> {
+        *self
+            .transport
+            .write()
+            .expect("trojan transport lock poisoned") = config.transport;
         *self.routing.write().expect("trojan routing lock poisoned") = config.routing;
         *self
             .fallbacks
@@ -400,8 +523,10 @@ impl ServerController {
             .map(|addr| addr.to_string())
             .collect::<Vec<_>>();
         let tls_config = self.tls_config.clone();
+        let reality = self.reality.clone();
         let accounting = self.accounting.clone();
         let users = self.users.clone();
+        let transport = self.transport.clone();
         let routing = self.routing.clone();
         let fallbacks = self.fallbacks.clone();
         let handle = tokio::spawn(async move {
@@ -409,12 +534,18 @@ impl ServerController {
             let mut accept_loops = JoinSet::new();
             for listener in listeners {
                 let tls_config = tls_config.clone();
+                let reality = reality.clone();
                 let accounting = accounting.clone();
                 let users = users.clone();
+                let transport = transport.clone();
                 let routing = routing.clone();
                 let fallbacks = fallbacks.clone();
                 accept_loops.spawn(async move {
-                    accept_loop(listener, tls_config, accounting, users, routing, fallbacks).await;
+                    accept_loop(
+                        listener, tls_config, reality, accounting, users, transport, routing,
+                        fallbacks,
+                    )
+                    .await;
                 });
             }
 
@@ -470,20 +601,56 @@ impl ServerController {
 
     async fn update_tls_config(&self, tls: &EffectiveTlsConfig) -> anyhow::Result<()> {
         let mut tls_materials = self.tls_materials.lock().await;
+        let reality = tls.reality.as_ref().map(|reality| tls::RealityTlsConfig {
+            server_name: reality.server_name.clone(),
+            server_port: reality.server_port,
+            server_names: reality.server_names.clone(),
+            private_key: reality.private_key,
+            short_ids: reality.short_ids.clone(),
+        });
         let should_reload = tls_materials.as_ref().is_none_or(|current| {
-            !current.matches_source(&tls.source, tls.ech.as_ref(), None, &tls.alpn)
+            !current.matches_source(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
         });
         if !should_reload {
             return Ok(());
         }
 
-        let reloaded = tls::load_tls_materials(&tls.source, tls.ech.as_ref(), None, &tls.alpn)
-            .await
-            .context("load Trojan TLS materials")?;
+        if let Some(reality) = tls.reality.as_ref() {
+            let short_id_hex = reality
+                .short_ids
+                .first()
+                .map(hex::encode)
+                .unwrap_or_default();
+            let short_id_tail = &short_id_hex[short_id_hex.len().saturating_sub(4)..];
+            info!(
+                reality_server_names = %reality.server_names.join(","),
+                reality_short_id_count = reality.short_ids.len(),
+                reality_short_id_tail = %short_id_tail,
+                "applying Trojan REALITY TLS config"
+            );
+        }
+
+        let reloaded =
+            tls::load_tls_materials(&tls.source, tls.ech.as_ref(), reality.as_ref(), &tls.alpn)
+                .await
+                .context("load Trojan TLS materials")?;
+        let reality_state = match reality {
+            Some(config) => Some(RealityServerState {
+                config,
+                cert_state: Arc::new(
+                    super::shared::reality::build_certificate_state()
+                        .context("build Trojan REALITY certificate state")?,
+                ),
+                alpn_protocols: tls::parse_alpn_protocols(&tls.alpn)
+                    .context("parse Trojan REALITY ALPN protocols")?,
+            }),
+            None => None,
+        };
         *self
             .tls_config
             .write()
             .expect("trojan tls config lock poisoned") = Some(reloaded.acceptor());
+        *self.reality.write().expect("trojan reality lock poisoned") = reality_state;
         *tls_materials = Some(reloaded);
         Ok(())
     }
@@ -492,8 +659,10 @@ impl ServerController {
 async fn accept_loop(
     listener: TcpListener,
     tls_config: Arc<RwLock<Option<Arc<boring::ssl::SslAcceptor>>>>,
+    reality: Arc<RwLock<Option<RealityServerState>>>,
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
+    transport: Arc<RwLock<TransportMode>>,
     routing: Arc<RwLock<routing::RoutingTable>>,
     fallbacks: Arc<RwLock<FallbackConfig>>,
 ) {
@@ -521,28 +690,58 @@ async fn accept_loop(
             };
             tls_config
         };
+        let reality = reality
+            .read()
+            .expect("trojan reality lock poisoned")
+            .clone();
         let accounting = accounting.clone();
         let users = users.clone();
+        let transport = transport.clone();
         let routing = routing.clone();
         let fallbacks = fallbacks.clone();
         tokio::spawn(async move {
-            let tls_stream = match timeout(
-                TLS_HANDSHAKE_TIMEOUT,
-                tokio_boring::accept(acceptor.as_ref(), stream),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    warn!(%error, %source, "Trojan TLS handshake failed");
-                    return;
+            let tls_stream = if let Some(reality) = reality {
+                match accept_reality_tls(stream, source, &reality).await {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => return,
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            error_chain = %format_args!("{error:#}"),
+                            %source,
+                            "Trojan REALITY handshake failed"
+                        );
+                        return;
+                    }
                 }
-                Err(_) => {
-                    warn!(%source, "Trojan TLS handshake timed out");
-                    return;
+            } else {
+                match timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    tokio_boring::accept(acceptor.as_ref(), stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => TlsStream::Boring(stream),
+                    Ok(Err(error)) => {
+                        warn!(%error, %source, "Trojan TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(%source, "Trojan TLS handshake timed out");
+                        return;
+                    }
                 }
             };
+            let server_name = tls_stream.server_name().map(str::to_string);
+            let negotiated_alpn = tls_stream
+                .selected_alpn_protocol()
+                .map(|value| value.to_vec());
+            let local_addr = tls_stream.local_addr().ok();
             let users = users.read().expect("trojan users lock poisoned").clone();
+            let transport = transport
+                .read()
+                .expect("trojan transport lock poisoned")
+                .clone();
             let routing = routing
                 .read()
                 .expect("trojan routing lock poisoned")
@@ -551,8 +750,19 @@ async fn accept_loop(
                 .read()
                 .expect("trojan fallback lock poisoned")
                 .clone();
-            if let Err(error) =
-                serve_connection(tls_stream, source, accounting, users, routing, fallbacks).await
+            if let Err(error) = serve_transport(
+                tls_stream,
+                source,
+                local_addr,
+                server_name,
+                negotiated_alpn,
+                accounting,
+                users,
+                transport,
+                routing,
+                fallbacks,
+            )
+            .await
             {
                 warn!(%error, %source, "Trojan session terminated with error");
             }
@@ -560,22 +770,473 @@ async fn accept_loop(
     }
 }
 
-async fn serve_connection(
-    mut stream: TlsStream,
+async fn accept_reality_tls(
+    mut stream: TcpStream,
+    source: SocketAddr,
+    reality: &RealityServerState,
+) -> anyhow::Result<Option<TlsStream>> {
+    let client_hello = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        super::shared::reality::read_client_hello(&mut stream),
+    )
+    .await
+    .map_err(|_| anyhow!("REALITY ClientHello timed out"))??;
+
+    let authenticated =
+        match super::shared::reality::authenticate_client_hello(&client_hello, &reality.config) {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                warn!(%error, %source, "Trojan REALITY ClientHello rejected; forwarding to target");
+                proxy_reality_fallback(stream, reality, client_hello.prefix).await?;
+                return Ok(None);
+            }
+        };
+
+    let observed_target = match observe_reality_target(&client_hello.prefix, reality).await {
+        Ok(observed) => observed,
+        Err(error) => {
+            warn!(
+                %error,
+                %source,
+                "Trojan REALITY target handshake observation failed; forwarding to target"
+            );
+            proxy_reality_fallback(stream, reality, client_hello.prefix).await?;
+            return Ok(None);
+        }
+    };
+
+    let handshake_profile = match reality_handshake_profile(&observed_target.server_hello) {
+        Ok(profile) => profile,
+        Err(error) => {
+            warn!(
+                %error,
+                %source,
+                "Trojan REALITY target handshake profile is unsupported; forwarding to target"
+            );
+            proxy_observed_reality_fallback(stream, observed_target, Vec::new()).await?;
+            return Ok(None);
+        }
+    };
+
+    let client_details = super::shared::reality::client_hello_details(&client_hello)
+        .context("parse REALITY ClientHello details")?;
+
+    let tls_stream = match super::shared::reality_tls::accept(
+        stream,
+        &client_hello,
+        &client_details,
+        &authenticated,
+        &reality.cert_state,
+        super::shared::reality_tls::RealityTlsProfile {
+            cipher_suite: handshake_profile.cipher_suite,
+            key_share_group: handshake_profile.key_share_group,
+        },
+        Some(&observed_target.server_hello),
+        &reality.alpn_protocols,
+        TLS_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(stream) => TlsStream::Reality(stream),
+        Err(error) => {
+            let sent_server_flight = error.sent_server_flight();
+            let (stream, error) = error.into_parts();
+            if !sent_server_flight {
+                warn!(
+                    error = %error,
+                    error_chain = %format_args!("{error:#}"),
+                    %source,
+                    "Trojan REALITY TLS handshake failed before server flight; forwarding to target"
+                );
+                proxy_observed_reality_fallback(stream, observed_target, Vec::new()).await?;
+                return Ok(None);
+            }
+            warn!(
+                error = %error,
+                error_chain = %format_args!("{error:#}"),
+                %source,
+                "Trojan REALITY TLS handshake failed after server flight"
+            );
+            return Err(error.context("Trojan REALITY TLS handshake failed after server flight"));
+        }
+    };
+    Ok(Some(tls_stream))
+}
+
+fn reality_handshake_profile(
+    server_hello: &super::shared::reality::ObservedServerHello,
+) -> anyhow::Result<RealityHandshakeProfile> {
+    let Some(_curves_list) = server_hello.curves_list() else {
+        bail!(
+            "unsupported REALITY target key share group 0x{:04x}",
+            server_hello.key_share_group
+        );
+    };
+    ensure!(
+        matches!(server_hello.cipher_suite, 0x1301 | 0x1302 | 0x1303),
+        "unsupported REALITY target cipher suite 0x{:04x}",
+        server_hello.cipher_suite
+    );
+
+    Ok(RealityHandshakeProfile {
+        cipher_suite: server_hello.cipher_suite,
+        key_share_group: server_hello.key_share_group,
+    })
+}
+
+async fn observe_reality_target(
+    client_hello_prefix: &[u8],
+    reality: &RealityServerState,
+) -> anyhow::Result<ObservedRealityTarget> {
+    let mut target = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        TcpStream::connect((
+            reality.config.server_name.as_str(),
+            reality.config.server_port,
+        )),
+    )
+    .await
+    .map_err(|_| anyhow!("connect REALITY target timed out"))?
+    .with_context(|| {
+        format!(
+            "connect REALITY target {}:{}",
+            reality.config.server_name, reality.config.server_port
+        )
+    })?;
+    configure_tcp_stream(&target);
+    target
+        .write_all(client_hello_prefix)
+        .await
+        .context("write REALITY target ClientHello")?;
+
+    let observed = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        super::shared::reality::read_server_hello(&mut target),
+    )
+    .await
+    .map_err(|_| anyhow!("read REALITY target ServerHello timed out"))??;
+
+    Ok(ObservedRealityTarget {
+        stream: target,
+        server_hello: observed,
+    })
+}
+
+async fn proxy_observed_reality_fallback(
+    stream: TcpStream,
+    observed_target: ObservedRealityTarget,
+    consumed_after_client_hello: Vec<u8>,
+) -> anyhow::Result<()> {
+    let control = SessionControl::new();
+    let (mut client_reader, mut client_writer) = split(stream);
+    let (mut target_reader, mut target_writer) = split(observed_target.stream);
+    if !observed_target.server_hello.prefix.is_empty() {
+        client_writer
+            .write_all(&observed_target.server_hello.prefix)
+            .await
+            .context("write observed REALITY target ServerHello")?;
+    }
+    if !consumed_after_client_hello.is_empty() {
+        target_writer
+            .write_all(&consumed_after_client_hello)
+            .await
+            .context("write observed REALITY fallback client flight")?;
+    }
+
+    let client_to_target = copy_with_traffic(
+        &mut client_reader,
+        &mut target_writer,
+        control.clone(),
+        None,
+    );
+    let target_to_client = copy_with_traffic(&mut target_reader, &mut client_writer, control, None);
+    let _ = tokio::try_join!(client_to_target, target_to_client)?;
+    Ok(())
+}
+
+async fn proxy_reality_fallback(
+    stream: TcpStream,
+    reality: &RealityServerState,
+    consumed: Vec<u8>,
+) -> anyhow::Result<()> {
+    let fallback = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        TcpStream::connect((
+            reality.config.server_name.as_str(),
+            reality.config.server_port,
+        )),
+    )
+    .await
+    .map_err(|_| anyhow!("connect REALITY fallback target timed out"))?
+    .with_context(|| {
+        format!(
+            "connect REALITY fallback {}:{}",
+            reality.config.server_name, reality.config.server_port
+        )
+    })?;
+    configure_tcp_stream(&fallback);
+    let control = SessionControl::new();
+    let (mut client_reader, mut client_writer) = split(stream);
+    let (mut fallback_reader, mut fallback_writer) = split(fallback);
+    if !consumed.is_empty() {
+        fallback_writer
+            .write_all(&consumed)
+            .await
+            .context("write REALITY fallback client hello")?;
+    }
+
+    let client_to_fallback = copy_with_traffic(
+        &mut client_reader,
+        &mut fallback_writer,
+        control.clone(),
+        None,
+    );
+    let fallback_to_client =
+        copy_with_traffic(&mut fallback_reader, &mut client_writer, control, None);
+    let _ = tokio::try_join!(client_to_fallback, fallback_to_client)?;
+    Ok(())
+}
+
+async fn serve_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    server_name: Option<String>,
+    negotiated_alpn: Option<Vec<u8>>,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    transport: TransportMode,
+    routing: routing::RoutingTable,
+    fallbacks: FallbackConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match transport {
+        TransportMode::Tcp => {
+            serve_connection(
+                stream,
+                source,
+                local_addr,
+                server_name,
+                negotiated_alpn,
+                accounting,
+                users,
+                routing,
+                fallbacks,
+            )
+            .await
+        }
+        TransportMode::Grpc(config) => {
+            serve_grpc_transport(
+                stream, source, accounting, users, routing, fallbacks, config,
+            )
+            .await
+        }
+        TransportMode::Ws(config) => {
+            let Some(stream) = ws::accept(stream, &config).await? else {
+                return Ok(());
+            };
+            serve_connection(
+                stream,
+                source,
+                local_addr,
+                server_name,
+                negotiated_alpn,
+                accounting,
+                users,
+                routing,
+                fallbacks,
+            )
+            .await
+        }
+        TransportMode::HttpUpgrade(config) => {
+            let Some(stream) = httpupgrade::accept(stream, &config).await? else {
+                return Ok(());
+            };
+            serve_connection(
+                stream,
+                source,
+                local_addr,
+                server_name,
+                negotiated_alpn,
+                accounting,
+                users,
+                routing,
+                fallbacks,
+            )
+            .await
+        }
+        TransportMode::Xhttp(config) => {
+            serve_xhttp_transport(
+                stream, source, accounting, users, routing, fallbacks, config,
+            )
+            .await
+        }
+    }
+}
+
+async fn serve_grpc_transport<S>(
+    stream: S,
     source: SocketAddr,
     accounting: Arc<Accounting>,
     users: UserValidator,
     routing: routing::RoutingTable,
     fallbacks: FallbackConfig,
-) -> anyhow::Result<()> {
-    let server_name = stream
-        .ssl()
-        .servername(NameType::HOST_NAME)
-        .map(str::to_string);
-    let negotiated_alpn = stream
-        .ssl()
-        .selected_alpn_protocol()
-        .map(|value| value.to_vec());
+    config: grpc::GrpcConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let on_stream: Arc<dyn Fn(grpc::GrpcStream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let routing = routing.clone();
+        let fallbacks = fallbacks.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_connection(
+                stream, source, None, None, None, accounting, users, routing, fallbacks,
+            )
+            .await
+            {
+                warn!(%error, %source, "Trojan gRPC session terminated with error");
+            }
+        });
+    });
+    grpc::serve_h2(stream, config, on_stream).await
+}
+
+async fn serve_xhttp_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    routing: routing::RoutingTable,
+    fallbacks: FallbackConfig,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream = http1::PrefixedIo::new(stream, Vec::new()).capture_inner_reads();
+    let is_h2 = timeout(
+        AUTHENTICATION_TIMEOUT,
+        sniff_http2_connection_preface(&mut stream),
+    )
+    .await
+    .map_err(|_| anyhow!("XHTTP connection preface timed out"))??;
+    let (stream, prefetched) = stream.into_parts();
+    let stream = http1::PrefixedIo::new(stream, prefetched);
+    if is_h2 {
+        return serve_xhttp_h2_transport(
+            stream, source, accounting, users, routing, fallbacks, config,
+        )
+        .await;
+    }
+
+    serve_xhttp_http1_transport(
+        stream, source, accounting, users, routing, fallbacks, config,
+    )
+    .await
+}
+
+async fn serve_xhttp_http1_transport<S>(
+    mut stream: http1::PrefixedIo<S>,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    routing: routing::RoutingTable,
+    fallbacks: FallbackConfig,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        let wrapped = xhttp::accept_prefixed(stream, &config).await?;
+        match wrapped {
+            xhttp::AcceptResult::Stream(stream) => {
+                return serve_connection(
+                    stream, source, None, None, None, accounting, users, routing, fallbacks,
+                )
+                .await;
+            }
+            xhttp::AcceptResult::Responded(xhttp::ResponseState::Continue(next_stream)) => {
+                stream = next_stream;
+            }
+            xhttp::AcceptResult::Responded(xhttp::ResponseState::Closed) => return Ok(()),
+        }
+    }
+}
+
+async fn serve_xhttp_h2_transport<S>(
+    stream: S,
+    source: SocketAddr,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    routing: routing::RoutingTable,
+    fallbacks: FallbackConfig,
+    config: xhttp::XhttpConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let on_stream: Arc<dyn Fn(xhttp::XhttpStream) + Send + Sync> = Arc::new(move |stream| {
+        let accounting = accounting.clone();
+        let users = users.clone();
+        let routing = routing.clone();
+        let fallbacks = fallbacks.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_connection(
+                stream, source, None, None, None, accounting, users, routing, fallbacks,
+            )
+            .await
+            {
+                warn!(%error, %source, "Trojan XHTTP h2 session terminated with error");
+            }
+        });
+    });
+    xhttp::serve_h2(stream, config, on_stream).await
+}
+
+async fn sniff_http2_connection_preface<S>(
+    stream: &mut http1::PrefixedIo<S>,
+) -> anyhow::Result<bool>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut bytes = [0u8; HTTP2_CONNECTION_PREFACE.len()];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let read = stream
+            .read(&mut bytes[offset..])
+            .await
+            .context("read XHTTP connection preface")?;
+        if read == 0 {
+            return Ok(false);
+        }
+        offset += read;
+        if bytes[..offset] != HTTP2_CONNECTION_PREFACE[..offset] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn serve_connection<S>(
+    mut stream: S,
+    source: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    server_name: Option<String>,
+    negotiated_alpn: Option<Vec<u8>>,
+    accounting: Arc<Accounting>,
+    users: UserValidator,
+    routing: routing::RoutingTable,
+    fallbacks: FallbackConfig,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut consumed = Vec::with_capacity(128);
     let auth = match timeout(
         AUTHENTICATION_TIMEOUT,
@@ -590,7 +1251,7 @@ async fn serve_connection(
                 negotiated_alpn.as_deref(),
                 &consumed,
             ) {
-                proxy_fallback(stream, source, target, consumed).await?;
+                proxy_fallback(stream, source, local_addr, target, consumed).await?;
                 return Ok(());
             }
             return Err(error);
@@ -601,7 +1262,7 @@ async fn serve_connection(
                 negotiated_alpn.as_deref(),
                 &consumed,
             ) {
-                proxy_fallback(stream, source, target, consumed).await?;
+                proxy_fallback(stream, source, local_addr, target, consumed).await?;
                 return Ok(());
             }
             return Err(anyhow!("Trojan authentication timed out"));
@@ -615,7 +1276,7 @@ async fn serve_connection(
                 negotiated_alpn.as_deref(),
                 &consumed,
             ) {
-                proxy_fallback(stream, source, target, consumed).await?;
+                proxy_fallback(stream, source, local_addr, target, consumed).await?;
                 return Ok(());
             }
             return Err(anyhow!("unknown Trojan user"));
@@ -643,7 +1304,7 @@ async fn serve_connection(
 }
 
 async fn serve_connect(
-    stream: TlsStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin,
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
@@ -676,7 +1337,7 @@ async fn serve_connect(
 }
 
 async fn serve_udp_associate(
-    stream: TlsStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     accounting: Arc<Accounting>,
     lease: SessionLease,
     user: UserEntry,
@@ -717,21 +1378,22 @@ async fn serve_udp_associate(
 }
 
 async fn proxy_fallback(
-    stream: TlsStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin,
     source: SocketAddr,
+    local: Option<SocketAddr>,
     target: &FallbackTarget,
     consumed: Vec<u8>,
 ) -> anyhow::Result<()> {
-    let local = stream
-        .get_ref()
-        .local_addr()
-        .context("read Trojan fallback local address")?;
     let fallback = connect_fallback_target(target).await?;
     let control = SessionControl::new();
     let (mut client_reader, mut client_writer) = split(stream);
     let (mut fallback_reader, mut fallback_writer) = split(fallback);
     if target.xver != 0 {
-        let header = encode_proxy_header(source, local, target.xver)?;
+        let header = encode_proxy_header(
+            source,
+            local.ok_or_else(|| anyhow!("read Trojan fallback local address"))?,
+            target.xver,
+        )?;
         fallback_writer
             .write_all(&header)
             .await
@@ -863,7 +1525,7 @@ fn unix_fallback_connect_path(path: &str) -> anyhow::Result<String> {
 }
 
 async fn relay_client_to_udp(
-    mut reader: ReadHalf<TlsStream>,
+    mut reader: ReadHalf<impl AsyncRead + AsyncWrite + Unpin>,
     socket: Arc<UdpSocket>,
     control: Arc<SessionControl>,
     routing: routing::RoutingTable,
@@ -898,7 +1560,7 @@ async fn relay_client_to_udp(
 }
 
 async fn relay_udp_to_client(
-    mut writer: WriteHalf<TlsStream>,
+    mut writer: WriteHalf<impl AsyncRead + AsyncWrite + Unpin>,
     socket: Arc<UdpSocket>,
     control: Arc<SessionControl>,
     traffic: TrafficRecorder,
@@ -1313,24 +1975,18 @@ where
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    if !remote.network.trim().is_empty() && !remote.network.eq_ignore_ascii_case("tcp") {
-        anyhow::bail!("Xboard network must be tcp for Trojan nodes");
-    }
-    if remote.tls.is_some() && remote.tls_mode() != 1 {
+    parse_transport_mode(remote)?;
+    if remote.tls.is_some() && !matches!(remote.tls_mode(), 1 | 2) {
         anyhow::bail!(
             "Xboard tls mode {} is not supported by NodeRS Trojan server yet",
             remote.tls_mode()
         );
     }
-    if remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material() {
-        anyhow::bail!("REALITY settings are not supported for Trojan nodes");
-    }
-    if remote
-        .network_settings
-        .as_ref()
-        .is_some_and(crate::panel::json_value_is_enabled)
+    if remote.tls_mode() != 2
+        && (remote.reality_settings.is_configured()
+            || remote.tls_settings.has_reality_key_material())
     {
-        anyhow::bail!("Xboard networkSettings is not supported by NodeRS Trojan server yet");
+        anyhow::bail!("Trojan REALITY settings require Xboard tls mode 2");
     }
     if let Some(transport) = remote.transport.as_ref() {
         validate_transport_field(transport)?;
@@ -1339,6 +1995,51 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         anyhow::bail!("Xboard multiplex is not supported by NodeRS Trojan server yet");
     }
     Ok(())
+}
+
+fn parse_transport_mode(remote: &NodeConfigResponse) -> anyhow::Result<TransportMode> {
+    let network = remote.network.trim();
+    if network.is_empty() || network.eq_ignore_ascii_case("tcp") {
+        ensure!(
+            remote
+                .network_settings
+                .as_ref()
+                .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
+            "Xboard networkSettings is only supported for Trojan grpc/ws/httpupgrade/xhttp nodes"
+        );
+        return Ok(TransportMode::Tcp);
+    }
+    if network.eq_ignore_ascii_case("grpc") {
+        return Ok(TransportMode::Grpc(
+            grpc::GrpcConfig::from_network_settings(remote.network_settings.as_ref())?,
+        ));
+    }
+    if network.eq_ignore_ascii_case("ws") {
+        return Ok(TransportMode::Ws(ws::WsConfig::from_network_settings(
+            remote.network_settings.as_ref(),
+        )?));
+    }
+    if network.eq_ignore_ascii_case("httpupgrade") {
+        return Ok(TransportMode::HttpUpgrade(
+            httpupgrade::HttpUpgradeConfig::from_network_settings(
+                remote.network_settings.as_ref(),
+            )?,
+        ));
+    }
+    if network.eq_ignore_ascii_case("xhttp") {
+        return Ok(TransportMode::Xhttp(
+            xhttp::XhttpConfig::from_network_settings(remote.network_settings.as_ref())?,
+        ));
+    }
+    bail!("Xboard network must be tcp, grpc, ws, httpupgrade or xhttp for Trojan nodes");
+}
+
+fn default_grpc_alpn() -> Vec<String> {
+    vec!["h2".to_string()]
+}
+
+fn default_xhttp_alpn() -> Vec<String> {
+    vec!["http/1.1".to_string(), "h2".to_string()]
 }
 
 fn validate_transport_field(value: &serde_json::Value) -> anyhow::Result<()> {
@@ -1642,6 +2343,8 @@ fn trojan_auth(password: &str) -> [u8; TROJAN_AUTH_HEX_LEN] {
 mod tests {
     use super::*;
     use crate::panel::CertConfig;
+
+    const REALITY_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -2058,6 +2761,88 @@ mod tests {
     }
 
     #[test]
+    fn accepts_xboard_websocket_network() {
+        let remote = NodeConfigResponse {
+            network: "ws".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/trojan",
+                "headers": {
+                    "Host": "cdn.example.com"
+                }
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Ws(_)));
+    }
+
+    #[test]
+    fn accepts_xboard_grpc_network() {
+        let remote = NodeConfigResponse {
+            network: "grpc".to_string(),
+            network_settings: Some(serde_json::json!({
+                "serviceName": "TunService"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Grpc(_)));
+        assert_eq!(config.tls.alpn, vec!["h2".to_string()]);
+    }
+
+    #[test]
+    fn accepts_xboard_httpupgrade_network() {
+        let remote = NodeConfigResponse {
+            network: "httpupgrade".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/upgrade",
+                "host": "cdn.example.com"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::HttpUpgrade(_)));
+    }
+
+    #[test]
+    fn accepts_xboard_xhttp_network() {
+        let remote = NodeConfigResponse {
+            network: "xhttp".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/x",
+                "host": "cdn.example.com",
+                "mode": "stream-one"
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert!(matches!(config.transport, TransportMode::Xhttp(_)));
+        assert_eq!(
+            config.tls.alpn,
+            vec!["http/1.1".to_string(), "h2".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_xboard_network() {
+        let remote = NodeConfigResponse {
+            network: "h2".to_string(),
+            network_settings: Some(serde_json::json!({
+                "path": "/h2",
+                "host": "cdn.example.com"
+            })),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("network");
+        assert!(error.to_string().contains("network"));
+    }
+
+    #[test]
     fn accepts_disabled_network_settings_and_tcp_transport_field() {
         let remote = NodeConfigResponse {
             network_settings: Some(serde_json::json!({
@@ -2083,7 +2868,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_disabled_multiplex_but_rejects_non_tls_mode() {
+    fn accepts_disabled_multiplex_but_rejects_unsupported_tls_mode() {
         let remote = NodeConfigResponse {
             tls: Some(serde_json::json!(1)),
             multiplex: Some(serde_json::json!({
@@ -2096,11 +2881,47 @@ mod tests {
         assert_eq!(config.server_port, 443);
 
         let remote = NodeConfigResponse {
-            tls: Some(serde_json::json!(2)),
+            tls: Some(serde_json::json!(3)),
             ..base_remote()
         };
         let error = EffectiveNodeConfig::from_remote(&remote).expect_err("tls mode");
         assert!(error.to_string().contains("tls mode"));
+    }
+
+    #[test]
+    fn accepts_reality_tls_mode() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(2)),
+            reality_settings: crate::panel::NodeRealitySettings {
+                server_name: "reality.example.com".to_string(),
+                private_key: REALITY_KEY_B64.to_string(),
+                short_id: "a1b2".to_string(),
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        let reality = config.tls.reality.expect("reality config");
+        assert_eq!(reality.server_name, "reality.example.com");
+        assert_eq!(reality.server_port, 443);
+        assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn rejects_reality_settings_without_reality_tls_mode() {
+        let remote = NodeConfigResponse {
+            tls: Some(serde_json::json!(1)),
+            reality_settings: crate::panel::NodeRealitySettings {
+                server_name: "reality.example.com".to_string(),
+                private_key: REALITY_KEY_B64.to_string(),
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("reality without tls2");
+        assert!(error.to_string().contains("tls mode 2"));
     }
 
     #[test]

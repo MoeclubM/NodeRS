@@ -180,6 +180,7 @@ impl Session {
                     }
                     if idle_for >= HEARTBEAT_INTERVAL
                         && state.received_settings.load(Ordering::Relaxed)
+                        && peer_supports_v2(state.peer_version.load(Ordering::Relaxed))
                     {
                         write_frame(&writer, CMD_HEART_REQUEST, 0, &[]).await?;
                     }
@@ -274,7 +275,7 @@ impl Session {
         }
         if stream_gate.1 {
             let error = format!("too many concurrent streams: limit={MAX_STREAMS_PER_SESSION}");
-            if peer_version >= 2 {
+            if peer_supports_v2(peer_version) {
                 self.write_frame(CMD_SYNACK, stream_id, error.as_bytes())
                     .await?;
             }
@@ -297,7 +298,7 @@ impl Session {
             activity: self.activity.clone(),
             upload_traffic: TrafficRecorder::upload(accounting.clone(), user.id),
             download_traffic: TrafficRecorder::download(accounting, user.id),
-            send_synack: peer_version >= 2,
+            send_synack: peer_supports_v2(peer_version),
         };
         let state = self.state.clone();
         let task = tokio::spawn(async move {
@@ -352,14 +353,11 @@ impl Session {
             .context("read settings frame")?;
         let settings = parse_settings(&bytes);
         self.state.received_settings.store(true, Ordering::Relaxed);
-        let peer_version = settings
-            .get("v")
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or_default();
+        let peer_version = negotiated_peer_version(&settings);
         self.state
             .peer_version
             .store(peer_version, Ordering::Relaxed);
-        if peer_version >= 2 {
+        if peer_supports_v2(peer_version) {
             self.maybe_send_light_padding_update().await?;
         }
 
@@ -375,7 +373,7 @@ impl Session {
             )
             .await?;
         }
-        if peer_version >= 2 {
+        if peer_supports_v2(peer_version) {
             self.write_frame(CMD_SERVER_SETTINGS, 0, b"v=2").await?;
         }
         Ok(())
@@ -574,6 +572,21 @@ fn close_peer_stream(state: &SessionState, stream_id: u32) {
     if let Some(stream) = take_stream(state, stream_id) {
         stream.task.abort();
     }
+}
+
+fn negotiated_peer_version(settings: &std::collections::HashMap<String, String>) -> u8 {
+    match settings
+        .get("v")
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        Some(version) if version >= 2 => 2,
+        Some(1) => 1,
+        _ => 0,
+    }
+}
+
+fn peer_supports_v2(peer_version: u8) -> bool {
+    peer_version >= 2
 }
 
 async fn handle_stream(
@@ -819,8 +832,8 @@ mod tests {
     };
     use super::{
         SessionState, StreamState, close_peer_stream, forward_buffered_inbound_payload,
-        forward_inbound_payload_to_channel, prefetch_remote_download_with_grace,
-        read_exact_payload,
+        forward_inbound_payload_to_channel, negotiated_peer_version, peer_supports_v2,
+        prefetch_remote_download_with_grace, read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use crate::protocols::shared::traffic::TrafficRecorder;
@@ -1011,6 +1024,16 @@ mod tests {
         let settings = parse_settings(b"v=2\nclient=test");
         assert_eq!(settings.get("v"), Some(&"2".to_string()));
         assert_eq!(settings.get("client"), Some(&"test".to_string()));
+    }
+
+    #[test]
+    fn negotiates_anytls_v2_for_current_and_future_versions() {
+        assert_eq!(negotiated_peer_version(&parse_settings(b"v=1")), 1);
+        assert_eq!(negotiated_peer_version(&parse_settings(b"v=2")), 2);
+        assert_eq!(negotiated_peer_version(&parse_settings(b"v=300")), 2);
+        assert_eq!(negotiated_peer_version(&parse_settings(b"client=test")), 0);
+        assert!(!peer_supports_v2(1));
+        assert!(peer_supports_v2(2));
     }
 
     #[test]

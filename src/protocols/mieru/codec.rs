@@ -167,6 +167,21 @@ pub fn encode_data_metadata(
     seq: u32,
     payload_len: usize,
 ) -> anyhow::Result<[u8; METADATA_LEN]> {
+    encode_data_metadata_full(protocol, session_id, seq, 0, 0, 0, 0, payload_len, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn encode_data_metadata_full(
+    protocol: ProtocolType,
+    session_id: u32,
+    seq: u32,
+    unack_seq: u32,
+    window_size: u16,
+    fragment: u8,
+    prefix_len: u8,
+    payload_len: usize,
+    suffix_len: u8,
+) -> anyhow::Result<[u8; METADATA_LEN]> {
     ensure!(
         payload_len <= u16::MAX as usize,
         "Mieru data payload too large: {payload_len}"
@@ -176,7 +191,12 @@ pub fn encode_data_metadata(
     bytes[2..6].copy_from_slice(&(current_timestamp_minutes()? as u32).to_be_bytes());
     bytes[6..10].copy_from_slice(&session_id.to_be_bytes());
     bytes[10..14].copy_from_slice(&seq.to_be_bytes());
+    bytes[14..18].copy_from_slice(&unack_seq.to_be_bytes());
+    bytes[18..20].copy_from_slice(&window_size.to_be_bytes());
+    bytes[20] = fragment;
+    bytes[21] = prefix_len;
     bytes[22..24].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    bytes[24] = suffix_len;
     Ok(bytes)
 }
 

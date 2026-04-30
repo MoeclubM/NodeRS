@@ -1,6 +1,6 @@
 [package]
 name = "noders"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -10,6 +10,8 @@ blake3 = "1.8.4"
 boring = { version = "5.1.0", features = ["mlkem"] }
 bytes = "1.11.1"
 futures-util = "0.3.32"
+h3 = "0.0.8"
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
 h2 = "0.4.13"
 hex = "0.4.3"
 hmac = "0.12.1"
@@ -26,6 +28,7 @@ prost = "0.14.1"
 pqc_kyber = { version = "0.7.1", features = ["std"] }
 rand = "0.10.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
+quinn = "0.11.9"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "query", "rustls", "http2"] }
 regex = "1.12.3"
 rustc-hash = "2.1.1"
