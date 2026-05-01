@@ -1,14 +1,15 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use blake2::Blake2bVar;
 use blake2::digest::{Update, VariableOutput};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, Endpoint, UdpPoller, VarInt};
+use quinn::{AsyncUdpSocket, Endpoint, IdleTimeout, UdpPoller, VarInt};
 use rustc_hash::FxHashMap;
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -31,7 +32,12 @@ use super::shared::{
 const H3_ALPN: &str = "h3";
 const AUTH_PATH: &str = "/auth";
 const AUTH_HOST: &str = "hysteria";
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const HY2_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+const HY2_CONN_RECEIVE_WINDOW: u32 = 20 * 1024 * 1024;
+const HY2_MAX_INCOMING_STREAMS: u32 = 1024;
+const HY2_DATAGRAM_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const COPY_BUFFER_LEN: usize = 64 * 1024;
 const MAX_ADDRESS_LEN: u64 = 2048;
@@ -48,8 +54,11 @@ pub struct EffectiveNodeConfig {
     pub server_port: u16,
     pub tls: EffectiveTlsConfig,
     pub cc_rx: String,
+    congestion_control: Hy2CongestionControl,
+    auth_timeout: Duration,
     pub udp_enabled: bool,
     obfs: Option<SalamanderConfig>,
+    masquerade: MasqueradeConfig,
     pub routes: Vec<RouteConfig>,
     pub custom_outbounds: Vec<serde_json::Value>,
     pub custom_routes: Vec<serde_json::Value>,
@@ -59,19 +68,51 @@ impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
         let mut tls = EffectiveTlsConfig::from_remote(remote)?;
-        tls.alpn = vec![H3_ALPN.to_string()];
+        tls.alpn = hy2_alpn(remote)?;
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
             tls,
             cc_rx: hy2_cc_rx(remote.up_mbps.as_ref(), remote.ignore_client_bandwidth)?,
+            congestion_control: parse_hy2_congestion_control(&remote.congestion_control)?,
+            auth_timeout: parse_hy2_duration(
+                &remote.auth_timeout,
+                DEFAULT_AUTH_TIMEOUT,
+                "auth_timeout",
+            )?,
             udp_enabled: hy2_udp_enabled(&remote.udp_relay_mode),
             obfs: parse_hy2_obfs(remote)?,
+            masquerade: parse_hy2_masquerade(remote.masquerade.as_ref())?,
             routes: remote.routes.clone(),
             custom_outbounds: remote.custom_outbounds.clone(),
             custom_routes: remote.custom_routes.clone(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hy2CongestionControl {
+    Bbr,
+    Reno,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MasqueradeConfig {
+    NotFound,
+    File {
+        dir: PathBuf,
+    },
+    Proxy {
+        url: String,
+        rewrite_host: bool,
+        x_forwarded: bool,
+        insecure: bool,
+    },
+    String {
+        content: Vec<u8>,
+        headers: Vec<(String, String)>,
+        status_code: u16,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -113,9 +154,13 @@ pub struct ServerController {
 struct RunningServer {
     listen_ip: String,
     server_port: u16,
+    tls: EffectiveTlsConfig,
     cc_rx: String,
+    congestion_control: Hy2CongestionControl,
+    auth_timeout: Duration,
     udp_enabled: bool,
     obfs: Option<SalamanderConfig>,
+    masquerade: MasqueradeConfig,
     endpoint: Endpoint,
     handle: JoinHandle<()>,
 }
@@ -311,9 +356,13 @@ impl ServerController {
             let should_restart = guard.as_ref().is_none_or(|running| {
                 running.listen_ip != config.listen_ip
                     || running.server_port != config.server_port
+                    || running.tls != config.tls
                     || running.cc_rx != config.cc_rx
+                    || running.congestion_control != config.congestion_control
+                    || running.auth_timeout != config.auth_timeout
                     || running.udp_enabled != config.udp_enabled
                     || running.obfs != config.obfs
+                    || running.masquerade != config.masquerade
             });
             if !should_restart {
                 return Ok(());
@@ -331,7 +380,9 @@ impl ServerController {
         let users = self.users.clone();
         let accounting = self.accounting.clone();
         let cc_rx = config.cc_rx.clone();
+        let auth_timeout = config.auth_timeout;
         let udp_enabled = config.udp_enabled;
+        let masquerade = config.masquerade.clone();
         let routing = RoutingTable::from_remote(
             &config.routes,
             &config.custom_outbounds,
@@ -347,6 +398,7 @@ impl ServerController {
                 let accounting = accounting.clone();
                 let routing = routing.clone();
                 let cc_rx = cc_rx.clone();
+                let masquerade = masquerade.clone();
                 connections.spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
@@ -356,7 +408,9 @@ impl ServerController {
                                 users,
                                 routing,
                                 cc_rx,
+                                auth_timeout,
                                 udp_enabled,
+                                masquerade,
                             )
                             .await
                             {
@@ -380,9 +434,13 @@ impl ServerController {
         *guard = Some(RunningServer {
             listen_ip: config.listen_ip,
             server_port: config.server_port,
+            tls: config.tls,
             cc_rx: config.cc_rx,
+            congestion_control: config.congestion_control,
+            auth_timeout: config.auth_timeout,
             udp_enabled: config.udp_enabled,
             obfs: config.obfs,
+            masquerade: config.masquerade,
             endpoint,
             handle,
         });
@@ -407,14 +465,14 @@ impl ServerController {
 }
 
 async fn build_endpoint(config: &EffectiveNodeConfig) -> anyhow::Result<Endpoint> {
-    let rustls_config = tls::load_rustls_server_config(&config.tls.source, &[H3_ALPN.to_string()])
+    let rustls_config = tls::load_rustls_server_config(&config.tls.source, &config.tls.alpn)
         .await
         .context("load HY2 TLS materials")?;
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
         .context("build HY2 QUIC TLS config")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    configure_hy2_transport(&mut transport_config, config.congestion_control)?;
     server_config.transport_config(Arc::new(transport_config));
     let bind_addr = hy2_bind_addr(&config.listen_ip, config.server_port)?;
     if let Some(obfs) = config.obfs.clone() {
@@ -434,6 +492,27 @@ async fn build_endpoint(config: &EffectiveNodeConfig) -> anyhow::Result<Endpoint
     Endpoint::server(server_config, bind_addr).context("bind HY2 UDP endpoint")
 }
 
+fn configure_hy2_transport(
+    transport_config: &mut quinn::TransportConfig,
+    congestion_control: Hy2CongestionControl,
+) -> anyhow::Result<()> {
+    let idle_timeout =
+        IdleTimeout::try_from(DEFAULT_QUIC_IDLE_TIMEOUT).context("build HY2 QUIC idle timeout")?;
+    transport_config
+        .max_concurrent_bidi_streams(VarInt::from_u32(HY2_MAX_INCOMING_STREAMS))
+        .stream_receive_window(VarInt::from_u32(HY2_STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(HY2_CONN_RECEIVE_WINDOW))
+        .send_window(u64::from(HY2_CONN_RECEIVE_WINDOW))
+        .max_idle_timeout(Some(idle_timeout))
+        .datagram_receive_buffer_size(Some(HY2_DATAGRAM_BUFFER_SIZE))
+        .datagram_send_buffer_size(HY2_DATAGRAM_BUFFER_SIZE)
+        .congestion_controller_factory(match congestion_control {
+            Hy2CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+            Hy2CongestionControl::Reno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        });
+    Ok(())
+}
+
 fn hy2_bind_addr(listen_ip: &str, server_port: u16) -> anyhow::Result<SocketAddr> {
     let listen_ip = listen_ip.trim();
     format!("{listen_ip}:{server_port}")
@@ -447,10 +526,20 @@ async fn handle_connection(
     users: Arc<RwLock<UserValidator>>,
     routing: RoutingTable,
     cc_rx: String,
+    auth_timeout: Duration,
     udp_enabled: bool,
+    masquerade: MasqueradeConfig,
 ) -> anyhow::Result<()> {
-    let Some((user, lease)) =
-        authenticate_connection(&connection, accounting.clone(), users, cc_rx, udp_enabled).await?
+    let Some((user, lease)) = authenticate_connection(
+        &connection,
+        accounting.clone(),
+        users,
+        cc_rx,
+        auth_timeout,
+        udp_enabled,
+        masquerade,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -502,54 +591,73 @@ async fn authenticate_connection(
     accounting: Arc<Accounting>,
     users: Arc<RwLock<UserValidator>>,
     cc_rx: String,
+    auth_timeout: Duration,
     udp_enabled: bool,
+    masquerade: MasqueradeConfig,
 ) -> anyhow::Result<Option<(UserEntry, SessionLease)>> {
     let h3_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3 = h3::server::builder()
         .build(h3_connection)
         .await
         .context("initialize HY2 HTTP/3 server")?;
-    let resolver = tokio::time::timeout(AUTH_TIMEOUT, h3.accept())
-        .await
-        .context("HY2 auth request timed out")?
-        .context("accept HY2 HTTP/3 request")?
-        .ok_or_else(|| anyhow!("HY2 connection closed before auth"))?;
-    let (request, mut stream) = resolver
-        .resolve_request()
-        .await
-        .context("resolve HY2 auth request")?;
+    let timeout = tokio::time::sleep(auth_timeout);
+    tokio::pin!(timeout);
+    loop {
+        let resolver = tokio::select! {
+            _ = &mut timeout => return Err(anyhow!("HY2 auth request timed out")),
+            resolver = h3.accept() => resolver
+                .context("accept HY2 HTTP/3 request")?
+                .ok_or_else(|| anyhow!("HY2 connection closed before auth"))?,
+        };
+        let (request, mut stream) = resolver
+            .resolve_request()
+            .await
+            .context("resolve HY2 HTTP/3 request")?;
 
-    if !is_auth_request(&request) {
-        send_h3_status(&mut stream, 404).await?;
-        return Ok(None);
+        if !is_auth_request(&request) {
+            send_masquerade_response(
+                &masquerade,
+                &request,
+                &mut stream,
+                connection.remote_address(),
+            )
+            .await?;
+            continue;
+        }
+
+        let auth = request
+            .headers()
+            .get("Hysteria-Auth")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .trim();
+        let user = users.read().expect("hy2 users lock poisoned").get(auth);
+        let Some(user) = user else {
+            send_masquerade_response(
+                &masquerade,
+                &request,
+                &mut stream,
+                connection.remote_address(),
+            )
+            .await?;
+            continue;
+        };
+        let lease = accounting.open_session(&user, connection.remote_address())?;
+
+        let response = http::Response::builder()
+            .status(http::StatusCode::from_u16(233).context("build HY2 status code")?)
+            .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
+            .header("Hysteria-CC-RX", cc_rx)
+            .header("Hysteria-Padding", "")
+            .body(())
+            .context("build HY2 auth response")?;
+        stream
+            .send_response(response)
+            .await
+            .context("send HY2 auth response")?;
+        stream.finish().await.context("finish HY2 auth stream")?;
+        return Ok(Some((user, lease)));
     }
-
-    let auth = request
-        .headers()
-        .get("Hysteria-Auth")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .trim();
-    let user = users.read().expect("hy2 users lock poisoned").get(auth);
-    let Some(user) = user else {
-        send_h3_status(&mut stream, 404).await?;
-        return Ok(None);
-    };
-    let lease = accounting.open_session(&user, connection.remote_address())?;
-
-    let response = http::Response::builder()
-        .status(http::StatusCode::from_u16(233).context("build HY2 status code")?)
-        .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
-        .header("Hysteria-CC-RX", cc_rx)
-        .header("Hysteria-Padding", "")
-        .body(())
-        .context("build HY2 auth response")?;
-    stream
-        .send_response(response)
-        .await
-        .context("send HY2 auth response")?;
-    stream.finish().await.context("finish HY2 auth stream")?;
-    Ok(Some((user, lease)))
 }
 
 fn is_auth_request(request: &http::Request<()>) -> bool {
@@ -582,6 +690,235 @@ where
         .await
         .with_context(|| format!("finish HY2 HTTP/3 {status} response"))?;
     Ok(())
+}
+
+async fn send_masquerade_response<S>(
+    config: &MasqueradeConfig,
+    request: &http::Request<()>,
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    remote_addr: SocketAddr,
+) -> anyhow::Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    match config {
+        MasqueradeConfig::NotFound => send_h3_status(stream, 404).await,
+        MasqueradeConfig::String {
+            content,
+            headers,
+            status_code,
+        } => send_h3_body(stream, *status_code, headers, content.clone()).await,
+        MasqueradeConfig::File { dir } => send_file_masquerade(dir, request, stream).await,
+        MasqueradeConfig::Proxy {
+            url,
+            rewrite_host,
+            x_forwarded,
+            insecure,
+        } => {
+            send_proxy_masquerade(
+                url,
+                *rewrite_host,
+                *x_forwarded,
+                *insecure,
+                request,
+                stream,
+                remote_addr,
+            )
+            .await
+        }
+    }
+}
+
+async fn send_h3_body<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    status: u16,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> anyhow::Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let mut response = http::Response::builder().status(status);
+    for (name, value) in headers {
+        response = response.header(name, value);
+    }
+    let response = response
+        .body(())
+        .with_context(|| format!("build HY2 HTTP/3 {status} response"))?;
+    stream
+        .send_response(response)
+        .await
+        .with_context(|| format!("send HY2 HTTP/3 {status} response"))?;
+    if !body.is_empty() {
+        stream
+            .send_data(Bytes::from(body))
+            .await
+            .context("send HY2 HTTP/3 response body")?;
+    }
+    stream
+        .finish()
+        .await
+        .with_context(|| format!("finish HY2 HTTP/3 {status} response"))?;
+    Ok(())
+}
+
+async fn send_file_masquerade<S>(
+    dir: &Path,
+    request: &http::Request<()>,
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+) -> anyhow::Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let path = masquerade_file_path(dir, request.uri().path())?;
+    let path = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_dir() => path.join("index.html"),
+        Ok(metadata) if metadata.is_file() => path,
+        Ok(_) => return send_h3_status(stream, 404).await,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return send_h3_status(stream, 404).await;
+        }
+        Err(error) => return Err(error).context("read HY2 masquerade file metadata"),
+    };
+    let body = match tokio::fs::read(&path).await {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return send_h3_status(stream, 404).await;
+        }
+        Err(error) => return Err(error).context("read HY2 masquerade file"),
+    };
+    send_h3_body(stream, 200, &[], body).await
+}
+
+async fn send_proxy_masquerade<S>(
+    url: &str,
+    rewrite_host: bool,
+    x_forwarded: bool,
+    insecure: bool,
+    request: &http::Request<()>,
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    remote_addr: SocketAddr,
+) -> anyhow::Result<()>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let target = masquerade_proxy_url(url, request.uri())?;
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .context("receive HY2 masquerade request body")?
+    {
+        while chunk.has_remaining() {
+            body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+    }
+
+    let mut builder = reqwest::Client::builder();
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    let client = builder
+        .build()
+        .context("build HY2 masquerade proxy client")?;
+    let mut proxied = client.request(request.method().clone(), target);
+    for (name, value) in request.headers() {
+        if !is_hop_by_hop_header(name) {
+            proxied = proxied.header(name, value.clone());
+        }
+    }
+    if !rewrite_host && let Some(authority) = request.uri().authority() {
+        proxied = proxied.header(http::header::HOST, authority.as_str());
+    }
+    if x_forwarded {
+        proxied = proxied
+            .header("x-forwarded-for", remote_addr.ip().to_string())
+            .header("x-forwarded-proto", "https");
+        if let Some(authority) = request.uri().authority() {
+            proxied = proxied.header("x-forwarded-host", authority.as_str());
+        }
+    }
+
+    let response = proxied
+        .body(body)
+        .send()
+        .await
+        .context("proxy HY2 masquerade request")?;
+    let status = response.status();
+    let mut headers = Vec::new();
+    for (name, value) in response.headers() {
+        if !is_hop_by_hop_header(name) {
+            headers.push((
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .context("decode HY2 masquerade proxy response header")?
+                    .to_string(),
+            ));
+        }
+    }
+    let body = response
+        .bytes()
+        .await
+        .context("read HY2 masquerade proxy response")?
+        .to_vec();
+    send_h3_body(stream, status.as_u16(), &headers, body).await
+}
+
+fn is_hop_by_hop_header(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn masquerade_proxy_url(base_url: &str, uri: &http::Uri) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url).context("parse HY2 masquerade proxy url")?;
+    let mut path = url.path().trim_end_matches('/').to_string();
+    let request_path = uri.path();
+    if request_path == "/" {
+        if path.is_empty() {
+            path.push('/');
+        }
+    } else {
+        path.push('/');
+        path.push_str(request_path.trim_start_matches('/'));
+    }
+    url.set_path(&path);
+    let query = match (url.query(), uri.query()) {
+        (Some(base), Some(request)) if !base.is_empty() && !request.is_empty() => {
+            Some(format!("{base}&{request}"))
+        }
+        (Some(base), _) if !base.is_empty() => Some(base.to_string()),
+        (_, Some(request)) if !request.is_empty() => Some(request.to_string()),
+        _ => None,
+    };
+    url.set_query(query.as_deref());
+    Ok(url)
+}
+
+fn masquerade_file_path(root: &Path, request_path: &str) -> anyhow::Result<PathBuf> {
+    let decoded = percent_encoding::percent_decode_str(request_path.trim_start_matches('/'))
+        .decode_utf8()
+        .context("decode HY2 masquerade file path")?;
+    let mut path = root.to_path_buf();
+    for component in Path::new(decoded.as_ref()).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("HY2 masquerade file path escapes root")
+            }
+        }
+    }
+    Ok(path)
 }
 
 async fn handle_tcp_stream(
@@ -1195,6 +1532,175 @@ fn parse_host_port(value: &str) -> anyhow::Result<SocksAddr> {
     }
 }
 
+fn hy2_alpn(remote: &NodeConfigResponse) -> anyhow::Result<Vec<String>> {
+    for protocol in &remote.alpn {
+        ensure!(
+            protocol.eq_ignore_ascii_case(H3_ALPN),
+            "HY2 alpn only supports h3"
+        );
+    }
+    Ok(vec![H3_ALPN.to_string()])
+}
+
+fn parse_hy2_congestion_control(value: &str) -> anyhow::Result<Hy2CongestionControl> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "bbr" => Ok(Hy2CongestionControl::Bbr),
+        "reno" => Ok(Hy2CongestionControl::Reno),
+        other => bail!("unsupported HY2 congestion_control {other}"),
+    }
+}
+
+fn parse_hy2_duration(value: &str, default: Duration, field: &str) -> anyhow::Result<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(default);
+    }
+    let split = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split]
+        .parse::<u64>()
+        .with_context(|| format!("parse HY2 {field}"))?;
+    let duration = match &value[split..] {
+        "" | "s" => Duration::from_secs(number),
+        "ms" => Duration::from_millis(number),
+        "m" => Duration::from_secs(number.saturating_mul(60)),
+        "h" => Duration::from_secs(number.saturating_mul(3600)),
+        unit => bail!("unsupported HY2 {field} unit {unit}"),
+    };
+    ensure!(duration > Duration::ZERO, "HY2 {field} must be positive");
+    Ok(duration)
+}
+
+fn parse_hy2_masquerade(value: Option<&serde_json::Value>) -> anyhow::Result<MasqueradeConfig> {
+    let Some(value) = value else {
+        return Ok(MasqueradeConfig::NotFound);
+    };
+    match value {
+        serde_json::Value::Null => Ok(MasqueradeConfig::NotFound),
+        serde_json::Value::String(kind) if kind.trim().is_empty() || kind.trim() == "404" => {
+            Ok(MasqueradeConfig::NotFound)
+        }
+        serde_json::Value::Object(object) => {
+            let kind = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("404")
+                .trim()
+                .to_ascii_lowercase();
+            match kind.as_str() {
+                "" | "404" => Ok(MasqueradeConfig::NotFound),
+                "file" => {
+                    let file = object.get("file").and_then(serde_json::Value::as_object);
+                    let dir = file
+                        .and_then(|file| file.get("dir"))
+                        .or_else(|| object.get("dir"))
+                        .and_then(serde_json::Value::as_str)
+                        .context("HY2 masquerade.file.dir is required")?;
+                    Ok(MasqueradeConfig::File {
+                        dir: PathBuf::from(dir),
+                    })
+                }
+                "proxy" => {
+                    let proxy = object.get("proxy").and_then(serde_json::Value::as_object);
+                    let url = proxy
+                        .and_then(|proxy| proxy.get("url"))
+                        .or_else(|| object.get("url"))
+                        .and_then(serde_json::Value::as_str)
+                        .context("HY2 masquerade.proxy.url is required")?;
+                    let parsed =
+                        reqwest::Url::parse(url).context("parse HY2 masquerade proxy url")?;
+                    ensure!(
+                        matches!(parsed.scheme(), "http" | "https"),
+                        "HY2 masquerade proxy url must use http or https"
+                    );
+                    Ok(MasqueradeConfig::Proxy {
+                        url: url.to_string(),
+                        rewrite_host: json_bool(
+                            proxy
+                                .and_then(|proxy| proxy.get("rewriteHost"))
+                                .or_else(|| object.get("rewriteHost")),
+                        ),
+                        x_forwarded: json_bool(
+                            proxy
+                                .and_then(|proxy| proxy.get("xForwarded"))
+                                .or_else(|| object.get("xForwarded")),
+                        ),
+                        insecure: json_bool(
+                            proxy
+                                .and_then(|proxy| proxy.get("insecure"))
+                                .or_else(|| object.get("insecure")),
+                        ),
+                    })
+                }
+                "string" => {
+                    let string = object.get("string").and_then(serde_json::Value::as_object);
+                    let content = string
+                        .and_then(|string| string.get("content"))
+                        .or_else(|| object.get("content"))
+                        .and_then(serde_json::Value::as_str)
+                        .context("HY2 masquerade.string.content is required")?;
+                    let status_code = string
+                        .and_then(|string| string.get("statusCode"))
+                        .or_else(|| object.get("statusCode"))
+                        .map(parse_hy2_status_code)
+                        .transpose()?
+                        .unwrap_or(200);
+                    ensure!(
+                        status_code != 233,
+                        "HY2 masquerade.string.statusCode cannot be 233"
+                    );
+                    let headers = parse_masquerade_headers(
+                        string
+                            .and_then(|string| string.get("headers"))
+                            .or_else(|| object.get("headers")),
+                    )?;
+                    Ok(MasqueradeConfig::String {
+                        content: content.as_bytes().to_vec(),
+                        headers,
+                        status_code,
+                    })
+                }
+                other => bail!("unsupported HY2 masquerade type {other}"),
+            }
+        }
+        _ => bail!("HY2 masquerade must be an object"),
+    }
+}
+
+fn parse_hy2_status_code(value: &serde_json::Value) -> anyhow::Result<u16> {
+    let status = value_to_u64(value)?;
+    ensure!(
+        (200..=599).contains(&status),
+        "HY2 masquerade status code must be 200-599"
+    );
+    Ok(status as u16)
+}
+
+fn parse_masquerade_headers(
+    value: Option<&serde_json::Value>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let serde_json::Value::Object(object) = value else {
+        bail!("HY2 masquerade.string.headers must be an object");
+    };
+    object
+        .iter()
+        .map(|(name, value)| {
+            let value = value
+                .as_str()
+                .context("HY2 masquerade.string.headers values must be strings")?;
+            Ok((name.clone(), value.to_string()))
+        })
+        .collect()
+}
+
+fn json_bool(value: Option<&serde_json::Value>) -> bool {
+    value.and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     if let Some(version) = &remote.version {
         let version = match version {
@@ -1213,6 +1719,11 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         || remote.tls_settings.has_reality_key_material()
     {
         bail!("HY2 does not support REALITY TLS mode");
+    }
+    if remote.tls_settings.ech.is_enabled() {
+        bail!(
+            "HY2 QUIC TLS does not support Xboard tls_settings.ech with the current rustls backend"
+        );
     }
     let network = remote.network.trim();
     ensure!(
@@ -1311,7 +1822,7 @@ fn value_to_u64(value: &serde_json::Value) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::CertConfig;
+    use crate::panel::{CertConfig, NodeEchSettings, NodeTlsSettings};
 
     fn base_remote() -> NodeConfigResponse {
         NodeConfigResponse {
@@ -1343,7 +1854,116 @@ mod tests {
         assert_eq!(config.listen_ip, "0.0.0.0");
         assert_eq!(config.cc_rx, "12500000");
         assert_eq!(config.tls.alpn, vec!["h3".to_string()]);
+        assert_eq!(config.congestion_control, Hy2CongestionControl::Bbr);
+        assert_eq!(config.auth_timeout, DEFAULT_AUTH_TIMEOUT);
+        assert_eq!(config.masquerade, MasqueradeConfig::NotFound);
         assert!(config.udp_enabled);
+    }
+
+    #[test]
+    fn parses_hy2_congestion_timeout_and_masquerade() {
+        let remote = NodeConfigResponse {
+            congestion_control: "reno".to_string(),
+            auth_timeout: "3s".to_string(),
+            masquerade: Some(serde_json::json!({
+                "type": "string",
+                "content": "hello",
+                "headers": {
+                    "content-type": "text/plain"
+                },
+                "statusCode": 418
+            })),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.congestion_control, Hy2CongestionControl::Reno);
+        assert_eq!(config.auth_timeout, Duration::from_secs(3));
+        assert_eq!(
+            config.masquerade,
+            MasqueradeConfig::String {
+                content: b"hello".to_vec(),
+                headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                status_code: 418,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_hy2_congestion_control() {
+        let remote = NodeConfigResponse {
+            congestion_control: "cubic".to_string(),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("congestion");
+        assert!(error.to_string().contains("congestion_control"));
+    }
+
+    #[test]
+    fn rejects_non_h3_hy2_alpn() {
+        let remote = NodeConfigResponse {
+            alpn: vec!["h2".to_string()],
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("alpn");
+        assert!(error.to_string().contains("alpn"));
+    }
+
+    #[test]
+    fn rejects_hy2_ech_until_quic_backend_supports_it() {
+        let remote = NodeConfigResponse {
+            tls_settings: NodeTlsSettings {
+                ech: NodeEchSettings {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("ech");
+        assert!(error.to_string().contains("tls_settings.ech"));
+    }
+
+    #[test]
+    fn parses_hy2_proxy_masquerade_from_xboard_shape() {
+        let config = parse_hy2_masquerade(Some(&serde_json::json!({
+            "type": "proxy",
+            "url": "https://example.com/base",
+            "rewriteHost": true,
+            "xForwarded": true,
+            "insecure": true
+        })))
+        .expect("masquerade");
+
+        assert_eq!(
+            config,
+            MasqueradeConfig::Proxy {
+                url: "https://example.com/base".to_string(),
+                rewrite_host: true,
+                x_forwarded: true,
+                insecure: true,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_hy2_proxy_masquerade_target_url() {
+        let uri: http::Uri = "https://hysteria.example/path?q=1".parse().expect("uri");
+        let url = masquerade_proxy_url("https://example.com/base?token=2", &uri).expect("url");
+
+        assert_eq!(url.as_str(), "https://example.com/base/path?token=2&q=1");
+    }
+
+    #[test]
+    fn rejects_hy2_file_masquerade_path_escape() {
+        let error =
+            masquerade_file_path(Path::new("/var/www"), "/../secret").expect_err("path escape");
+
+        assert!(error.to_string().contains("escapes root"));
     }
 
     #[test]
