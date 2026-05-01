@@ -34,6 +34,8 @@ const AUTH_HOST: &str = "hysteria";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const HY2_TCP_REQUEST_ID: u64 = 0x401;
 const COPY_BUFFER_LEN: usize = 64 * 1024;
+const MAX_ADDRESS_LEN: u64 = 2048;
+const MAX_PADDING_LEN: u64 = 4096;
 const SALAMANDER_SALT_LEN: usize = 8;
 const SALAMANDER_KEY_LEN: usize = 32;
 const SALAMANDER_MIN_PASSWORD_LEN: usize = 4;
@@ -62,7 +64,7 @@ impl EffectiveNodeConfig {
             listen_ip: effective_listen_ip(remote),
             server_port: remote.server_port,
             tls,
-            cc_rx: hy2_cc_rx(remote.down_mbps.as_ref(), remote.ignore_client_bandwidth)?,
+            cc_rx: hy2_cc_rx(remote.up_mbps.as_ref(), remote.ignore_client_bandwidth)?,
             udp_enabled: hy2_udp_enabled(&remote.udp_relay_mode),
             obfs: parse_hy2_obfs(remote)?,
             routes: remote.routes.clone(),
@@ -1012,13 +1014,15 @@ where
         "unsupported HY2 request id {request_id:#x}"
     );
     let address_len = read_varint(reader).await?;
-    ensure!(address_len <= 2048, "HY2 address is too long");
+    ensure!(address_len > 0, "HY2 address is required");
+    ensure!(address_len <= MAX_ADDRESS_LEN, "HY2 address is too long");
     let mut address = vec![0u8; address_len as usize];
     reader
         .read_exact(&mut address)
         .await
         .context("read HY2 target address")?;
     let padding_len = read_varint(reader).await?;
+    ensure!(padding_len <= MAX_PADDING_LEN, "HY2 padding is too long");
     discard_exact(reader, padding_len as usize).await?;
     parse_host_port(std::str::from_utf8(&address).context("decode HY2 target address")?)
 }
@@ -1108,7 +1112,11 @@ fn decode_udp_message(mut bytes: &[u8]) -> anyhow::Result<UdpMessage> {
     let fragment_count = bytes[7];
     bytes = &bytes[8..];
     let address_len = read_varint_from_slice(&mut bytes)?;
-    ensure!(address_len <= 2048, "HY2 UDP address is too long");
+    ensure!(address_len > 0, "HY2 UDP address is required");
+    ensure!(
+        address_len <= MAX_ADDRESS_LEN,
+        "HY2 UDP address is too long"
+    );
     ensure!(
         bytes.len() >= address_len as usize,
         "HY2 UDP address is truncated"
@@ -1188,6 +1196,18 @@ fn parse_host_port(value: &str) -> anyhow::Result<SocksAddr> {
 }
 
 fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
+    if let Some(version) = &remote.version {
+        let version = match version {
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .ok_or_else(|| anyhow!("HY2 version must be a non-negative integer"))?,
+            serde_json::Value::String(text) => {
+                text.trim().parse::<u64>().context("parse HY2 version")?
+            }
+            _ => bail!("HY2 version must be a number or decimal string"),
+        };
+        ensure!(version == 2, "HY2 only supports hysteria version 2");
+    }
     if remote.tls_mode() == 2
         || remote.reality_settings.is_configured()
         || remote.tls_settings.has_reality_key_material()
@@ -1312,7 +1332,9 @@ mod tests {
     #[test]
     fn parses_hy2_remote_config() {
         let remote = NodeConfigResponse {
-            down_mbps: Some(serde_json::json!(100)),
+            version: Some(serde_json::json!(2)),
+            up_mbps: Some(serde_json::json!(100)),
+            down_mbps: Some(serde_json::json!(300)),
             udp_relay_mode: "native".to_string(),
             ..base_remote()
         };
@@ -1322,6 +1344,29 @@ mod tests {
         assert_eq!(config.cc_rx, "12500000");
         assert_eq!(config.tls.alpn, vec!["h3".to_string()]);
         assert!(config.udp_enabled);
+    }
+
+    #[test]
+    fn hy2_cc_rx_uses_server_receive_bandwidth() {
+        let remote = NodeConfigResponse {
+            up_mbps: Some(serde_json::json!(40)),
+            down_mbps: Some(serde_json::json!(200)),
+            ..base_remote()
+        };
+
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.cc_rx, "5000000");
+    }
+
+    #[test]
+    fn rejects_hysteria_v1_config() {
+        let remote = NodeConfigResponse {
+            version: Some(serde_json::json!(1)),
+            ..base_remote()
+        };
+
+        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("version");
+        assert!(error.to_string().contains("version 2"));
     }
 
     #[test]
@@ -1394,6 +1439,25 @@ mod tests {
                 .expect("decode");
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn rejects_oversized_hy2_tcp_padding() {
+        let mut request = Vec::new();
+        encode_varint(HY2_TCP_REQUEST_ID, &mut request).expect("request id");
+        encode_varint(15, &mut request).expect("address len");
+        request.extend_from_slice(b"example.com:443");
+        encode_varint(MAX_PADDING_LEN + 1, &mut request).expect("padding len");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let error = runtime
+            .block_on(async { read_tcp_request(&mut request.as_slice()).await })
+            .expect_err("padding");
+
+        assert!(error.to_string().contains("padding"));
     }
 
     #[test]
