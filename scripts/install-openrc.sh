@@ -156,11 +156,11 @@ detect_asset_suffix() {
   libc_family="$(detect_local_libc)"
   if [[ "$libc_family" == "glibc" ]]; then
     detected_glibc_version="$(glibc_version)"
-    if [[ -n "$detected_glibc_version" ]] && version_at_least "$detected_glibc_version" "2.17"; then
+    if [[ -n "$detected_glibc_version" ]] && version_at_least "$detected_glibc_version" "2.36"; then
       printf '%s\n' "$asset_prefix"
       return
     fi
-    echo "Detected glibc ${detected_glibc_version:-unknown}; falling back to ${asset_prefix}-musl because GNU builds target glibc >= 2.17." >&2
+    echo "Detected glibc ${detected_glibc_version:-unknown}; falling back to ${asset_prefix}-musl because GNU builds target glibc >= 2.36." >&2
     printf '%s-musl\n' "$asset_prefix"
     return
   fi

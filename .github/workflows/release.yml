@@ -11,23 +11,26 @@ permissions:
 
 env:
   BIN_NAME: noders
+  GNU_GLIBC_FLOOR: "2.36"
 
 jobs:
   build-gnu:
-    name: Build GNU release bundle (linux-amd64)
+    name: Build GNU release bundle (linux-amd64, Debian 12)
     runs-on: ubuntu-latest
+    container:
+      image: debian:12
     steps:
+      - name: Install GNU build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake clang libclang-dev llvm-dev zstd
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install GNU build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev llvm-dev
-          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -43,6 +46,13 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Verify GNU glibc requirement
+        run: |
+          max_glibc="$(readelf --version-info "target/x86_64-unknown-linux-gnu/release/${BIN_NAME}" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)"
+          printf 'max required glibc: %s; configured floor: %s\n' "$max_glibc" "$GNU_GLIBC_FLOOR"
+          test -n "$max_glibc"
+          dpkg --compare-versions "$max_glibc" le "$GNU_GLIBC_FLOOR"
 
       - name: Prepare release package
         shell: bash
@@ -63,20 +73,22 @@ jobs:
           if-no-files-found: error
 
   build-arm64-gnu:
-    name: Build GNU release bundle (linux-arm64)
+    name: Build GNU release bundle (linux-arm64, Debian 12)
     runs-on: ubuntu-22.04-arm
+    container:
+      image: debian:12
     steps:
+      - name: Install GNU build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake clang libclang-dev llvm-dev zstd
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install GNU build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev llvm-dev
-          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -92,6 +104,13 @@ jobs:
 
       - name: Build release binary
         run: cargo build --locked --release --target aarch64-unknown-linux-gnu
+
+      - name: Verify GNU glibc requirement
+        run: |
+          max_glibc="$(readelf --version-info "target/aarch64-unknown-linux-gnu/release/${BIN_NAME}" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)"
+          printf 'max required glibc: %s; configured floor: %s\n' "$max_glibc" "$GNU_GLIBC_FLOOR"
+          test -n "$max_glibc"
+          dpkg --compare-versions "$max_glibc" le "$GNU_GLIBC_FLOOR"
 
       - name: Prepare release package
         shell: bash

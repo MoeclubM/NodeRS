@@ -20,7 +20,7 @@ require_linux() {
   fi
 }
 
-GNU_GLIBC_FLOOR="2.17"
+GNU_GLIBC_FLOOR="2.36"
 
 version_at_least() {
   local lhs rhs
