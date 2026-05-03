@@ -67,7 +67,14 @@ pub struct EffectiveNodeConfig {
 impl EffectiveNodeConfig {
     pub fn from_remote(remote: &NodeConfigResponse) -> anyhow::Result<Self> {
         validate_remote_support(remote)?;
-        let mut tls = EffectiveTlsConfig::from_remote(remote)?;
+        let mut tls_remote = remote.clone();
+        if tls_remote.tls_settings.ech.is_enabled() {
+            warn!(
+                "HY2 ignores Xboard tls_settings.ech because the QUIC rustls backend does not enable server ECH"
+            );
+            tls_remote.tls_settings.ech = Default::default();
+        }
+        let mut tls = EffectiveTlsConfig::from_remote(&tls_remote)?;
         tls.alpn = hy2_alpn(remote)?;
         Ok(Self {
             listen_ip: effective_listen_ip(remote),
@@ -1721,11 +1728,6 @@ fn validate_remote_support(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     {
         bail!("HY2 does not support REALITY TLS mode");
     }
-    if remote.tls_settings.ech.is_enabled() {
-        bail!(
-            "HY2 QUIC TLS does not support Xboard tls_settings.ech with the current rustls backend"
-        );
-    }
     let network = remote.network.trim();
     ensure!(
         network.is_empty()
@@ -1913,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hy2_ech_until_quic_backend_supports_it() {
+    fn ignores_hy2_ech_until_quic_backend_supports_it() {
         let remote = NodeConfigResponse {
             tls_settings: NodeTlsSettings {
                 ech: NodeEchSettings {
@@ -1925,8 +1927,8 @@ mod tests {
             ..base_remote()
         };
 
-        let error = EffectiveNodeConfig::from_remote(&remote).expect_err("ech");
-        assert!(error.to_string().contains("tls_settings.ech"));
+        let config = EffectiveNodeConfig::from_remote(&remote).expect("config");
+        assert_eq!(config.tls.ech, None);
     }
 
     #[test]
