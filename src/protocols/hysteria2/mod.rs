@@ -5,10 +5,11 @@ use bytes::{Buf, Bytes};
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, Endpoint, IdleTimeout, UdpPoller, VarInt};
 use rustc_hash::FxHashMap;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IoSliceMut};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -484,12 +485,8 @@ async fn build_endpoint(config: &EffectiveNodeConfig) -> anyhow::Result<Endpoint
     let mut transport_config = quinn::TransportConfig::default();
     configure_hy2_transport(&mut transport_config, config.congestion_control)?;
     server_config.transport_config(Arc::new(transport_config));
-    let bind_addr = hy2_bind_addr(&config.listen_ip, config.server_port)?;
+    let socket = bind_hy2_udp_socket(&config.listen_ip, config.server_port)?;
     if let Some(obfs) = config.obfs.clone() {
-        let socket = std::net::UdpSocket::bind(bind_addr).context("bind HY2 UDP endpoint")?;
-        socket
-            .set_nonblocking(true)
-            .context("set HY2 UDP endpoint nonblocking")?;
         let socket = SalamanderUdpSocket::new(socket, obfs)?;
         return Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
@@ -499,7 +496,13 @@ async fn build_endpoint(config: &EffectiveNodeConfig) -> anyhow::Result<Endpoint
         )
         .context("bind HY2 salamander UDP endpoint");
     }
-    Endpoint::server(server_config, bind_addr).context("bind HY2 UDP endpoint")
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .context("bind HY2 UDP endpoint")
 }
 
 fn configure_hy2_transport(
@@ -525,9 +528,49 @@ fn configure_hy2_transport(
 
 fn hy2_bind_addr(listen_ip: &str, server_port: u16) -> anyhow::Result<SocketAddr> {
     let listen_ip = listen_ip.trim();
-    format!("{listen_ip}:{server_port}")
-        .parse()
-        .with_context(|| format!("parse HY2 listen address {listen_ip}:{server_port}"))
+    if listen_ip.is_empty() || listen_ip == "0.0.0.0" || listen_ip == "::" || listen_ip == "[::]" {
+        return Ok(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            server_port,
+        ));
+    }
+    let listen_ip = listen_ip
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(listen_ip);
+    let ip = listen_ip
+        .parse::<IpAddr>()
+        .with_context(|| format!("parse HY2 listen IP {listen_ip}"))?;
+    Ok(SocketAddr::new(ip, server_port))
+}
+
+fn bind_hy2_udp_socket(listen_ip: &str, server_port: u16) -> anyhow::Result<std::net::UdpSocket> {
+    let bind_addr = hy2_bind_addr(listen_ip, server_port)?;
+    let domain = if bind_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .with_context(|| format!("create HY2 UDP socket for {bind_addr}"))?;
+    socket.set_reuse_address(true).ok();
+    if bind_addr.is_ipv6() {
+        let listen_ip = listen_ip.trim();
+        let only_v6 = !(listen_ip.is_empty()
+            || listen_ip == "0.0.0.0"
+            || listen_ip == "::"
+            || listen_ip == "[::]");
+        socket
+            .set_only_v6(only_v6)
+            .with_context(|| format!("set HY2 IPv6-only UDP mode for {bind_addr}"))?;
+    }
+    socket
+        .bind(&bind_addr.into())
+        .with_context(|| format!("bind HY2 UDP endpoint {bind_addr}"))?;
+    socket
+        .set_nonblocking(true)
+        .with_context(|| format!("set HY2 UDP endpoint {bind_addr} nonblocking"))?;
+    Ok(socket.into())
 }
 
 async fn handle_connection(
@@ -2259,6 +2302,38 @@ mod tests {
         assert_eq!(
             parse_host_port("127.0.0.1:53").expect("ip"),
             SocksAddr::Ip("127.0.0.1:53".parse().expect("addr"))
+        );
+        assert_eq!(
+            parse_host_port("[2001:db8::1]:53").expect("bracketed ipv6"),
+            SocksAddr::Ip("[2001:db8::1]:53".parse().expect("addr"))
+        );
+        assert_eq!(
+            parse_host_port("2001:db8::1:53").expect("plain ipv6"),
+            SocksAddr::Ip("[2001:db8::1]:53".parse().expect("addr"))
+        );
+    }
+
+    #[test]
+    fn parses_hy2_ipv6_listen_addresses() {
+        assert_eq!(
+            hy2_bind_addr("0.0.0.0", 443).expect("wildcard"),
+            "[::]:443".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(
+            hy2_bind_addr("::", 443).expect("ipv6 wildcard"),
+            "[::]:443".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(
+            hy2_bind_addr("[::]", 443).expect("bracketed wildcard"),
+            "[::]:443".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(
+            hy2_bind_addr("2001:db8::1", 443).expect("ipv6"),
+            "[2001:db8::1]:443".parse::<SocketAddr>().expect("addr")
+        );
+        assert_eq!(
+            hy2_bind_addr("[2001:db8::1]", 443).expect("bracketed ipv6"),
+            "[2001:db8::1]:443".parse::<SocketAddr>().expect("addr")
         );
     }
 
