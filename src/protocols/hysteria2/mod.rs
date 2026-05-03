@@ -129,11 +129,13 @@ impl UserValidator {
                 if auth.is_empty() {
                     continue;
                 }
-                ensure!(
-                    by_auth.insert(auth.to_string(), entry.clone()).is_none(),
-                    "duplicate HY2 auth credential for user {}",
-                    user.id
-                );
+                if let Some(existing) = by_auth.insert(auth.to_string(), entry.clone()) {
+                    ensure!(
+                        existing.id == entry.id,
+                        "duplicate HY2 auth credential for user {}",
+                        user.id
+                    );
+                }
             }
         }
         ensure!(!by_auth.is_empty(), "HY2 users require password or uuid");
@@ -2270,5 +2272,18 @@ mod tests {
 
         assert_eq!(validator.get("uuid-auth").map(|user| user.id), Some(1));
         assert_eq!(validator.get("pass-auth").map(|user| user.id), Some(1));
+    }
+
+    #[test]
+    fn accepts_same_hy2_password_and_uuid_for_one_user() {
+        let validator = UserValidator::from_users(&[PanelUser {
+            id: 1,
+            uuid: "same-auth".to_string(),
+            password: "same-auth".to_string(),
+            ..Default::default()
+        }])
+        .expect("validator");
+
+        assert_eq!(validator.get("same-auth").map(|user| user.id), Some(1));
     }
 }
