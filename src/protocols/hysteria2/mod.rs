@@ -277,6 +277,7 @@ impl AsyncUdpSocket for SalamanderUdpSocket {
 }
 
 type IoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
+type Hy2H3Connection = h3::server::Connection<h3_quinn::Connection, Bytes>;
 
 struct SalamanderUdpPoller {
     socket: Arc<SalamanderUdpSocket>,
@@ -530,7 +531,7 @@ async fn handle_connection(
     udp_enabled: bool,
     masquerade: MasqueradeConfig,
 ) -> anyhow::Result<()> {
-    let Some((user, lease)) = authenticate_connection(
+    let Some((user, lease, _h3_connection)) = authenticate_connection(
         &connection,
         accounting.clone(),
         users,
@@ -543,6 +544,8 @@ async fn handle_connection(
     else {
         return Ok(());
     };
+    // The h3 server connection sends H3_NO_ERROR from Drop. Keep it alive for the
+    // whole proxy connection so clients can open HY2 TCP streams after /auth.
     let control = lease.control();
     if udp_enabled {
         let sessions = Arc::new(AsyncMutex::new(FxHashMap::default()));
@@ -594,7 +597,7 @@ async fn authenticate_connection(
     auth_timeout: Duration,
     udp_enabled: bool,
     masquerade: MasqueradeConfig,
-) -> anyhow::Result<Option<(UserEntry, SessionLease)>> {
+) -> anyhow::Result<Option<(UserEntry, SessionLease, Hy2H3Connection)>> {
     let h3_connection = h3_quinn::Connection::new(connection.clone());
     let mut h3 = h3::server::builder()
         .build(h3_connection)
@@ -656,7 +659,7 @@ async fn authenticate_connection(
             .await
             .context("send HY2 auth response")?;
         stream.finish().await.context("finish HY2 auth stream")?;
-        return Ok(Some((user, lease)));
+        return Ok(Some((user, lease, h3)));
     }
 }
 
@@ -1115,17 +1118,13 @@ async fn reassemble_udp_message(
         message.fragment_count > 0,
         "HY2 UDP fragment_count must be positive"
     );
+    if message.fragment_count == 1 {
+        return Ok(Some(message));
+    }
     ensure!(
         message.fragment_id < message.fragment_count,
         "HY2 UDP fragment_id must be less than fragment_count"
     );
-    if message.fragment_count == 1 {
-        ensure!(
-            message.fragment_id == 0,
-            "HY2 UDP unfragmented packet must use fragment_id 0"
-        );
-        return Ok(Some(message));
-    }
 
     let key = (message.session_id, message.packet_id);
     let mut guard = fragments.lock().await;
@@ -2137,6 +2136,36 @@ mod tests {
             .expect("complete message");
 
         assert_eq!(result.fragment_count, 1);
+        assert_eq!(result.payload, b"hello");
+    }
+
+    #[test]
+    fn accepts_unfragmented_hy2_udp_with_nonzero_fragment_id() {
+        let fragments = Arc::new(AsyncMutex::new(FxHashMap::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(async {
+                reassemble_udp_message(
+                    UdpMessage {
+                        session_id: 7,
+                        packet_id: 9,
+                        fragment_id: 3,
+                        fragment_count: 1,
+                        address: "example.com:53".to_string(),
+                        payload: b"hello".to_vec(),
+                    },
+                    &fragments,
+                )
+                .await
+            })
+            .expect("unfragmented packet")
+            .expect("message");
+
+        assert_eq!(result.fragment_id, 3);
         assert_eq!(result.payload, b"hello");
     }
 
