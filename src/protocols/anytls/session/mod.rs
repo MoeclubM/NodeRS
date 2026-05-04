@@ -3,12 +3,12 @@ mod frame;
 mod io;
 mod writer;
 
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, anyhow, bail};
 use rustc_hash::FxHashMap;
 use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf, ReadHalf, split};
@@ -120,7 +120,6 @@ struct Session {
 struct SessionState {
     received_settings: AtomicBool,
     peer_version: AtomicU8,
-    next_client_stream_id: AtomicU32,
     streams: RwLock<FxHashMap<u32, StreamState>>,
 }
 
@@ -129,7 +128,6 @@ impl Default for SessionState {
         Self {
             received_settings: AtomicBool::new(false),
             peer_version: AtomicU8::new(0),
-            next_client_stream_id: AtomicU32::new(1),
             streams: RwLock::new(FxHashMap::default()),
         }
     }
@@ -196,7 +194,7 @@ impl Session {
             match header.cmd {
                 CMD_PSH => self.handle_psh(header).await?,
                 CMD_SYN => self.handle_syn(header.stream_id).await?,
-                CMD_FIN => self.handle_fin(header.stream_id).await?,
+                CMD_FIN => self.handle_fin(header.stream_id).await,
                 CMD_WASTE => self.discard(header.length as usize).await?,
                 CMD_SETTINGS => self.handle_settings(header.length as usize).await?,
                 CMD_ALERT => self.handle_alert(header.length as usize).await?,
@@ -205,29 +203,14 @@ impl Session {
                         .await?
                 }
                 CMD_HEART_RESPONSE => {}
-                CMD_UPDATE_PADDING_SCHEME => {
-                    self.write_frame(
-                        CMD_ALERT,
-                        0,
-                        b"client sent server-only UPDATE_PADDING_SCHEME",
-                    )
-                    .await?;
-                    bail!("AnyTLS client sent server-only UPDATE_PADDING_SCHEME")
-                }
-                CMD_SERVER_SETTINGS => {
-                    self.write_frame(CMD_ALERT, 0, b"client sent server-only SERVER_SETTINGS")
-                        .await?;
-                    bail!("AnyTLS client sent server-only SERVER_SETTINGS")
-                }
-                CMD_SYNACK => {
-                    self.write_frame(CMD_ALERT, 0, b"client sent server-only SYNACK")
-                        .await?;
-                    bail!("AnyTLS client sent server-only SYNACK")
-                }
+                CMD_UPDATE_PADDING_SCHEME => self.discard(header.length as usize).await?,
+                CMD_SERVER_SETTINGS => self.discard(header.length as usize).await?,
+                CMD_SYNACK => self.discard(header.length as usize).await?,
                 other => {
-                    let alert = format!("unknown session command: {other}");
-                    self.write_frame(CMD_ALERT, 0, alert.as_bytes()).await?;
-                    bail!(alert);
+                    warn!(cmd = other, user = %self.user.uuid, "unknown session command ignored");
+                    if header.length > 0 {
+                        self.discard(header.length as usize).await?;
+                    }
                 }
             }
         };
@@ -244,31 +227,18 @@ impl Session {
     }
 
     async fn handle_psh(&mut self, header: FrameHeader) -> anyhow::Result<()> {
-        if header.stream_id == 0 {
-            self.write_frame(
-                CMD_ALERT,
-                0,
-                b"PSH stream_id 0 is reserved for control frames",
-            )
-            .await?;
-            bail!("AnyTLS client sent PSH on control stream")
-        }
+        let mut payload = self.payload_pool.take(header.length as usize);
+        read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
+
         let inbound = {
             let streams = self.state.streams.read().expect("streams lock poisoned");
             streams
                 .get(&header.stream_id)
                 .and_then(|stream| stream.inbound.clone())
         };
-        let Some(inbound) = inbound else {
-            let alert = format!("PSH for unknown stream {}", header.stream_id);
-            self.write_frame(CMD_ALERT, 0, alert.as_bytes()).await?;
-            bail!(alert);
-        };
-
-        let mut payload = self.payload_pool.take(header.length as usize);
-        read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
-
-        if let Err(error) = self.forward_inbound_payload(inbound, payload).await {
+        if let Some(inbound) = inbound
+            && let Err(error) = self.forward_inbound_payload(inbound, payload).await
+        {
             debug!(
                 stream_id = header.stream_id,
                 user = %self.user.uuid,
@@ -281,15 +251,6 @@ impl Session {
     }
 
     async fn handle_syn(&self, stream_id: u32) -> anyhow::Result<()> {
-        if stream_id == 0 {
-            self.write_frame(
-                CMD_ALERT,
-                0,
-                b"SYN stream_id 0 is reserved for control frames",
-            )
-            .await?;
-            bail!("AnyTLS client sent SYN on control stream")
-        }
         let received_settings = self.state.received_settings.load(Ordering::Relaxed);
         let peer_version = self.state.peer_version.load(Ordering::Relaxed);
         if !received_settings {
@@ -304,17 +265,8 @@ impl Session {
                 streams.len() >= MAX_STREAMS_PER_SESSION,
             )
         };
-        let expected_stream_id = self.state.next_client_stream_id.load(Ordering::Relaxed);
-        if stream_id != expected_stream_id {
-            let alert =
-                format!("unexpected stream id: expected {expected_stream_id}, got {stream_id}");
-            self.write_frame(CMD_ALERT, 0, alert.as_bytes()).await?;
-            bail!(alert);
-        }
         if stream_gate.0 {
-            let alert = format!("reused stream id: {stream_id}");
-            self.write_frame(CMD_ALERT, 0, alert.as_bytes()).await?;
-            bail!(alert);
+            return Ok(());
         }
         if stream_gate.1 {
             let error = format!("too many concurrent streams: limit={MAX_STREAMS_PER_SESSION}");
@@ -373,29 +325,11 @@ impl Session {
                     task,
                 },
             );
-        self.state.next_client_stream_id.store(
-            stream_id.checked_add(1).context("stream id exhausted")?,
-            Ordering::Relaxed,
-        );
         Ok(())
     }
 
-    async fn handle_fin(&self, stream_id: u32) -> anyhow::Result<()> {
-        if stream_id == 0 {
-            self.write_frame(
-                CMD_ALERT,
-                0,
-                b"FIN stream_id 0 is reserved for control frames",
-            )
-            .await?;
-            bail!("AnyTLS client sent FIN on control stream")
-        }
-        if !close_peer_stream(&self.state, stream_id) {
-            let alert = format!("FIN for unknown stream {stream_id}");
-            self.write_frame(CMD_ALERT, 0, alert.as_bytes()).await?;
-            bail!(alert);
-        }
-        Ok(())
+    async fn handle_fin(&self, stream_id: u32) {
+        close_peer_stream(&self.state, stream_id);
     }
 
     async fn drop_stream(&self, stream_id: u32) {
@@ -407,24 +341,30 @@ impl Session {
     }
 
     async fn handle_settings(&mut self, length: usize) -> anyhow::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
         let mut bytes = vec![0u8; length];
         self.reader
             .read_exact(&mut bytes)
             .await
             .context("read settings frame")?;
         let settings = parse_settings(&bytes);
-        let peer_version = match validate_settings(&settings, &self.padding) {
-            Ok(peer_version) => peer_version,
-            Err(error) => {
-                let alert = error.to_string();
-                self.write_frame(CMD_ALERT, 0, alert.as_bytes()).await?;
-                return Err(error.context("invalid AnyTLS settings"));
-            }
-        };
         self.state.received_settings.store(true, Ordering::Relaxed);
+        let peer_version = negotiated_peer_version(&settings);
         self.state
             .peer_version
             .store(peer_version, Ordering::Relaxed);
+
+        let expected_padding_md5 = padding_md5(self.padding.raw_lines());
+        if settings.get("padding-md5") != Some(&expected_padding_md5) {
+            self.write_frame(
+                CMD_UPDATE_PADDING_SCHEME,
+                0,
+                self.padding.raw_lines().join("\n").as_bytes(),
+            )
+            .await?;
+        }
         if peer_supports_v2(peer_version) {
             self.write_frame(CMD_SERVER_SETTINGS, 0, b"v=2").await?;
         }
@@ -594,51 +534,26 @@ fn take_stream(state: &SessionState, stream_id: u32) -> Option<StreamState> {
         .remove(&stream_id)
 }
 
-fn close_peer_stream(state: &SessionState, stream_id: u32) -> bool {
+fn close_peer_stream(state: &SessionState, stream_id: u32) {
     // sing-anytls treats peer FIN as a full stream close instead of a half-close.
     if let Some(stream) = take_stream(state, stream_id) {
         stream.task.abort();
-        return true;
     }
-    false
+}
+
+fn negotiated_peer_version(settings: &std::collections::HashMap<String, String>) -> u8 {
+    match settings
+        .get("v")
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        Some(version) if version >= 2 => 2,
+        Some(1) => 1,
+        _ => 0,
+    }
 }
 
 fn peer_supports_v2(peer_version: u8) -> bool {
     peer_version >= 2
-}
-
-fn validate_settings(
-    settings: &std::collections::HashMap<String, String>,
-    padding: &PaddingScheme,
-) -> anyhow::Result<u8> {
-    ensure!(!settings.is_empty(), "AnyTLS settings must not be empty");
-    ensure!(
-        settings.get("v").map(String::as_str) == Some("2"),
-        "AnyTLS settings must contain v=2"
-    );
-    let client = settings
-        .get("client")
-        .ok_or_else(|| anyhow!("AnyTLS settings missing client"))?;
-    ensure!(
-        !client.trim().is_empty(),
-        "AnyTLS settings client must not be empty"
-    );
-    let peer_padding_md5 = settings
-        .get("padding-md5")
-        .ok_or_else(|| anyhow!("AnyTLS settings missing padding-md5"))?;
-    ensure!(
-        peer_padding_md5.len() == 32
-            && peer_padding_md5
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit()),
-        "AnyTLS settings padding-md5 must be 32 hex characters"
-    );
-    let expected_padding_md5 = padding_md5(padding.raw_lines());
-    ensure!(
-        peer_padding_md5.eq_ignore_ascii_case(&expected_padding_md5),
-        "AnyTLS settings padding-md5 mismatch"
-    );
-    Ok(2)
 }
 
 async fn handle_stream(
@@ -883,7 +798,7 @@ mod tests {
     };
     use super::frame::{
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
-        padding_md5, parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
+        parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
@@ -891,11 +806,10 @@ mod tests {
     };
     use super::{
         SessionState, StreamState, close_peer_stream, forward_buffered_inbound_payload,
-        forward_inbound_payload_to_channel, prefetch_remote_download_with_grace,
-        read_exact_payload, validate_settings,
+        forward_inbound_payload_to_channel, negotiated_peer_version,
+        prefetch_remote_download_with_grace, read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
-    use crate::protocols::anytls::padding::PaddingScheme;
     use crate::protocols::shared::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
     use std::io::IoSlice;
@@ -1087,66 +1001,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_complete_strict_settings() {
-        let padding = PaddingScheme::default();
-        let settings = parse_settings(
-            format!(
-                "v=2\nclient=test-client\npadding-md5={}",
-                padding_md5(padding.raw_lines())
-            )
-            .as_bytes(),
-        );
-
-        assert_eq!(
-            validate_settings(&settings, &padding).expect("valid settings"),
-            2
-        );
-    }
-
-    #[test]
-    fn rejects_incomplete_or_mismatched_settings() {
-        let padding = PaddingScheme::default();
-        assert!(validate_settings(&parse_settings(b""), &padding).is_err());
-        assert!(
-            validate_settings(
-                &parse_settings(
-                    format!(
-                        "v=1\nclient=test\npadding-md5={}",
-                        padding_md5(padding.raw_lines())
-                    )
-                    .as_bytes()
-                ),
-                &padding
-            )
-            .is_err()
-        );
-        assert!(
-            validate_settings(
-                &parse_settings(
-                    format!(
-                        "v=2\nclient=\npadding-md5={}",
-                        padding_md5(padding.raw_lines())
-                    )
-                    .as_bytes()
-                ),
-                &padding
-            )
-            .is_err()
-        );
-        assert!(
-            validate_settings(
-                &parse_settings(b"v=2\nclient=test\npadding-md5=not-md5"),
-                &padding
-            )
-            .is_err()
-        );
-        assert!(
-            validate_settings(
-                &parse_settings(b"v=2\nclient=test\npadding-md5=00000000000000000000000000000000"),
-                &padding
-            )
-            .is_err()
-        );
+    fn negotiates_anytls_v2_for_current_and_future_versions() {
+        assert_eq!(negotiated_peer_version(&parse_settings(b"v=1")), 1);
+        assert_eq!(negotiated_peer_version(&parse_settings(b"v=2")), 2);
+        assert_eq!(negotiated_peer_version(&parse_settings(b"v=300")), 2);
+        assert_eq!(negotiated_peer_version(&parse_settings(b"client=test")), 0);
     }
 
     #[test]
