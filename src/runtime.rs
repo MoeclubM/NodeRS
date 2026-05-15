@@ -217,7 +217,7 @@ impl MachineRuntime {
             );
             return self.refresh_machine_nodes().await;
         };
-        node.replace_users(&users)
+        node.replace_users(&users).await
     }
 
     pub(crate) async fn refresh_node_users(&self, node_id: i64) -> anyhow::Result<()> {
@@ -468,6 +468,10 @@ impl ManagedNode {
                     break;
                 }
 
+                if let Err(error) = report_node.flush_protocol_traffic().await {
+                    warn!(node_id = report_node.node_id, %error, "protocol traffic snapshot failed");
+                }
+
                 let traffic = report_node
                     .accounting
                     .snapshot_traffic(DEFAULT_MIN_TRAFFIC_BYTES);
@@ -496,7 +500,7 @@ impl ManagedNode {
                     }
                 }
 
-                let alive = report_node.accounting.snapshot_alive();
+                let alive = report_node.snapshot_alive().await;
                 if let Err(error) = report_node.panel.report_alive(alive).await {
                     warn!(node_id = report_node.node_id, %error, "alive report failed");
                 }
@@ -552,7 +556,7 @@ impl ManagedNode {
         };
 
         if let Some(users) = response {
-            self.replace_users(&users)?;
+            self.replace_users(&users).await?;
         }
 
         Ok(())
@@ -588,6 +592,21 @@ impl ManagedNode {
         self.controller.refresh_runtime_assets().await
     }
 
+    async fn flush_protocol_traffic(&self) -> anyhow::Result<()> {
+        self.controller.flush_traffic().await
+    }
+
+    async fn snapshot_alive(&self) -> HashMap<i64, Vec<String>> {
+        match self.controller.snapshot_alive().await {
+            Ok(Some(alive)) => alive,
+            Ok(None) => self.accounting.snapshot_alive(),
+            Err(error) => {
+                warn!(node_id = self.node_id, %error, "protocol alive snapshot failed");
+                self.accounting.snapshot_alive()
+            }
+        }
+    }
+
     async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         let handles = {
@@ -598,13 +617,13 @@ impl ManagedNode {
             handle.abort();
         }
 
-        let _ = self.replace_users(&[]);
+        let _ = self.replace_users(&[]).await;
         self.accounting.set_external_alive_counts(&HashMap::new());
         self.controller.shutdown().await;
     }
 
-    fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
-        self.controller.replace_users(users)
+    async fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
+        self.controller.replace_users(users).await
     }
 
     fn protocol(&self) -> ProtocolKind {

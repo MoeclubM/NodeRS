@@ -1,12 +1,8 @@
-pub mod anytls;
-pub mod hysteria2;
-pub mod mieru;
+pub mod aerion;
 pub mod shadowsocks;
 pub(crate) mod shared;
-pub mod trojan;
-pub mod vless;
-pub mod vmess;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::accounting::Accounting;
@@ -19,6 +15,7 @@ pub enum ProtocolKind {
     Mieru,
     Shadowsocks,
     Trojan,
+    Tuic,
     Vless,
     Vmess,
 }
@@ -45,6 +42,8 @@ impl ProtocolKind {
             Some(Self::Shadowsocks)
         } else if normalized == "trojan" {
             Some(Self::Trojan)
+        } else if normalized == "tuic" {
+            Some(Self::Tuic)
         } else if normalized == "vless" {
             Some(Self::Vless)
         } else if normalized == "vmess" {
@@ -61,6 +60,7 @@ impl ProtocolKind {
             Self::Mieru => "mieru",
             Self::Shadowsocks => "shadowsocks",
             Self::Trojan => "trojan",
+            Self::Tuic => "tuic",
             Self::Vless => "vless",
             Self::Vmess => "vmess",
         }
@@ -76,6 +76,7 @@ mod tests {
         assert_eq!(ProtocolKind::parse("mieru"), Some(ProtocolKind::Mieru));
         assert_eq!(ProtocolKind::parse("hy2"), Some(ProtocolKind::Hysteria2));
         assert_eq!(ProtocolKind::parse("ss"), Some(ProtocolKind::Shadowsocks));
+        assert_eq!(ProtocolKind::parse("tuic"), Some(ProtocolKind::Tuic));
         assert_eq!(
             ProtocolKind::parse("shadowsocks-2022"),
             Some(ProtocolKind::Shadowsocks)
@@ -88,76 +89,40 @@ mod tests {
 }
 
 pub enum ProtocolController {
-    Anytls(Arc<anytls::ServerController>),
-    Hysteria2(Arc<hysteria2::ServerController>),
-    Mieru(Arc<mieru::ServerController>),
+    Aerion(Arc<aerion::ServerController>),
     Shadowsocks(Arc<shadowsocks::ServerController>),
-    Trojan(Arc<trojan::ServerController>),
-    Vless(Arc<vless::ServerController>),
-    Vmess(Arc<vmess::ServerController>),
 }
 
 impl ProtocolController {
     pub fn new(protocol: ProtocolKind, accounting: Arc<Accounting>) -> Self {
         match protocol {
-            ProtocolKind::Anytls => {
-                Self::Anytls(Arc::new(anytls::ServerController::new(accounting)))
-            }
-            ProtocolKind::Hysteria2 => {
-                Self::Hysteria2(Arc::new(hysteria2::ServerController::new(accounting)))
-            }
-            ProtocolKind::Mieru => Self::Mieru(Arc::new(mieru::ServerController::new(accounting))),
             ProtocolKind::Shadowsocks => {
                 Self::Shadowsocks(Arc::new(shadowsocks::ServerController::new(accounting)))
             }
-            ProtocolKind::Trojan => {
-                Self::Trojan(Arc::new(trojan::ServerController::new(accounting)))
-            }
-            ProtocolKind::Vless => Self::Vless(Arc::new(vless::ServerController::new(accounting))),
-            ProtocolKind::Vmess => Self::Vmess(Arc::new(vmess::ServerController::new(accounting))),
+            ProtocolKind::Anytls
+            | ProtocolKind::Hysteria2
+            | ProtocolKind::Mieru
+            | ProtocolKind::Trojan
+            | ProtocolKind::Tuic
+            | ProtocolKind::Vless
+            | ProtocolKind::Vmess => Self::Aerion(Arc::new(aerion::ServerController::new(
+                protocol, accounting,
+            ))),
         }
     }
 
     pub fn kind(&self) -> ProtocolKind {
         match self {
-            Self::Anytls(_) => ProtocolKind::Anytls,
-            Self::Hysteria2(_) => ProtocolKind::Hysteria2,
-            Self::Mieru(_) => ProtocolKind::Mieru,
+            Self::Aerion(server) => server.protocol(),
             Self::Shadowsocks(_) => ProtocolKind::Shadowsocks,
-            Self::Trojan(_) => ProtocolKind::Trojan,
-            Self::Vless(_) => ProtocolKind::Vless,
-            Self::Vmess(_) => ProtocolKind::Vmess,
         }
     }
 
     pub async fn apply_remote_config(&self, remote: &NodeConfigResponse) -> anyhow::Result<()> {
         match self {
-            Self::Anytls(server) => {
-                let effective = anytls::EffectiveNodeConfig::from_remote(remote)?;
-                server.apply_config(effective).await
-            }
-            Self::Hysteria2(server) => {
-                let effective = hysteria2::EffectiveNodeConfig::from_remote(remote)?;
-                server.apply_config(effective).await
-            }
-            Self::Mieru(server) => {
-                let effective = mieru::EffectiveNodeConfig::from_remote(remote)?;
-                server.apply_config(effective).await
-            }
+            Self::Aerion(server) => server.apply_remote_config(remote).await,
             Self::Shadowsocks(server) => {
                 let effective = shadowsocks::EffectiveNodeConfig::from_remote(remote)?;
-                server.apply_config(effective).await
-            }
-            Self::Trojan(server) => {
-                let effective = trojan::EffectiveNodeConfig::from_remote(remote)?;
-                server.apply_config(effective).await
-            }
-            Self::Vless(server) => {
-                let effective = vless::EffectiveNodeConfig::from_remote(remote)?;
-                server.apply_config(effective).await
-            }
-            Self::Vmess(server) => {
-                let effective = vmess::EffectiveNodeConfig::from_remote(remote)?;
                 server.apply_config(effective).await
             }
         }
@@ -165,37 +130,36 @@ impl ProtocolController {
 
     pub async fn refresh_runtime_assets(&self) -> anyhow::Result<()> {
         match self {
-            Self::Anytls(server) => server.refresh_tls().await,
-            Self::Hysteria2(server) => server.refresh_runtime_assets().await,
-            Self::Mieru(server) => server.refresh_runtime_assets().await,
+            Self::Aerion(server) => server.refresh_runtime_assets().await,
             Self::Shadowsocks(server) => server.refresh_runtime_assets().await,
-            Self::Trojan(server) => server.refresh_tls().await,
-            Self::Vless(server) => server.refresh_tls().await,
-            Self::Vmess(server) => server.refresh_runtime_assets().await,
         }
     }
 
-    pub fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
+    pub async fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
         match self {
-            Self::Anytls(server) => server.replace_users(users),
-            Self::Hysteria2(server) => server.replace_users(users),
-            Self::Mieru(server) => server.replace_users(users),
+            Self::Aerion(server) => server.replace_users(users).await,
             Self::Shadowsocks(server) => server.replace_users(users),
-            Self::Trojan(server) => server.replace_users(users),
-            Self::Vless(server) => server.replace_users(users),
-            Self::Vmess(server) => server.replace_users(users),
+        }
+    }
+
+    pub async fn flush_traffic(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Aerion(server) => server.flush_traffic().await,
+            Self::Shadowsocks(_) => Ok(()),
+        }
+    }
+
+    pub async fn snapshot_alive(&self) -> anyhow::Result<Option<HashMap<i64, Vec<String>>>> {
+        match self {
+            Self::Aerion(server) => server.snapshot_alive().await.map(Some),
+            Self::Shadowsocks(_) => Ok(None),
         }
     }
 
     pub async fn shutdown(&self) {
         match self {
-            Self::Anytls(server) => server.shutdown().await,
-            Self::Hysteria2(server) => server.shutdown().await,
-            Self::Mieru(server) => server.shutdown().await,
+            Self::Aerion(server) => server.shutdown().await,
             Self::Shadowsocks(server) => server.shutdown().await,
-            Self::Trojan(server) => server.shutdown().await,
-            Self::Vless(server) => server.shutdown().await,
-            Self::Vmess(server) => server.shutdown().await,
         }
     }
 }

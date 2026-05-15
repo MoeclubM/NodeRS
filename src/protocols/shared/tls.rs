@@ -144,6 +144,49 @@ pub async fn load_rustls_server_config(
     Ok(config)
 }
 
+pub(crate) async fn materialize_tls_files(
+    source: &TlsMaterialSource,
+    label: &str,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    match source {
+        TlsMaterialSource::Files {
+            cert_path,
+            key_path,
+        } => Ok((cert_path.clone(), key_path.clone())),
+        TlsMaterialSource::Acme {
+            cert_path,
+            key_path,
+            config,
+        } => {
+            acme::ensure_certificate(config, cert_path, key_path)
+                .await
+                .context("ensure ACME certificate")?;
+            Ok((cert_path.clone(), key_path.clone()))
+        }
+        TlsMaterialSource::Inline { .. } | TlsMaterialSource::SelfSigned { .. } => {
+            let (cert_pem, key_pem) = load_source_materials(source).await?;
+            let mut hasher = Sha256::new();
+            hasher.update(label.as_bytes());
+            hasher.update(&cert_pem);
+            hasher.update(&key_pem);
+            let digest = hex::encode(hasher.finalize());
+            let dir = std::env::temp_dir().join("noders-aerion-tls");
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .with_context(|| format!("create Aerion TLS material dir {}", dir.display()))?;
+            let cert_path = dir.join(format!("{digest}-cert.pem"));
+            let key_path = dir.join(format!("{digest}-key.pem"));
+            tokio::fs::write(&cert_path, cert_pem)
+                .await
+                .with_context(|| format!("write Aerion certificate PEM {}", cert_path.display()))?;
+            tokio::fs::write(&key_path, key_pem)
+                .await
+                .with_context(|| format!("write Aerion private key PEM {}", key_path.display()))?;
+            Ok((cert_path, key_path))
+        }
+    }
+}
+
 pub async fn reload_if_changed(
     materials: &mut LoadedTlsMaterials,
 ) -> anyhow::Result<Option<Arc<SslAcceptor>>> {
