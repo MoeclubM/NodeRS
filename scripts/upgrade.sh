@@ -280,6 +280,145 @@ legacy_layout_detected() {
   return 1
 }
 
+read_legacy_config_value() {
+  local config_path field
+  config_path="$1"
+  field="$2"
+  sed -n "s/^[[:space:]]*${field}[[:space:]]*=[[:space:]]*\"\\(.*\\)\"[[:space:]]*$/\\1/p" "$config_path" | head -n1
+}
+
+read_legacy_config_machine_id() {
+  local config_path
+  config_path="$1"
+  sed -n 's/^[[:space:]]*machine_id[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$config_path" | head -n1
+}
+
+migrate_legacy_configs() {
+  MIGRATED_LEGACY_INSTANCES=()
+
+  local config_path file_name machine_id panel_api instance_id target_path
+  [[ -d "${CONFIG_DIR%/}/machines" ]] || return 0
+
+  shopt -s nullglob
+  for config_path in "${CONFIG_DIR%/}/machines/"*.toml; do
+    [[ -f "$config_path" ]] || continue
+    file_name="$(basename "$config_path")"
+    [[ "$file_name" =~ ^[0-9]+\.toml$ ]] || continue
+    machine_id="${file_name%.toml}"
+    panel_api="$(read_legacy_config_value "$config_path" api)"
+    [[ -n "$panel_api" ]] || {
+      echo "Legacy config $config_path does not contain panel.api; cannot migrate automatically." >&2
+      exit 1
+    }
+    if [[ -z "$(read_legacy_config_machine_id "$config_path")" ]]; then
+      echo "Legacy config $config_path does not contain panel.machine_id; cannot migrate automatically." >&2
+      exit 1
+    fi
+    instance_id="$(machine_instance_id "$panel_api" "$machine_id")"
+    target_path="$(node_config_path "$instance_id")"
+    if [[ "$target_path" != "$config_path" ]]; then
+      if [[ -e "$target_path" ]]; then
+        rm -f "$config_path"
+      else
+        mv "$config_path" "$target_path"
+      fi
+    fi
+    MIGRATED_LEGACY_INSTANCES+=("$instance_id")
+  done
+  shopt -u nullglob
+}
+
+migrate_legacy_systemd_units() {
+  [[ "$(id -u)" -eq 0 ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  compgen -G "/etc/systemd/system/${LEGACY_SERVICE_NAME}*.service" >/dev/null || compgen -G "/etc/systemd/system/${SERVICE_NAME}-[0-9]*.service" >/dev/null || return 0
+
+  local instance_id unit_path config_path unit_name legacy_path
+  for instance_id in "${MIGRATED_LEGACY_INSTANCES[@]}"; do
+    config_path="$(node_config_path "$instance_id")"
+    [[ -f "$config_path" ]] || continue
+    unit_path="/etc/systemd/system/${SERVICE_NAME}-${instance_id}.service"
+    cat > "$unit_path" <<EOF
+[Unit]
+Description=NodeRS service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${OPENRC_SERVICE_USER}
+Group=${OPENRC_SERVICE_GROUP}
+WorkingDirectory=${STATE_DIR}
+ExecStart=$(runtime_binary_path) ${config_path}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  done
+
+  shopt -s nullglob
+  for legacy_path in \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service \
+    /etc/systemd/system/${SERVICE_NAME}-[0-9]*.service; do
+    [[ -f "$legacy_path" ]] || continue
+    unit_name="$(basename "$legacy_path" .service)"
+    if [[ "$unit_name" == "$LEGACY_SERVICE_NAME" || "$unit_name" == "$LEGACY_SERVICE_NAME"-* || "$unit_name" =~ ^${SERVICE_NAME}-[0-9]+$ ]]; then
+      systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
+      rm -f "$legacy_path"
+    fi
+  done
+  shopt -u nullglob
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+migrate_legacy_openrc_units() {
+  [[ "$(id -u)" -eq 0 ]] || return 0
+  command -v rc-service >/dev/null 2>&1 || return 0
+  compgen -G "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}*" >/dev/null || compgen -G "${OPENRC_DIR%/}/${SERVICE_NAME}-[0-9]*" >/dev/null || return 0
+
+  discover_openrc_service_account
+
+  local instance_id config_path service_path legacy_path unit_name
+  for instance_id in "${MIGRATED_LEGACY_INSTANCES[@]}"; do
+    config_path="$(node_config_path "$instance_id")"
+    [[ -f "$config_path" ]] || continue
+    service_path="${OPENRC_DIR%/}/${SERVICE_NAME}-${instance_id}"
+    render_openrc_service_file "$service_path" "$instance_id" "$config_path" "$OPENRC_SERVICE_USER" "$OPENRC_SERVICE_GROUP"
+    rc-update add "${SERVICE_NAME}-${instance_id}" default >/dev/null 2>&1 || true
+  done
+
+  shopt -s nullglob
+  for legacy_path in \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}" \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-"* \
+    "${OPENRC_DIR%/}/${SERVICE_NAME}-"[0-9]*; do
+    [[ -f "$legacy_path" ]] || continue
+    unit_name="$(basename "$legacy_path")"
+    if [[ "$unit_name" == "$LEGACY_SERVICE_NAME" || "$unit_name" == "$LEGACY_SERVICE_NAME"-* || "$unit_name" =~ ^${SERVICE_NAME}-[0-9]+$ ]]; then
+      rc-service "$unit_name" stop >/dev/null 2>&1 || true
+      rc-update del "$unit_name" default >/dev/null 2>&1 || true
+      rm -f "$legacy_path"
+    fi
+  done
+  shopt -u nullglob
+}
+
+migrate_legacy_layout() {
+  migrate_legacy_configs
+  if [[ -x "$PREFIX/bin/${SERVICE_NAME}-anytls" || ${#MIGRATED_LEGACY_INSTANCES[@]} -gt 0 ]]; then
+    echo "Migrating legacy noders-anytls layout to current noders runtime layout."
+    migrate_legacy_systemd_units
+    migrate_legacy_openrc_units
+  fi
+}
+
 discover_units() {
   DISCOVERED_UNITS=()
 
@@ -612,9 +751,7 @@ main() {
 
   ensure_existing_installation
   if legacy_layout_detected; then
-    echo "Legacy noders-anytls install layout detected." >&2
-    echo "Back up $CONFIG_DIR and your existing state directory, then reinstall with scripts/install.sh or scripts/install-openrc.sh." >&2
-    exit 1
+    migrate_legacy_layout
   fi
   discover_units
   refresh_systemd_unit_files

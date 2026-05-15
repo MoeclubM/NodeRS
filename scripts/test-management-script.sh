@@ -178,8 +178,8 @@ test_management_script_filters_invalid_units() (
   assert_equals "$expected" "$actual" "management script passed unexpected unit arguments to systemctl"
 )
 
-test_upgrade_rejects_legacy_layout() (
-  local tmp_root bundle_root stderr_path stdout_path upgrade_path expected_hint
+test_upgrade_migrates_legacy_layout() (
+  local tmp_root bundle_root stderr_path stdout_path upgrade_path expected_instance
 
   tmp_root="$(mktemp -d)"
   cleanup_upgrade_test() {
@@ -194,7 +194,13 @@ test_upgrade_rejects_legacy_layout() (
   install -d "$PREFIX/bin" "$CONFIG_DIR/machines" "$STATE_DIR" "$OPENRC_DIR"
   : > "$PREFIX/bin/noders-anytls"
   chmod 0755 "$PREFIX/bin/noders-anytls"
-  : > "$CONFIG_DIR/machines/3.toml"
+  cat > "$CONFIG_DIR/machines/3.toml" <<'EOF'
+[panel]
+api = "https://panel.example.com/"
+key = "machine-key"
+machine_id = 3
+EOF
+  expected_instance="$(machine_instance_id "https://panel.example.com/" 3)"
 
   bundle_root="$tmp_root/bundle"
   prepare_fake_release_bundle "$bundle_root"
@@ -202,14 +208,29 @@ test_upgrade_rejects_legacy_layout() (
   stdout_path="$tmp_root/stdout"
   stderr_path="$tmp_root/stderr"
   upgrade_path="$bundle_root/upgrade.sh"
-  if bash "$upgrade_path" --prefix "$PREFIX" --config-dir "$CONFIG_DIR" >"$stdout_path" 2>"$stderr_path"; then
-    echo "upgrade.sh unexpectedly accepted a legacy noders-anytls layout" >&2
+  if ! bash "$upgrade_path" --prefix "$PREFIX" --config-dir "$CONFIG_DIR" --no-restart >"$stdout_path" 2>"$stderr_path"; then
+    echo "upgrade.sh failed to migrate a legacy noders-anytls layout" >&2
+    cat "$stderr_path" >&2
     exit 1
   fi
 
-  expected_hint="Back up $CONFIG_DIR and your existing state directory, then reinstall with scripts/install.sh or scripts/install-openrc.sh."
-  assert_contains "Legacy noders-anytls install layout detected." "$stderr_path" "upgrade.sh did not report the legacy layout"
-  assert_contains "$expected_hint" "$stderr_path" "upgrade.sh did not report the manual reinstall guidance"
+  [[ -x "$PREFIX/bin/noders" ]] || {
+    echo "upgrade.sh did not install the current noders binary" >&2
+    exit 1
+  }
+  [[ ! -e "$PREFIX/bin/noders-anytls" ]] || {
+    echo "upgrade.sh did not remove the legacy noders-anytls binary" >&2
+    exit 1
+  }
+  [[ -f "$CONFIG_DIR/machines/${expected_instance}.toml" ]] || {
+    echo "upgrade.sh did not migrate the legacy numeric config name" >&2
+    exit 1
+  }
+  [[ ! -e "$CONFIG_DIR/machines/3.toml" ]] || {
+    echo "upgrade.sh left the legacy numeric config name behind" >&2
+    exit 1
+  }
+  assert_contains "Migrating legacy noders-anytls layout" "$stdout_path" "upgrade.sh did not report migration"
 )
 
 test_install_management_support_skips_self_copy() (
@@ -287,7 +308,7 @@ main() {
   test_validate_args
   test_install_common_defaults_service_names
   test_management_script_filters_invalid_units
-  test_upgrade_rejects_legacy_layout
+  test_upgrade_migrates_legacy_layout
   test_install_management_support_skips_self_copy
   test_upgrade_skips_binary_self_copy
 }

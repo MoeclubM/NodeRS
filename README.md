@@ -1,16 +1,15 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. The repository currently includes AnyTLS, Hysteria2, Mieru, Shadowsocks, Trojan, VLESS, and VMess protocol handlers.
+NodeRS is a pure Rust Xboard machine-node runtime. Runtime protocol handling is backed by Aerion for AnyTLS, Hysteria2, Mieru, Trojan, TUIC, VLESS, and VMess; Shadowsocks remains on the local pure-Rust handler until Aerion exposes a server-side Shadowsocks runtime.
 
 ## Overview
 
 - Linux only
 - Prebuilt release bundles are published for `linux-amd64`, `linux-amd64-musl`, `linux-arm64`, and `linux-arm64-musl`; GNU bundles target glibc 2.36 or newer, and install/upgrade scripts auto-detect `x86_64`/`aarch64` plus `glibc`/`musl`
 - Compatible with Xboard `/api/v2/server/*` and `/api/v2/server/machine/*`
-- One local process manages every AnyTLS node assigned to the same Xboard machine
+- One local process manages every node assigned to the same Xboard machine
 - Node membership, users, routes, listen address, port, and TLS are supplied by the panel
-- Device-limit control is supported
-- `speed_limit` is intentionally not implemented
+- Device-limit and `speed_limit` control are supported by the active protocol runtime
 
 ## Runtime Model
 
@@ -28,8 +27,8 @@ NodeRS currently runs in Xboard machine mode only.
 
 TLS is no longer read from the local config file.
 
-- AnyTLS, VLESS, Trojan, and VMess nodes receive TLS from Xboard `cert_config`
-- `listen_ip`, `server_port`, `server_name`, `tls_settings`, and `routes` are taken from the panel response; `padding_scheme` is currently AnyTLS-specific
+- AnyTLS, Hysteria2, Trojan, TUIC, VLESS, and VMess nodes receive TLS from Xboard `cert_config`
+- `listen_ip`, `server_port`, `server_name`, and `tls_settings` are taken from the panel response; `padding_scheme` is currently AnyTLS-specific
 - Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, and `dns`
 - File or path mode requires `cert_path` and `key_path`
 - Inline or PEM mode requires certificate PEM content and private key PEM content; the pushed certificate may be CA-issued or self-signed because NodeRS only validates that the PEM/key pair is usable
@@ -44,14 +43,11 @@ TLS is no longer read from the local config file.
 
 ## Support Matrix
 
-- Supported panel fields: `listen_ip`, `server_port`, `server_name`, `padding_scheme`, `routes`, and `cert_config`
+- Supported panel fields: `listen_ip`, `server_port`, `server_name`, `padding_scheme`, and `cert_config`
 - Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, or `dns`
-- Supported `custom_outbounds` types: `direct`, `dns`, and `block`
-- Supported `custom_routes` actions: `outbound`, `reject`, and `block`
-- Supported `custom_routes` match fields: `network`, `protocol`, `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`, `ip_cidr`, `ip_is_private`, `port`, and `port_range`
-- Supported ECH delivery: Xboard `tls_settings.ech.key` or `key_path`, with optional `config` or `config_path`, for AnyTLS/VLESS/Trojan/VMess TLS listeners
+- Server-side ECH is not currently exposed by Aerion-backed protocol runtimes; ECH settings fail explicitly instead of being ignored
 - `padding_scheme` is consumed by AnyTLS only; VLESS and Trojan ignore it because their wire formats do not use AnyTLS padding frames
-- Unsupported `custom_outbounds` types, unsupported `custom_routes` fields or actions, and malformed ECH settings fail explicitly during config sync; they are not ignored silently
+- Xboard routing/custom outbounds/custom routes/fallbacks are not currently exposed by Aerion-backed protocol runtimes; configured values fail explicitly instead of being ignored silently
 
 ## Install
 
@@ -145,11 +141,7 @@ tail -f /var/log/noders/noders-1-123456789.log
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-`upgrade.sh` only supports hosts that already run the current `noders` runtime layout.
-
-If the host still uses the old `noders-anytls` binary or service layout, back up `/etc/noders/anytls` and `/var/lib/noders/anytls`, then reinstall with the current installer.
-
-If an existing host already uses `noders` but still has old plain `noders-<machine_id>` units, reinstall once so the host switches to the hashed `noders-<machine_id>-<api_hash>` instance names.
+`upgrade.sh` preserves existing machine configs, certificates, ACME account files, and state. Hosts that still have the old `noders-anytls` binary or plain `noders-<machine_id>` config names are migrated in place to the current `noders-<machine_id>-<api_hash>` instance layout before the binary is replaced.
 
 ## Uninstall
 
