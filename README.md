@@ -1,6 +1,6 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. Runtime protocol handling is backed by Aerion for AnyTLS, Hysteria2, Mieru, Trojan, TUIC, VLESS, and VMess; Shadowsocks remains on the local pure-Rust handler until Aerion exposes a server-side Shadowsocks runtime.
+NodeRS is a pure Rust Xboard machine-node runtime. Runtime protocol handling is backed by Aerion for AnyTLS, Hysteria2, Mieru, Naive, Trojan, TUIC, VLESS, and VMess; Shadowsocks remains on the local pure-Rust handler until the Aerion migration preserves the existing Shadowsocks 2022, plugin, mux, routing, and accounting behavior.
 
 ## Overview
 
@@ -27,7 +27,7 @@ NodeRS currently runs in Xboard machine mode only.
 
 TLS is no longer read from the local config file.
 
-- AnyTLS, Hysteria2, Trojan, TUIC, VLESS, and VMess nodes receive TLS from Xboard `cert_config`
+- AnyTLS, Hysteria2, Naive, Trojan, TUIC, VLESS, and VMess nodes receive TLS from Xboard `cert_config`
 - `listen_ip`, `server_port`, `server_name`, and `tls_settings` are taken from the panel response; `padding_scheme` is currently AnyTLS-specific
 - Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, and `dns`
 - File or path mode requires `cert_path` and `key_path`
