@@ -441,6 +441,7 @@ async fn build_vmess_config(
     validate_vmess_remote(remote, users)?;
     let credentials = credentials_for_server(ProtocolKind::Vmess, users)?;
     let (user_id, rest) = split_primary(credentials)?;
+    let transport = vless_transport(remote)?;
     let (cert_path, key_path) = if remote.tls_mode() == 1 {
         let tls = tls_config(remote)?;
         let (cert_path, key_path) = materialize_tls(&tls, "vmess", remote).await?;
@@ -455,6 +456,7 @@ async fn build_vmess_config(
         tls: remote.tls_mode() == 1,
         cert_path,
         key_path,
+        transport,
     }))
 }
 
@@ -657,7 +659,6 @@ fn validate_vless_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
 }
 
 fn validate_vmess_remote(remote: &NodeConfigResponse, users: &[PanelUser]) -> anyhow::Result<()> {
-    require_tcp_network(remote, "VMess")?;
     if !matches!(remote.tls_mode(), 0 | 1) {
         bail!(
             "Xboard tls mode {} is not supported for VMess nodes",
