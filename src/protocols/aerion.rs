@@ -32,6 +32,7 @@ enum BuiltServerConfig {
     Anytls(::aerion::ServerConfig),
     Hysteria2(::aerion::Hysteria2ServerConfig),
     Mieru(::aerion::MieruServerConfig),
+    Naive(::aerion::NaiveServerConfig),
     Trojan(::aerion::TrojanServerConfig),
     Tuic(::aerion::TuicServerConfig),
     Vless(::aerion::VlessServerConfig),
@@ -169,6 +170,9 @@ impl ServerController {
                     BuiltServerConfig::Mieru(config) => {
                         ::aerion::run_mieru_server_with_core(config, core).await
                     }
+                    BuiltServerConfig::Naive(config) => {
+                        ::aerion::run_naive_server_with_core(config, core).await
+                    }
                     BuiltServerConfig::Trojan(config) => {
                         ::aerion::run_trojan_server_with_core(config, core).await
                     }
@@ -213,6 +217,7 @@ async fn build_server_config(
         ProtocolKind::Anytls => build_anytls_config(remote, users).await,
         ProtocolKind::Hysteria2 => build_hysteria2_config(remote, users).await,
         ProtocolKind::Mieru => build_mieru_config(remote, users),
+        ProtocolKind::Naive => build_naive_config(remote, users).await,
         ProtocolKind::Trojan => build_trojan_config(remote, users).await,
         ProtocolKind::Tuic => build_tuic_config(remote, users).await,
         ProtocolKind::Vless => build_vless_config(remote, users).await,
@@ -302,6 +307,33 @@ fn build_mieru_config(
         user_hint_mandatory: false,
         transport: mieru_transport(remote.transport.as_ref())?,
         traffic_pattern: None,
+    }))
+}
+
+async fn build_naive_config(
+    remote: &NodeConfigResponse,
+    users: &[PanelUser],
+) -> anyhow::Result<BuiltServerConfig> {
+    validate_naive_remote(remote)?;
+    let tls = tls_config(remote)?;
+    ensure!(
+        tls.reality.is_none(),
+        "REALITY settings are not valid for Naive nodes"
+    );
+    let (cert_path, key_path) = materialize_tls(&tls, "naive", remote).await?;
+    let (primary, extra) = split_primary(credentials_for_server(ProtocolKind::Naive, users)?)?;
+    let (username, password) = primary
+        .split_once(':')
+        .with_context(|| format!("Naive primary credential must be username:password"))?;
+    Ok(BuiltServerConfig::Naive(::aerion::NaiveServerConfig {
+        listen: listen_addr(remote)?,
+        username: username.to_string(),
+        password: password.to_string(),
+        users: extra,
+        cert_path,
+        key_path,
+        udp_over_tcp: !is_disabled(&remote.udp_relay_mode),
+        quic: naive_quic_enabled(remote)?,
     }))
 }
 
@@ -542,6 +574,34 @@ fn validate_mieru_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_naive_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
+    let network = remote.network.trim().to_ascii_lowercase();
+    ensure!(
+        network.is_empty()
+            || matches!(
+                network.as_str(),
+                "tcp" | "raw" | "http" | "https" | "h2" | "quic" | "h3" | "http3"
+            ),
+        "Naive network must be empty, tcp/raw/http/https/h2 or quic/h3/http3"
+    );
+    ensure!(
+        !remote.multiplex_enabled(),
+        "Naive multiplex is not a server-side setting"
+    );
+    ensure!(
+        !remote.udp_over_stream,
+        "Naive uses native UDP-over-TCP and does not support Xboard udp_over_stream"
+    );
+    ensure!(
+        remote
+            .network_settings
+            .as_ref()
+            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
+        "Xboard networkSettings is not supported by Aerion Naive server"
+    );
+    Ok(())
+}
+
 fn validate_trojan_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     require_tcp_network(remote, "Trojan")?;
     ensure!(
@@ -717,6 +777,9 @@ fn credentials_for_user(protocol: ProtocolKind, user: &PanelUser) -> anyhow::Res
             })?;
             credentials.push(identity.to_string());
         }
+        ProtocolKind::Naive => {
+            credentials.push(naive_credential(user)?);
+        }
         ProtocolKind::Trojan => {
             let credential = trojan_password(user).ok_or_else(|| {
                 anyhow::anyhow!("Trojan user {} is missing password/uuid", user.id)
@@ -766,6 +829,22 @@ fn mieru_identity(user: &PanelUser) -> Option<&str> {
     } else {
         Some(uuid)
     }
+}
+
+fn naive_credential(user: &PanelUser) -> anyhow::Result<String> {
+    let username = user.uuid.trim();
+    let username = if username.is_empty() {
+        user.id.to_string()
+    } else {
+        username.to_string()
+    };
+    let password = user.password.trim();
+    ensure!(
+        !password.is_empty(),
+        "Naive user {} is missing password",
+        user.id
+    );
+    Ok(format!("{username}:{password}"))
 }
 
 fn vless_transport(
@@ -892,6 +971,17 @@ fn hysteria2_obfs(remote: &NodeConfigResponse) -> anyhow::Result<(Option<String>
 
 fn hysteria2_udp_enabled(value: &str) -> bool {
     !is_disabled(value)
+}
+
+fn naive_quic_enabled(remote: &NodeConfigResponse) -> anyhow::Result<bool> {
+    let network = remote.network.trim().to_ascii_lowercase();
+    if matches!(network.as_str(), "quic" | "h3" | "http3") {
+        return Ok(true);
+    }
+    if network.is_empty() || matches!(network.as_str(), "tcp" | "raw" | "http" | "https" | "h2") {
+        return Ok(false);
+    }
+    bail!("unsupported Naive network {network}")
 }
 
 fn hysteria2_cc_rx(value: Option<&Value>, ignore_client_bandwidth: bool) -> anyhow::Result<String> {
