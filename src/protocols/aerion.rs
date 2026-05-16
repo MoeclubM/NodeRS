@@ -342,6 +342,7 @@ async fn build_trojan_config(
     users: &[PanelUser],
 ) -> anyhow::Result<BuiltServerConfig> {
     validate_trojan_remote(remote)?;
+    let transport = vless_transport(remote)?;
     let tls = tls_config(remote)?;
     ensure!(
         tls.reality.is_none(),
@@ -354,6 +355,7 @@ async fn build_trojan_config(
         users: credentials_for_server(ProtocolKind::Trojan, users)?,
         cert_path,
         key_path,
+        transport,
     }))
 }
 
@@ -606,7 +608,6 @@ fn validate_naive_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
 }
 
 fn validate_trojan_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    require_tcp_network(remote, "Trojan")?;
     ensure!(
         !matches!(remote.tls_mode(), 2),
         "Aerion Trojan server does not support REALITY TLS mode"
@@ -1060,4 +1061,34 @@ fn speed_limit_bytes_per_second(speed_limit: i64) -> Option<u64> {
 
 fn normalize_ip(ip: String) -> String {
     ip.trim_start_matches("::ffff:").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn trojan_accepts_websocket_transport() {
+        let remote = NodeConfigResponse {
+            network: "ws".to_string(),
+            network_settings: Some(json!({
+                "path": "trojan",
+                "headers": {
+                    "Host": "trojan.example.com"
+                }
+            })),
+            ..Default::default()
+        };
+
+        validate_trojan_remote(&remote).expect("validate Trojan transport");
+        let transport = vless_transport(&remote).expect("parse Trojan transport");
+        assert_eq!(
+            transport.kind,
+            ::aerion::vless_transport::VlessTransportKind::WebSocket
+        );
+        assert_eq!(transport.path, "/trojan");
+        assert_eq!(transport.host.as_deref(), Some("trojan.example.com"));
+    }
 }
