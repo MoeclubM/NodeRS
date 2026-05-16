@@ -425,6 +425,7 @@ async fn build_vless_config(
         listen: listen_addr(remote)?,
         user_id,
         users: rest,
+        tls: tls.is_some() && reality.is_none(),
         cert_path,
         key_path,
         flow: remote.flow.trim().to_string(),
