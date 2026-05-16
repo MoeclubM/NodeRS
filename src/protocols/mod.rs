@@ -13,6 +13,7 @@ pub enum ProtocolKind {
     Anytls,
     Hysteria2,
     Mieru,
+    Naive,
     Shadowsocks,
     Trojan,
     Tuic,
@@ -35,6 +36,8 @@ impl ProtocolKind {
             Some(Self::Hysteria2)
         } else if normalized == "mieru" {
             Some(Self::Mieru)
+        } else if matches!(normalized.as_str(), "naive" | "naiveproxy" | "naivehttps") {
+            Some(Self::Naive)
         } else if matches!(
             normalized.as_str(),
             "shadowsocks" | "ss" | "shadowsocks2022" | "ss2022"
@@ -58,6 +61,7 @@ impl ProtocolKind {
             Self::Anytls => "anytls",
             Self::Hysteria2 => "hysteria2",
             Self::Mieru => "mieru",
+            Self::Naive => "naive",
             Self::Shadowsocks => "shadowsocks",
             Self::Trojan => "trojan",
             Self::Tuic => "tuic",
@@ -74,6 +78,7 @@ mod tests {
     #[test]
     fn parses_common_protocol_aliases() {
         assert_eq!(ProtocolKind::parse("mieru"), Some(ProtocolKind::Mieru));
+        assert_eq!(ProtocolKind::parse("naive"), Some(ProtocolKind::Naive));
         assert_eq!(ProtocolKind::parse("hy2"), Some(ProtocolKind::Hysteria2));
         assert_eq!(ProtocolKind::parse("ss"), Some(ProtocolKind::Shadowsocks));
         assert_eq!(ProtocolKind::parse("tuic"), Some(ProtocolKind::Tuic));
@@ -102,6 +107,7 @@ impl ProtocolController {
             ProtocolKind::Anytls
             | ProtocolKind::Hysteria2
             | ProtocolKind::Mieru
+            | ProtocolKind::Naive
             | ProtocolKind::Trojan
             | ProtocolKind::Tuic
             | ProtocolKind::Vless
