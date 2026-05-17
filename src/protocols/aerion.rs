@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::accounting::Accounting;
+use crate::acme;
 use crate::panel::{NodeConfigResponse, PanelUser};
 use crate::protocols::ProtocolKind;
 
@@ -26,6 +27,13 @@ pub struct ServerController {
 
 struct RunningServer {
     handle: JoinHandle<()>,
+}
+
+struct AerionTlsIdentity {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    certificates: Vec<String>,
+    key: Option<String>,
 }
 
 enum BuiltServerConfig {
@@ -240,13 +248,15 @@ async fn build_anytls_config(
         tls.alpn.is_empty(),
         "Aerion AnyTLS server does not expose server ALPN configuration"
     );
-    let (cert_path, key_path) = materialize_tls(&tls, "anytls", remote).await?;
+    let identity = aerion_tls_identity(&tls, "AnyTLS").await?;
     Ok(BuiltServerConfig::Anytls(::aerion::ServerConfig {
         listen: listen_addr(remote)?,
         password: String::new(),
         users: credentials_for_server(ProtocolKind::Anytls, users)?,
-        cert_path,
-        key_path,
+        cert_path: identity.cert_path,
+        key_path: identity.key_path,
+        certificates: identity.certificates,
+        key: identity.key,
         padding_scheme: if remote.padding_scheme.is_empty() {
             ::aerion::padding::PaddingScheme::default_lines()
         } else {
@@ -266,15 +276,17 @@ async fn build_hysteria2_config(
         tls.reality.is_none(),
         "HY2 does not support REALITY TLS mode"
     );
-    let (cert_path, key_path) = materialize_tls(&tls, "hysteria2", remote).await?;
+    let identity = aerion_tls_identity(&tls, "Hysteria2").await?;
     let (obfs, obfs_password) = hysteria2_obfs(remote)?;
     Ok(BuiltServerConfig::Hysteria2(
         ::aerion::Hysteria2ServerConfig {
             listen: listen_addr(remote)?,
             password: String::new(),
             users: credentials_for_server(ProtocolKind::Hysteria2, users)?,
-            cert_path,
-            key_path,
+            cert_path: identity.cert_path,
+            key_path: identity.key_path,
+            certificates: identity.certificates,
+            key: identity.key,
             obfs,
             obfs_password,
             udp: hysteria2_udp_enabled(&remote.udp_relay_mode),
@@ -320,7 +332,7 @@ async fn build_naive_config(
         tls.reality.is_none(),
         "REALITY settings are not valid for Naive nodes"
     );
-    let (cert_path, key_path) = materialize_tls(&tls, "naive", remote).await?;
+    let identity = aerion_tls_identity(&tls, "Naive").await?;
     let (primary, extra) = split_primary(credentials_for_server(ProtocolKind::Naive, users)?)?;
     let (username, password) = primary
         .split_once(':')
@@ -330,8 +342,10 @@ async fn build_naive_config(
         username: username.to_string(),
         password: password.to_string(),
         users: extra,
-        cert_path,
-        key_path,
+        cert_path: identity.cert_path,
+        key_path: identity.key_path,
+        certificates: identity.certificates,
+        key: identity.key,
         udp_over_tcp: !is_disabled(&remote.udp_relay_mode),
         tcp: true,
         quic: naive_quic_enabled(remote)?,
@@ -354,13 +368,15 @@ async fn build_trojan_config(
         tls.reality.is_none(),
         "Aerion Trojan server does not support REALITY TLS mode"
     );
-    let (cert_path, key_path) = materialize_tls(&tls, "trojan", remote).await?;
+    let identity = aerion_tls_identity(&tls, "Trojan").await?;
     Ok(BuiltServerConfig::Trojan(::aerion::TrojanServerConfig {
         listen: listen_addr(remote)?,
         password: String::new(),
         users: credentials_for_server(ProtocolKind::Trojan, users)?,
-        cert_path,
-        key_path,
+        cert_path: identity.cert_path,
+        key_path: identity.key_path,
+        certificates: identity.certificates,
+        key: identity.key,
         transport,
     }))
 }
@@ -375,7 +391,7 @@ async fn build_tuic_config(
         tls.reality.is_none(),
         "TUIC does not support REALITY TLS mode"
     );
-    let (cert_path, key_path) = materialize_tls(&tls, "tuic", remote).await?;
+    let identity = aerion_tls_identity(&tls, "TUIC").await?;
     let users = users
         .iter()
         .map(|user| {
@@ -395,8 +411,10 @@ async fn build_tuic_config(
         uuid: String::new(),
         password: String::new(),
         users,
-        cert_path,
-        key_path,
+        cert_path: identity.cert_path,
+        key_path: identity.key_path,
+        certificates: identity.certificates,
+        key: identity.key,
         udp: !is_disabled(&remote.udp_relay_mode),
         congestion_control: remote.congestion_control.clone(),
         alpn_protocols: remote.alpn.clone(),
@@ -417,17 +435,25 @@ async fn build_vless_config(
     } else {
         None
     };
-    let (cert_path, key_path, reality) = match tls.as_ref() {
+    let (cert_path, key_path, certificates, key, reality) = match tls.as_ref() {
         Some(tls) if tls.reality.is_some() => (
             PathBuf::new(),
             PathBuf::new(),
+            Vec::new(),
+            None,
             Some(reality_config(tls, &transport)?),
         ),
         Some(tls) => {
-            let (cert_path, key_path) = materialize_tls(tls, "vless", remote).await?;
-            (cert_path, key_path, None)
+            let identity = aerion_tls_identity(tls, "VLESS").await?;
+            (
+                identity.cert_path,
+                identity.key_path,
+                identity.certificates,
+                identity.key,
+                None,
+            )
         }
-        None => (PathBuf::new(), PathBuf::new(), None),
+        None => (PathBuf::new(), PathBuf::new(), Vec::new(), None, None),
     };
     Ok(BuiltServerConfig::Vless(::aerion::VlessServerConfig {
         listen: listen_addr(remote)?,
@@ -436,6 +462,8 @@ async fn build_vless_config(
         tls: tls.is_some() && reality.is_none(),
         cert_path,
         key_path,
+        certificates,
+        key,
         flow: remote.flow.trim().to_string(),
         reality,
         transport,
@@ -450,12 +478,17 @@ async fn build_vmess_config(
     let credentials = credentials_for_server(ProtocolKind::Vmess, users)?;
     let (user_id, rest) = split_primary(credentials)?;
     let transport = vless_transport(remote)?;
-    let (cert_path, key_path) = if remote.tls_mode() == 1 {
+    let (cert_path, key_path, certificates, key) = if remote.tls_mode() == 1 {
         let tls = tls_config(remote)?;
-        let (cert_path, key_path) = materialize_tls(&tls, "vmess", remote).await?;
-        (Some(cert_path), Some(key_path))
+        let identity = aerion_tls_identity(&tls, "VMess").await?;
+        (
+            Some(identity.cert_path),
+            Some(identity.key_path),
+            identity.certificates,
+            identity.key,
+        )
     } else {
-        (None, None)
+        (None, None, Vec::new(), None)
     };
     Ok(BuiltServerConfig::Vmess(::aerion::VmessServerConfig {
         listen: listen_addr(remote)?,
@@ -464,6 +497,8 @@ async fn build_vmess_config(
         tls: remote.tls_mode() == 1,
         cert_path,
         key_path,
+        certificates,
+        key,
         transport,
     }))
 }
@@ -694,20 +729,53 @@ fn tls_config(remote: &NodeConfigResponse) -> anyhow::Result<EffectiveTlsConfig>
     Ok(tls)
 }
 
-async fn materialize_tls(
+async fn aerion_tls_identity(
     config: &EffectiveTlsConfig,
     protocol: &str,
-    remote: &NodeConfigResponse,
-) -> anyhow::Result<(PathBuf, PathBuf)> {
-    tls::materialize_tls_files(
-        &config.source,
-        &format!(
-            "{protocol}-{}-{}",
-            effective_listen_ip(remote),
-            remote.server_port
-        ),
-    )
-    .await
+) -> anyhow::Result<AerionTlsIdentity> {
+    match &config.source {
+        tls::TlsMaterialSource::Files {
+            cert_path,
+            key_path,
+        } => Ok(AerionTlsIdentity {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            certificates: Vec::new(),
+            key: None,
+        }),
+        tls::TlsMaterialSource::Acme {
+            cert_path,
+            key_path,
+            config,
+        } => {
+            acme::ensure_certificate(config, cert_path, key_path)
+                .await
+                .context("ensure ACME certificate")?;
+            Ok(AerionTlsIdentity {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+                certificates: Vec::new(),
+                key: None,
+            })
+        }
+        tls::TlsMaterialSource::Inline { .. } | tls::TlsMaterialSource::SelfSigned { .. } => {
+            let (cert_pem, key_pem) = tls::load_source_materials(&config.source).await?;
+            Ok(AerionTlsIdentity {
+                cert_path: PathBuf::new(),
+                key_path: PathBuf::new(),
+                certificates: vec![
+                    String::from_utf8(cert_pem).with_context(|| {
+                        format!("{protocol} certificate PEM is not valid UTF-8")
+                    })?,
+                ],
+                key: Some(
+                    String::from_utf8(key_pem).with_context(|| {
+                        format!("{protocol} private key PEM is not valid UTF-8")
+                    })?,
+                ),
+            })
+        }
+    }
 }
 
 fn reality_config(
