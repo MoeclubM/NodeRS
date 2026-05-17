@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "1c24ddc65dc367ac98b794d1a50c1f66379d43a9" }
+aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "46a28c29392b3831ae985ee1b370d64b42204835" }
 base64 = "0.22.1"
 blake2 = "0.10.6"
 blake3 = "1.8.4"
