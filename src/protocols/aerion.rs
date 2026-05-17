@@ -334,6 +334,11 @@ async fn build_naive_config(
         key_path,
         udp_over_tcp: !is_disabled(&remote.udp_relay_mode),
         quic: naive_quic_enabled(remote)?,
+        quic_congestion_control: if remote.congestion_control.trim().is_empty() {
+            ::aerion::naive::default_naive_quic_congestion_control()
+        } else {
+            remote.congestion_control.clone()
+        },
     }))
 }
 
