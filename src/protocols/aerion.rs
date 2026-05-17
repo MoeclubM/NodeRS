@@ -289,6 +289,7 @@ async fn build_hysteria2_config(
             key: identity.key,
             obfs,
             obfs_password,
+            upload_bandwidth: remote.up_mbps.as_ref().map(value_to_u64).transpose()?,
             udp: hysteria2_udp_enabled(&remote.udp_relay_mode),
             cc_rx: hysteria2_cc_rx(remote.up_mbps.as_ref(), remote.ignore_client_bandwidth)?,
             congestion_control: remote.congestion_control.clone(),
