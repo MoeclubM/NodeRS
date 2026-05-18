@@ -145,6 +145,12 @@ pub struct NodeConfigResponse {
     pub traffic_pattern: String,
     #[serde(
         default,
+        alias = "noncePattern",
+        deserialize_with = "deserialize_default_on_null"
+    )]
+    pub nonce_pattern: String,
+    #[serde(
+        default,
         alias = "alpnProtocols",
         alias = "alpn_protocols",
         deserialize_with = "deserialize_string_list_on_null"
@@ -1920,6 +1926,7 @@ mod tests {
                 "heartbeat": null,
                 "transport": null,
                 "traffic_pattern": null,
+                "nonce_pattern": null,
                 "alpn": null,
                 "packet_encoding": null,
                 "global_padding": null,
@@ -1971,6 +1978,7 @@ mod tests {
         assert_eq!(config.heartbeat, "");
         assert!(config.transport.is_none());
         assert_eq!(config.traffic_pattern, "");
+        assert_eq!(config.nonce_pattern, "");
         assert!(config.alpn.is_empty());
         assert_eq!(config.packet_encoding, "");
         assert!(!config.global_padding);
