@@ -1145,6 +1145,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builds_mieru_server_config() {
+        let remote = NodeConfigResponse {
+            listen_ip: "127.0.0.1".to_string(),
+            server_port: 8964,
+            network: "tcp".to_string(),
+            ..Default::default()
+        };
+        let users = vec![PanelUser {
+            id: 1001,
+            uuid: "mieru-secret".to_string(),
+            ..Default::default()
+        }];
+
+        let BuiltServerConfig::Mieru(config) =
+            build_mieru_config(&remote, &users).expect("build Mieru config")
+        else {
+            panic!("expected Mieru config");
+        };
+        assert_eq!(config.listen, "127.0.0.1:8964".parse().unwrap());
+        assert_eq!(config.users.len(), 1);
+        assert_eq!(config.users[0].username, "mieru-secret");
+        assert_eq!(config.users[0].password, "mieru-secret");
+        assert_eq!(config.transport, ::aerion::MieruTransport::Tcp);
+    }
+
+    #[tokio::test]
+    async fn builds_naive_server_config() {
+        let remote = NodeConfigResponse {
+            listen_ip: "127.0.0.1".to_string(),
+            server_port: 8443,
+            network: "quic".to_string(),
+            server_name: "naive.example.com".to_string(),
+            congestion_control: "cubic".to_string(),
+            udp_relay_mode: "native".to_string(),
+            ..Default::default()
+        };
+        let users = vec![
+            PanelUser {
+                id: 1001,
+                uuid: "alice".to_string(),
+                password: "alice-pass".to_string(),
+                ..Default::default()
+            },
+            PanelUser {
+                id: 1002,
+                uuid: "bob".to_string(),
+                password: "bob-pass".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let BuiltServerConfig::Naive(config) = build_naive_config(&remote, &users)
+            .await
+            .expect("build Naive config")
+        else {
+            panic!("expected Naive config");
+        };
+        assert_eq!(config.listen, "127.0.0.1:8443".parse().unwrap());
+        assert_eq!(config.username, "alice");
+        assert_eq!(config.password, "alice-pass");
+        assert_eq!(config.users, vec!["bob:bob-pass"]);
+        assert!(config.udp_over_tcp);
+        assert!(config.tcp);
+        assert!(config.quic);
+        assert_eq!(config.quic_congestion_control, "cubic");
+    }
+
+    #[test]
     fn trojan_accepts_websocket_transport() {
         let remote = NodeConfigResponse {
             network: "ws".to_string(),
