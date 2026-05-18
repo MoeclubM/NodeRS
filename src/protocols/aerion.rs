@@ -319,7 +319,7 @@ fn build_mieru_config(
         mtu: 0,
         user_hint_mandatory: false,
         transport: mieru_transport(remote.transport.as_ref())?,
-        traffic_pattern: None,
+        traffic_pattern: mieru_traffic_pattern(remote)?,
     }))
 }
 
@@ -605,10 +605,6 @@ fn validate_mieru_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     ensure!(
         !remote.multiplex_enabled(),
         "Aerion Mieru server does not support Xboard multiplex settings yet"
-    );
-    ensure!(
-        remote.traffic_pattern.trim().is_empty(),
-        "Aerion Mieru adapter does not map Xboard traffic_pattern yet"
     );
     ensure!(
         remote.tls.is_none()
@@ -1105,6 +1101,16 @@ fn mieru_transport(value: Option<&Value>) -> anyhow::Result<::aerion::MieruTrans
         },
         _ => bail!("unsupported Mieru transport"),
     }
+}
+
+fn mieru_traffic_pattern(
+    remote: &NodeConfigResponse,
+) -> anyhow::Result<Option<::aerion::MieruTrafficPattern>> {
+    ::aerion::MieruTrafficPattern::parse_pair(
+        Some(remote.traffic_pattern.trim()).filter(|value| !value.is_empty()),
+        Some(remote.nonce_pattern.trim()).filter(|value| !value.is_empty()),
+    )
+    .context("parse Mieru traffic pattern")
 }
 
 fn value_to_u64(value: &Value) -> anyhow::Result<u64> {
