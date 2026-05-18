@@ -917,9 +917,14 @@ fn naive_credential(user: &PanelUser) -> anyhow::Result<String> {
         username.to_string()
     };
     let password = user.password.trim();
+    let password = if password.is_empty() {
+        user.uuid.trim()
+    } else {
+        password
+    };
     ensure!(
         !password.is_empty(),
-        "Naive user {} is missing password",
+        "Naive user {} is missing password/uuid",
         user.id
     );
     Ok(format!("{username}:{password}"))
@@ -1210,6 +1215,30 @@ mod tests {
         assert!(config.tcp);
         assert!(config.quic);
         assert_eq!(config.quic_congestion_control, "cubic");
+    }
+
+    #[tokio::test]
+    async fn builds_naive_server_config_from_uuid_only_user() {
+        let remote = NodeConfigResponse {
+            listen_ip: "127.0.0.1".to_string(),
+            server_port: 8443,
+            server_name: "naive.example.com".to_string(),
+            ..Default::default()
+        };
+        let users = vec![PanelUser {
+            id: 1001,
+            uuid: "uuid-secret".to_string(),
+            ..Default::default()
+        }];
+
+        let BuiltServerConfig::Naive(config) = build_naive_config(&remote, &users)
+            .await
+            .expect("build Naive config")
+        else {
+            panic!("expected Naive config");
+        };
+        assert_eq!(config.username, "uuid-secret");
+        assert_eq!(config.password, "uuid-secret");
     }
 
     #[test]
