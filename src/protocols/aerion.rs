@@ -301,7 +301,6 @@ fn build_mieru_config(
     remote: &NodeConfigResponse,
     users: &[PanelUser],
 ) -> anyhow::Result<BuiltServerConfig> {
-    validate_mieru_remote(remote)?;
     let users = users
         .iter()
         .map(|user| {
@@ -586,34 +585,6 @@ fn validate_hysteria2_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> 
         let version = value_to_u64(version).context("parse HY2 version")?;
         ensure!(version == 2, "HY2 only supports hysteria version 2");
     }
-    Ok(())
-}
-
-fn validate_mieru_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    let network = remote.network.trim();
-    ensure!(
-        network.is_empty() || network.eq_ignore_ascii_case("tcp"),
-        "Xboard network must be tcp for Mieru nodes"
-    );
-    ensure!(
-        remote
-            .network_settings
-            .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Xboard networkSettings is not supported by Aerion Mieru server"
-    );
-    ensure!(
-        !remote.multiplex_enabled(),
-        "Aerion Mieru server does not support Xboard multiplex settings yet"
-    );
-    ensure!(
-        remote.tls.is_none()
-            && !remote.tls_settings.is_configured()
-            && !remote.tls_settings.has_reality_key_material()
-            && !remote.reality_settings.is_configured()
-            && remote.cert_config.is_none(),
-        "Xboard TLS is not supported by Mieru nodes"
-    );
     Ok(())
 }
 
@@ -1179,6 +1150,47 @@ mod tests {
         assert_eq!(config.users[0].username, "mieru-secret");
         assert_eq!(config.users[0].password, "mieru-secret");
         assert_eq!(config.transport, ::aerion::MieruTransport::Tcp);
+    }
+
+    #[test]
+    fn builds_mieru_server_config_ignores_xboard_tls_and_cert() {
+        let remote = NodeConfigResponse {
+            listen_ip: "127.0.0.1".to_string(),
+            server_port: 8964,
+            network: "ws".to_string(),
+            network_settings: Some(json!({ "path": "/ignored" })),
+            tls: Some(json!(1)),
+            tls_settings: crate::panel::NodeTlsSettings {
+                server_name: "tls.example.com".to_string(),
+                allow_insecure: true,
+                ..Default::default()
+            },
+            reality_settings: crate::panel::NodeRealitySettings {
+                server_name: "reality.example.com".to_string(),
+                private_key: "ignored".to_string(),
+                ..Default::default()
+            },
+            multiplex: Some(json!({ "enabled": true })),
+            cert_config: Some(crate::panel::CertConfig {
+                cert_mode: "acme".to_string(),
+                domain: "tls.example.com".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let users = vec![PanelUser {
+            id: 1001,
+            uuid: "mieru-secret".to_string(),
+            ..Default::default()
+        }];
+
+        let BuiltServerConfig::Mieru(config) =
+            build_mieru_config(&remote, &users).expect("build Mieru config")
+        else {
+            panic!("expected Mieru config");
+        };
+        assert_eq!(config.listen, "127.0.0.1:8964".parse().unwrap());
+        assert_eq!(config.users[0].username, "mieru-secret");
     }
 
     #[tokio::test]
