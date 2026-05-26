@@ -22,6 +22,7 @@ jobs:
         shell: bash
         run: |
           git init .
+          git config --global --add safe.directory "$PWD"
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git fetch --depth=1 origin "${GITHUB_SHA}"
           git checkout --detach FETCH_HEAD
