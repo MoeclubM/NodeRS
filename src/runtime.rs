@@ -60,6 +60,8 @@ struct ManagedNode {
 struct NodeSyncState {
     config_etag: Option<String>,
     user_etag: Option<String>,
+    config: Option<NodeConfigResponse>,
+    users: Option<Vec<PanelUser>>,
 }
 
 impl MachineRuntime {
@@ -523,15 +525,19 @@ impl ManagedNode {
             .fetch_node_config(current_etag.as_deref())
             .await?
         {
-            FetchState::Modified(remote, etag) => {
-                self.sync_state.lock().await.config_etag = etag;
-                Some(remote)
-            }
+            FetchState::Modified(remote, etag) => Some((remote, etag)),
             FetchState::NotModified => None,
         };
 
-        if let Some(remote) = response {
+        if let Some((remote, etag)) = response {
+            if self.sync_state.lock().await.config.as_ref() == Some(&remote) {
+                self.sync_state.lock().await.config_etag = etag;
+                return Ok(());
+            }
             self.apply_remote_config(&remote).await?;
+            let mut sync_state = self.sync_state.lock().await;
+            sync_state.config_etag = etag;
+            sync_state.config = Some(remote);
         }
 
         Ok(())
@@ -548,15 +554,19 @@ impl ManagedNode {
         };
 
         let response = match self.panel.fetch_users(current_etag.as_deref()).await? {
-            FetchState::Modified(users, etag) => {
-                self.sync_state.lock().await.user_etag = etag;
-                Some(users.users)
-            }
+            FetchState::Modified(users, etag) => Some((users.users, etag)),
             FetchState::NotModified => None,
         };
 
-        if let Some(users) = response {
+        if let Some((users, etag)) = response {
+            if self.sync_state.lock().await.users.as_ref() == Some(&users) {
+                self.sync_state.lock().await.user_etag = etag;
+                return Ok(());
+            }
             self.replace_users(&users).await?;
+            let mut sync_state = self.sync_state.lock().await;
+            sync_state.user_etag = etag;
+            sync_state.users = Some(users);
         }
 
         Ok(())

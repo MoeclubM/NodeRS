@@ -211,7 +211,13 @@ impl ServerController {
     async fn stop(&self) {
         let old = self.inner.lock().await.take();
         if let Some(old) = old {
+            self.core.cancel_all_sessions();
             old.handle.abort();
+            if let Err(error) = old.handle.await
+                && !error.is_cancelled()
+            {
+                error!(protocol = self.protocol.as_str(), %error, "Aerion server task join failed during stop");
+            }
         }
     }
 }
