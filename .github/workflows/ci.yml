@@ -29,9 +29,6 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt
 
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
       - name: Fetch dependencies
         run: cargo fetch --locked
 
