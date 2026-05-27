@@ -515,12 +515,6 @@ fn ensure_aerion_supported(
 ) -> anyhow::Result<()> {
     ensure_no_routing(remote, protocol.as_str())?;
     ensure_no_fallbacks(remote, protocol.as_str())?;
-    if remote.tls_settings.ech.is_enabled() {
-        bail!(
-            "Aerion {} server does not support server ECH yet",
-            protocol.as_str()
-        );
-    }
     Ok(())
 }
 
@@ -698,9 +692,7 @@ fn validate_vmess_remote(remote: &NodeConfigResponse, users: &[PanelUser]) -> an
 }
 
 fn tls_config(remote: &NodeConfigResponse) -> anyhow::Result<EffectiveTlsConfig> {
-    let tls = EffectiveTlsConfig::from_remote(remote)?;
-    ensure!(tls.ech.is_none(), "Aerion server ECH is not supported yet");
-    Ok(tls)
+    EffectiveTlsConfig::from_remote(remote)
 }
 
 async fn aerion_tls_identity(

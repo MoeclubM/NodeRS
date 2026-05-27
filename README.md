@@ -45,7 +45,7 @@ TLS is no longer read from the local config file.
 
 - Supported panel fields: `listen_ip`, `server_port`, `server_name`, `padding_scheme`, and `cert_config`
 - Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, or `dns`
-- Server-side ECH is not currently exposed by Aerion-backed protocol runtimes; ECH settings fail explicitly instead of being ignored
+- Server-side ECH is not currently exposed by Aerion-backed protocol runtimes; ECH settings are accepted but ignored
 - `padding_scheme` is consumed by AnyTLS only; VLESS and Trojan ignore it because their wire formats do not use AnyTLS padding frames
 - Xboard routing/custom outbounds/custom routes/fallbacks are not currently exposed by Aerion-backed protocol runtimes; configured values fail explicitly instead of being ignored silently
 
