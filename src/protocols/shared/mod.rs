@@ -360,7 +360,7 @@ fn effective_ech_config(
 pub(crate) fn aerion_ech_keys(
     tls: &EffectiveTlsConfig,
     reality: bool,
-) -> anyhow::Result<Option<::aerion::TlsEchServerKeys>> {
+) -> anyhow::Result<Option<::aerion::tls_ech::TlsEchServerKeys>> {
     if reality {
         ensure!(
             tls.ech.is_none(),
