@@ -423,10 +423,7 @@ impl NodeEchSettings {
 
 impl NodeTlsSettings {
     pub fn is_configured(&self) -> bool {
-        !self.server_name.trim().is_empty()
-            || !self.server_names.is_empty()
-            || self.allow_insecure
-            || self.ech.is_enabled()
+        !self.server_name.trim().is_empty() || !self.server_names.is_empty() || self.allow_insecure
     }
 
     pub fn has_reality_key_material(&self) -> bool {
@@ -2073,6 +2070,23 @@ mod tests {
                 .cert_mode(),
             "file"
         );
+    }
+
+    #[test]
+    fn ech_only_tls_settings_are_not_treated_as_configured() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "server_port": 443,
+            "tls_settings": {
+                "ech": {
+                    "enabled": true
+                }
+            }
+        }))
+        .expect("parse config");
+
+        assert!(config.tls_settings.ech.is_enabled());
+        assert!(!config.tls_settings.is_configured());
     }
 
     #[test]
