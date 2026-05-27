@@ -325,40 +325,10 @@ fn build_dns_provider_config(cert_config: &CertConfig) -> anyhow::Result<acme::D
 }
 
 fn effective_ech_config(
-    remote: &NodeConfigResponse,
+    _remote: &NodeConfigResponse,
 ) -> anyhow::Result<Option<tls::EchConfigSource>> {
-    if !remote.tls_settings.ech.is_enabled() {
-        return Ok(None);
-    }
-
-    let key_path = remote.tls_settings.ech.key_path.trim();
-    let config_path = remote.tls_settings.ech.config_path.trim();
-    let key = remote.tls_settings.ech.key.trim();
-    let config = remote.tls_settings.ech.config.trim();
-
-    if !key_path.is_empty() {
-        return Ok(Some(tls::EchConfigSource::Files {
-            key_path: key_path.into(),
-            config_path: if config_path.is_empty() {
-                None
-            } else {
-                Some(config_path.into())
-            },
-        }));
-    }
-
-    if !key.is_empty() {
-        return Ok(Some(tls::EchConfigSource::Inline {
-            key: key.as_bytes().to_vec(),
-            config: if config.is_empty() {
-                None
-            } else {
-                Some(config.as_bytes().to_vec())
-            },
-        }));
-    }
-
-    anyhow::bail!("Xboard tls_settings.ech must include key or key_path")
+    // Aerion-backed runtimes do not expose server ECH, so Xboard ECH settings are accepted and ignored.
+    Ok(None)
 }
 
 pub(crate) fn effective_reality_config(
@@ -604,7 +574,7 @@ pub(crate) fn effective_listen_ip(remote: &NodeConfigResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::{CertConfig, NodeConfigResponse, NodeTlsSettings};
+    use crate::panel::{CertConfig, NodeConfigResponse, NodeEchSettings, NodeTlsSettings};
 
     const REALITY_KEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -690,6 +660,23 @@ mod tests {
             }
             _ => unreachable!("expected ACME TLS source"),
         }
+    }
+
+    #[test]
+    fn tls_config_ignores_xboard_ech_settings() {
+        let remote = NodeConfigResponse {
+            tls_settings: NodeTlsSettings {
+                ech: NodeEchSettings {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..base_remote()
+        };
+
+        let effective = EffectiveTlsConfig::from_remote(&remote).expect("tls config");
+        assert!(effective.ech.is_none());
     }
 
     #[test]
