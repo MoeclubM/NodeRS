@@ -325,10 +325,62 @@ fn build_dns_provider_config(cert_config: &CertConfig) -> anyhow::Result<acme::D
 }
 
 fn effective_ech_config(
-    _remote: &NodeConfigResponse,
+    remote: &NodeConfigResponse,
 ) -> anyhow::Result<Option<tls::EchConfigSource>> {
-    // Aerion-backed runtimes do not expose server ECH, so Xboard ECH settings are accepted and ignored.
+    let ech = &remote.tls_settings.ech;
+    if !ech.is_enabled() {
+        return Ok(None);
+    }
+    if !ech.key_path.trim().is_empty() {
+        return Ok(Some(tls::EchConfigSource::Files {
+            key_path: ech.key_path.trim().into(),
+            config_path: if ech.config_path.trim().is_empty() {
+                None
+            } else {
+                Some(ech.config_path.trim().into())
+            },
+        }));
+    }
+    if !ech.key.trim().is_empty() {
+        return Ok(Some(tls::EchConfigSource::Inline {
+            key: ech.key.trim().as_bytes().to_vec(),
+            config: if ech.config.trim().is_empty() {
+                None
+            } else {
+                Some(ech.config.trim().as_bytes().to_vec())
+            },
+        }));
+    }
+    if ech.enabled {
+        anyhow::bail!("Xboard ECH is enabled but key material is missing");
+    }
     Ok(None)
+}
+
+pub(crate) fn aerion_ech_keys(
+    tls: &EffectiveTlsConfig,
+    reality: bool,
+) -> anyhow::Result<Option<::aerion::TlsEchServerKeys>> {
+    if reality {
+        ensure!(
+            tls.ech.is_none(),
+            "ECH cannot be combined with REALITY on Aerion-backed nodes"
+        );
+        return Ok(None);
+    }
+    let Some(source) = tls.ech.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(match source {
+        tls::EchConfigSource::Files { key_path, .. } => {
+            ::aerion::tls_ech::tls_ech_from_path(key_path)
+        }
+        tls::EchConfigSource::Inline { key, .. } => {
+            let inline = String::from_utf8(key.clone())
+                .context("Xboard inline ECH key material must be UTF-8")?;
+            ::aerion::tls_ech::tls_ech_from_compat_reference(inline.trim())
+        }
+    }))
 }
 
 pub(crate) fn effective_reality_config(
@@ -663,11 +715,12 @@ mod tests {
     }
 
     #[test]
-    fn tls_config_ignores_xboard_ech_settings() {
+    fn tls_config_maps_xboard_ech_settings() {
         let remote = NodeConfigResponse {
             tls_settings: NodeTlsSettings {
                 ech: NodeEchSettings {
                     enabled: true,
+                    key_path: "/etc/anytls/ech.bin".to_string(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -676,7 +729,7 @@ mod tests {
         };
 
         let effective = EffectiveTlsConfig::from_remote(&remote).expect("tls config");
-        assert!(effective.ech.is_none());
+        assert!(effective.ech.is_some());
     }
 
     #[test]

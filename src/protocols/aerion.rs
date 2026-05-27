@@ -13,7 +13,7 @@ use crate::acme;
 use crate::panel::{NodeConfigResponse, PanelUser};
 use crate::protocols::ProtocolKind;
 
-use super::shared::{EffectiveTlsConfig, effective_listen_ip, tls};
+use super::shared::{EffectiveTlsConfig, aerion_ech_keys, effective_listen_ip, tls};
 
 pub struct ServerController {
     protocol: ProtocolKind,
@@ -269,7 +269,7 @@ async fn build_anytls_config(
             remote.padding_scheme.clone()
         },
         heartbeat_interval_secs: heartbeat_interval_secs(remote)?,
-        ech: None,
+        ech: aerion_ech_keys(&tls, false)?,
     }))
 }
 
@@ -474,7 +474,10 @@ async fn build_vless_config(
         flow: remote.flow.trim().to_string(),
         reality,
         transport,
-        ech: None,
+        ech: match tls.as_ref() {
+            Some(tls) => aerion_ech_keys(tls, reality.is_some())?,
+            None => None,
+        },
     }))
 }
 
