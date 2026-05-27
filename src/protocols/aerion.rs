@@ -462,11 +462,12 @@ async fn build_vless_config(
         }
         None => (PathBuf::new(), PathBuf::new(), Vec::new(), None, None),
     };
+    let has_reality = reality.is_some();
     Ok(BuiltServerConfig::Vless(::aerion::VlessServerConfig {
         listen: listen_addr(remote)?,
         user_id,
         users: rest,
-        tls: tls.is_some() && reality.is_none(),
+        tls: tls.is_some() && !has_reality,
         cert_path,
         key_path,
         certificates,
@@ -475,7 +476,7 @@ async fn build_vless_config(
         reality,
         transport,
         ech: match tls.as_ref() {
-            Some(tls) => aerion_ech_keys(tls, reality.is_some())?,
+            Some(tls) => aerion_ech_keys(tls, has_reality)?,
             None => None,
         },
     }))
