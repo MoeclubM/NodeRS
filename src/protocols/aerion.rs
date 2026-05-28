@@ -385,6 +385,7 @@ async fn build_trojan_config(
         certificates: identity.certificates,
         key: identity.key,
         transport,
+        ech: aerion_ech_keys(&tls, false)?,
     }))
 }
 
@@ -490,8 +491,12 @@ async fn build_vmess_config(
     let credentials = credentials_for_server(ProtocolKind::Vmess, users)?;
     let (user_id, rest) = split_primary(credentials)?;
     let transport = vless_transport(remote)?;
-    let (cert_path, key_path, certificates, key) = if remote.tls_mode() == 1 {
-        let tls = tls_config(remote)?;
+    let tls = if remote.tls_mode() == 1 {
+        Some(tls_config(remote)?)
+    } else {
+        None
+    };
+    let (cert_path, key_path, certificates, key) = if let Some(tls) = tls.as_ref() {
         let identity = aerion_tls_identity(&tls, "VMess").await?;
         (
             Some(identity.cert_path),
@@ -512,6 +517,10 @@ async fn build_vmess_config(
         certificates,
         key,
         transport,
+        ech: match tls.as_ref() {
+            Some(tls) => aerion_ech_keys(tls, false)?,
+            None => None,
+        },
     }))
 }
 
