@@ -1,6 +1,6 @@
 [package]
 name = "noders"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 
 [dependencies]
@@ -48,7 +48,7 @@ tokio-yamux = "0.3.18"
 time = { version = "0.3.41", features = ["formatting"] }
 toml = "1.0.6"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "std"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1.50.0", features = ["macros", "rt", "time", "test-util", "io-util"] }
