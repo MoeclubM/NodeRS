@@ -9,8 +9,8 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
 pub const DEFAULT_ENV_FILTER: &str = "info,aerion=warn";
 
 pub fn init() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_ENV_FILTER));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_ENV_FILTER));
 
     Registry::default()
         .with(env_filter)
