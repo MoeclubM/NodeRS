@@ -14,7 +14,7 @@ use crate::panel::{NodeConfigResponse, PanelUser};
 use crate::protocols::ProtocolKind;
 
 use super::shared::{
-    EffectiveTlsConfig, aerion_ech_keys, bind_listeners, effective_listen_ip, tls,
+    EffectiveTlsConfig, aerion_ech_keys, bind_listeners, bind_udp_sockets, effective_listen_ip, tls,
 };
 
 pub struct ServerController {
@@ -187,10 +187,78 @@ impl ServerController {
                         Ok(())
                     }
                     BuiltServerConfig::Hysteria2(config) => {
-                        ::aerion::run_hysteria2_server_with_core(config, core).await
+                        let sockets =
+                            bind_udp_sockets(&config.listen.ip().to_string(), config.listen.port())
+                                .with_context(|| {
+                                    format!("bind Aerion Hysteria2 server on {}", config.listen)
+                                })?;
+                        let mut tasks = JoinSet::new();
+                        for socket in sockets {
+                            let config = config.clone();
+                            let core = core.clone();
+                            tasks.spawn(async move {
+                                let socket = socket
+                                    .into_std()
+                                    .context("convert Hysteria2 UDP socket to std")?;
+                                ::aerion::run_hysteria2_server_socket_with_core(
+                                    socket, config, core,
+                                )
+                                .await
+                            });
+                        }
+                        while let Some(result) = tasks.join_next().await {
+                            result.context("join Aerion Hysteria2 listener task")??;
+                        }
+                        Ok(())
                     }
                     BuiltServerConfig::Mieru(config) => {
-                        ::aerion::run_mieru_server_with_core(config, core).await
+                        if config.transport == ::aerion::MieruTransport::Udp {
+                            let sockets = bind_udp_sockets(
+                                &config.listen.ip().to_string(),
+                                config.listen.port(),
+                            )
+                            .with_context(|| {
+                                format!("bind Aerion Mieru UDP server on {}", config.listen)
+                            })?;
+                            let mut tasks = JoinSet::new();
+                            for socket in sockets {
+                                let config = config.clone();
+                                let core = core.clone();
+                                tasks.spawn(async move {
+                                    ::aerion::run_mieru_packet_server_socket_with_core(
+                                        socket, config, core,
+                                    )
+                                    .await
+                                });
+                            }
+                            while let Some(result) = tasks.join_next().await {
+                                result.context("join Aerion Mieru UDP listener task")??;
+                            }
+                            Ok(())
+                        } else {
+                            let listeners = bind_listeners(
+                                &config.listen.ip().to_string(),
+                                config.listen.port(),
+                            )
+                            .with_context(|| {
+                                format!("bind Aerion Mieru server on {}", config.listen)
+                            })?;
+                            let mut tasks = JoinSet::new();
+                            for listener in listeners {
+                                let config = config.clone();
+                                let core = core.clone();
+                                tasks.spawn(async move {
+                                    ::aerion::run_mieru_server_listener_with_core(
+                                        listener, config, core,
+                                    )
+                                    .await
+                                });
+                            }
+                            while let Some(result) = tasks.join_next().await {
+                                result.context("join Aerion Mieru listener task")??;
+                            }
+                            Ok(())
+                        }
                     }
                     BuiltServerConfig::Naive(config) => {
                         ::aerion::run_naive_server_with_core(config, core).await
