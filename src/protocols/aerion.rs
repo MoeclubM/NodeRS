@@ -170,8 +170,8 @@ impl ServerController {
                         let listeners =
                             bind_listeners(&config.listen.ip().to_string(), config.listen.port())
                                 .with_context(|| {
-                                    format!("bind Aerion AnyTLS server on {}", config.listen)
-                                })?;
+                                format!("bind Aerion AnyTLS server on {}", config.listen)
+                            })?;
                         let mut tasks = JoinSet::new();
                         for listener in listeners {
                             let config = config.clone();
