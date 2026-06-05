@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info};
 
 use crate::accounting::Accounting;
@@ -13,7 +13,9 @@ use crate::acme;
 use crate::panel::{NodeConfigResponse, PanelUser};
 use crate::protocols::ProtocolKind;
 
-use super::shared::{EffectiveTlsConfig, aerion_ech_keys, effective_listen_ip, tls};
+use super::shared::{
+    EffectiveTlsConfig, aerion_ech_keys, bind_listeners, effective_listen_ip, tls,
+};
 
 pub struct ServerController {
     protocol: ProtocolKind,
@@ -165,12 +167,24 @@ impl ServerController {
             let result: anyhow::Result<()> = async move {
                 match config {
                     BuiltServerConfig::Anytls(config) => {
-                        let listener = tokio::net::TcpListener::bind(config.listen)
-                            .await
-                            .with_context(|| {
-                                format!("bind Aerion AnyTLS server on {}", config.listen)
-                            })?;
-                        ::aerion::run_server_listener_with_core(listener, config, core).await
+                        let listeners =
+                            bind_listeners(&config.listen.ip().to_string(), config.listen.port())
+                                .with_context(|| {
+                                    format!("bind Aerion AnyTLS server on {}", config.listen)
+                                })?;
+                        let mut tasks = JoinSet::new();
+                        for listener in listeners {
+                            let config = config.clone();
+                            let core = core.clone();
+                            tasks.spawn(async move {
+                                ::aerion::run_server_listener_with_core(listener, config, core)
+                                    .await
+                            });
+                        }
+                        while let Some(result) = tasks.join_next().await {
+                            result.context("join Aerion AnyTLS listener task")??;
+                        }
+                        Ok(())
                     }
                     BuiltServerConfig::Hysteria2(config) => {
                         ::aerion::run_hysteria2_server_with_core(config, core).await
