@@ -1079,7 +1079,19 @@ fn heartbeat_interval_secs(remote: &NodeConfigResponse) -> anyhow::Result<u64> {
 }
 
 fn hysteria2_obfs(remote: &NodeConfigResponse) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let xboard_obfs = remote.is_obfs;
     let Some(obfs) = remote.obfs.as_ref() else {
+        if xboard_obfs {
+            let mut password = remote.obfs_password.trim();
+            if password.is_empty() {
+                password = remote.server_key.trim();
+            }
+            ensure!(
+                !password.is_empty(),
+                "HY2 salamander obfs password is required"
+            );
+            return Ok((Some("salamander".to_string()), Some(password.to_string())));
+        }
         ensure!(
             remote.obfs_password.trim().is_empty(),
             "HY2 obfs password requires salamander obfs"
@@ -1087,6 +1099,7 @@ fn hysteria2_obfs(remote: &NodeConfigResponse) -> anyhow::Result<(Option<String>
         return Ok((None, None));
     };
     if !crate::panel::json_value_is_enabled(obfs) {
+        ensure!(!xboard_obfs, "HY2 is_obfs requires salamander obfs");
         ensure!(
             remote.obfs_password.trim().is_empty(),
             "HY2 obfs password requires salamander obfs"
@@ -1106,7 +1119,10 @@ fn hysteria2_obfs(remote: &NodeConfigResponse) -> anyhow::Result<(Option<String>
         obfs_type.eq_ignore_ascii_case("salamander"),
         "HY2 obfs must be salamander"
     );
-    let password = remote.obfs_password.trim();
+    let mut password = remote.obfs_password.trim();
+    if password.is_empty() {
+        password = remote.server_key.trim();
+    }
     ensure!(
         !password.is_empty(),
         "HY2 salamander obfs password is required"
@@ -1352,6 +1368,47 @@ mod tests {
         };
         assert_eq!(config.username, "uuid-secret");
         assert_eq!(config.password, "uuid-secret");
+    }
+
+    #[tokio::test]
+    async fn builds_hysteria2_server_config_from_xboard_obfs_fields() {
+        let remote = NodeConfigResponse {
+            listen_ip: "127.0.0.1".to_string(),
+            server_port: 8444,
+            network: "udp".to_string(),
+            server_name: "hy2.example.com".to_string(),
+            version: Some(json!(2)),
+            up_mbps: Some(json!(100)),
+            server_key: "xboard-obfs-secret".to_string(),
+            is_obfs: true,
+            congestion_control: "reno".to_string(),
+            udp_relay_mode: "native".to_string(),
+            ..Default::default()
+        };
+        let users = vec![PanelUser {
+            id: 1001,
+            uuid: "uuid-secret".to_string(),
+            password: "password-secret".to_string(),
+            ..Default::default()
+        }];
+
+        let BuiltServerConfig::Hysteria2(config) = build_hysteria2_config(&remote, &users)
+            .await
+            .expect("build Hysteria2 config")
+        else {
+            panic!("expected Hysteria2 config");
+        };
+        assert_eq!(config.listen, "127.0.0.1:8444".parse().unwrap());
+        assert_eq!(config.users, vec!["password-secret", "uuid-secret"]);
+        assert_eq!(config.obfs.as_deref(), Some("salamander"));
+        assert_eq!(config.obfs_password.as_deref(), Some("xboard-obfs-secret"));
+        assert_eq!(config.upload_bandwidth, Some(100));
+        assert_eq!(config.cc_rx, "12500000");
+        assert_eq!(config.congestion_control, "reno");
+        assert!(config.udp);
+        assert_eq!(config.cert_path, PathBuf::new());
+        assert!(config.key.is_some());
+        assert_eq!(config.certificates.len(), 1);
     }
 
     #[test]

@@ -111,6 +111,12 @@ pub struct NodeConfigResponse {
     pub obfs: Option<Value>,
     #[serde(
         default,
+        alias = "isObfs",
+        deserialize_with = "deserialize_bool_from_any_on_null"
+    )]
+    pub is_obfs: bool,
+    #[serde(
+        default,
         alias = "obfs-password",
         deserialize_with = "deserialize_default_on_null"
     )]
@@ -2463,6 +2469,7 @@ mod tests {
                 "obfs": {
                     "type": "salamander"
                 },
+                "is_obfs": true,
                 "obfs-password": "cry_me_a_r1ver",
                 "congestion_control": "bbr",
                 "auth_timeout": "3s",
@@ -2515,6 +2522,7 @@ mod tests {
             config.obfs,
             Some(serde_json::json!({ "type": "salamander" }))
         );
+        assert!(config.is_obfs);
         assert_eq!(config.obfs_password, "cry_me_a_r1ver");
         assert_eq!(config.congestion_control, "bbr");
         assert_eq!(config.auth_timeout, "3s");
