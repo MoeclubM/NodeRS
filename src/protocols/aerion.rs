@@ -1,11 +1,12 @@
 use anyhow::{Context, bail, ensure};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::accounting::Accounting;
@@ -28,7 +29,7 @@ pub struct ServerController {
 }
 
 struct RunningServer {
-    handle: JoinHandle<()>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 struct AerionTlsIdentity {
@@ -149,140 +150,24 @@ impl ServerController {
     }
 
     async fn restart(&self) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
         let remote = self.remote.read().await.clone();
         let users = self.users.read().await.clone();
         let Some(remote) = remote else {
             return Ok(());
         };
         if users.is_empty() {
-            self.stop().await;
+            self.stop_locked(&mut inner).await;
             return Ok(());
         }
 
         let config = build_server_config(self.protocol, &remote, &users).await?;
-        self.stop().await;
-        let protocol = self.protocol;
-        let core = self.core.clone();
-        let handle = tokio::spawn(async move {
-            let result: anyhow::Result<()> = async move {
-                match config {
-                    BuiltServerConfig::Anytls(config) => {
-                        let listeners =
-                            bind_listeners(&config.listen.ip().to_string(), config.listen.port())
-                                .with_context(|| {
-                                format!("bind Aerion AnyTLS server on {}", config.listen)
-                            })?;
-                        let mut tasks = JoinSet::new();
-                        for listener in listeners {
-                            let config = config.clone();
-                            let core = core.clone();
-                            tasks.spawn(async move {
-                                ::aerion::run_server_listener_with_core(listener, config, core)
-                                    .await
-                            });
-                        }
-                        while let Some(result) = tasks.join_next().await {
-                            result.context("join Aerion AnyTLS listener task")??;
-                        }
-                        Ok(())
-                    }
-                    BuiltServerConfig::Hysteria2(config) => {
-                        let sockets =
-                            bind_udp_sockets(&config.listen.ip().to_string(), config.listen.port())
-                                .with_context(|| {
-                                    format!("bind Aerion Hysteria2 server on {}", config.listen)
-                                })?;
-                        let mut tasks = JoinSet::new();
-                        for socket in sockets {
-                            let config = config.clone();
-                            let core = core.clone();
-                            tasks.spawn(async move {
-                                let socket = socket
-                                    .into_std()
-                                    .context("convert Hysteria2 UDP socket to std")?;
-                                ::aerion::run_hysteria2_server_socket_with_core(
-                                    socket, config, core,
-                                )
-                                .await
-                            });
-                        }
-                        while let Some(result) = tasks.join_next().await {
-                            result.context("join Aerion Hysteria2 listener task")??;
-                        }
-                        Ok(())
-                    }
-                    BuiltServerConfig::Mieru(config) => {
-                        if config.transport == ::aerion::MieruTransport::Udp {
-                            let sockets = bind_udp_sockets(
-                                &config.listen.ip().to_string(),
-                                config.listen.port(),
-                            )
-                            .with_context(|| {
-                                format!("bind Aerion Mieru UDP server on {}", config.listen)
-                            })?;
-                            let mut tasks = JoinSet::new();
-                            for socket in sockets {
-                                let config = config.clone();
-                                let core = core.clone();
-                                tasks.spawn(async move {
-                                    ::aerion::run_mieru_packet_server_socket_with_core(
-                                        socket, config, core,
-                                    )
-                                    .await
-                                });
-                            }
-                            while let Some(result) = tasks.join_next().await {
-                                result.context("join Aerion Mieru UDP listener task")??;
-                            }
-                            Ok(())
-                        } else {
-                            let listeners = bind_listeners(
-                                &config.listen.ip().to_string(),
-                                config.listen.port(),
-                            )
-                            .with_context(|| {
-                                format!("bind Aerion Mieru server on {}", config.listen)
-                            })?;
-                            let mut tasks = JoinSet::new();
-                            for listener in listeners {
-                                let config = config.clone();
-                                let core = core.clone();
-                                tasks.spawn(async move {
-                                    ::aerion::run_mieru_server_listener_with_core(
-                                        listener, config, core,
-                                    )
-                                    .await
-                                });
-                            }
-                            while let Some(result) = tasks.join_next().await {
-                                result.context("join Aerion Mieru listener task")??;
-                            }
-                            Ok(())
-                        }
-                    }
-                    BuiltServerConfig::Naive(config) => {
-                        ::aerion::run_naive_server_with_core(config, core).await
-                    }
-                    BuiltServerConfig::Trojan(config) => {
-                        ::aerion::run_trojan_server_with_core(config, core).await
-                    }
-                    BuiltServerConfig::Tuic(config) => {
-                        ::aerion::run_tuic_server_with_core(config, core).await
-                    }
-                    BuiltServerConfig::Vless(config) => {
-                        ::aerion::run_vless_server_with_core(config, core).await
-                    }
-                    BuiltServerConfig::Vmess(config) => {
-                        ::aerion::run_vmess_server_with_core(config, core).await
-                    }
-                }
-            }
-            .await;
-            if let Err(error) = result {
-                error!(protocol = protocol.as_str(), %error, "Aerion server exited");
-            }
-        });
-        *self.inner.lock().await = Some(RunningServer { handle });
+        self.stop_locked(&mut inner).await;
+        *inner = Some(spawn_running_server(
+            self.protocol,
+            config,
+            self.core.clone(),
+        )?);
         info!(
             protocol = self.protocol.as_str(),
             "Aerion protocol runtime applied"
@@ -291,17 +176,130 @@ impl ServerController {
     }
 
     async fn stop(&self) {
-        let old = self.inner.lock().await.take();
+        let mut inner = self.inner.lock().await;
+        self.stop_locked(&mut inner).await;
+    }
+
+    async fn stop_locked(&self, inner: &mut Option<RunningServer>) {
+        let old = inner.take();
         if let Some(old) = old {
             self.core.cancel_all_sessions();
-            old.handle.abort();
-            if let Err(error) = old.handle.await
-                && !error.is_cancelled()
-            {
-                error!(protocol = self.protocol.as_str(), %error, "Aerion server task join failed during stop");
+            for handle in old.handles {
+                handle.abort();
+                if let Err(error) = handle.await
+                    && !error.is_cancelled()
+                {
+                    error!(protocol = self.protocol.as_str(), %error, "Aerion server task join failed during stop");
+                }
             }
         }
     }
+}
+
+fn spawn_running_server(
+    protocol: ProtocolKind,
+    config: BuiltServerConfig,
+    core: ::aerion::core::ProxyCore,
+) -> anyhow::Result<RunningServer> {
+    let handles = match config {
+        BuiltServerConfig::Anytls(config) => {
+            let listeners =
+                bind_listeners(&config.listen.ip().to_string(), config.listen.port())
+                    .with_context(|| format!("bind Aerion AnyTLS server on {}", config.listen))?;
+            listeners
+                .into_iter()
+                .map(|listener| {
+                    let config = config.clone();
+                    let core = core.clone();
+                    spawn_aerion_task(protocol, async move {
+                        ::aerion::run_server_listener_with_core(listener, config, core).await
+                    })
+                })
+                .collect()
+        }
+        BuiltServerConfig::Hysteria2(config) => {
+            let sockets = bind_udp_sockets(&config.listen.ip().to_string(), config.listen.port())
+                .with_context(|| {
+                format!("bind Aerion Hysteria2 server on {}", config.listen)
+            })?;
+            let mut handles = Vec::new();
+            for socket in sockets {
+                let socket = socket
+                    .into_std()
+                    .context("convert Hysteria2 UDP socket to std")?;
+                let config = config.clone();
+                let core = core.clone();
+                handles.push(spawn_aerion_task(protocol, async move {
+                    ::aerion::run_hysteria2_server_socket_with_core(socket, config, core).await
+                }));
+            }
+            handles
+        }
+        BuiltServerConfig::Mieru(config) => {
+            if config.transport == ::aerion::MieruTransport::Udp {
+                let sockets =
+                    bind_udp_sockets(&config.listen.ip().to_string(), config.listen.port())
+                        .with_context(|| {
+                            format!("bind Aerion Mieru UDP server on {}", config.listen)
+                        })?;
+                sockets
+                    .into_iter()
+                    .map(|socket| {
+                        let config = config.clone();
+                        let core = core.clone();
+                        spawn_aerion_task(protocol, async move {
+                            ::aerion::run_mieru_packet_server_socket_with_core(socket, config, core)
+                                .await
+                        })
+                    })
+                    .collect()
+            } else {
+                let listeners =
+                    bind_listeners(&config.listen.ip().to_string(), config.listen.port())
+                        .with_context(|| {
+                            format!("bind Aerion Mieru server on {}", config.listen)
+                        })?;
+                listeners
+                    .into_iter()
+                    .map(|listener| {
+                        let config = config.clone();
+                        let core = core.clone();
+                        spawn_aerion_task(protocol, async move {
+                            ::aerion::run_mieru_server_listener_with_core(listener, config, core)
+                                .await
+                        })
+                    })
+                    .collect()
+            }
+        }
+        BuiltServerConfig::Naive(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_naive_server_with_core(config, core).await
+        })],
+        BuiltServerConfig::Trojan(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_trojan_server_with_core(config, core).await
+        })],
+        BuiltServerConfig::Tuic(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_tuic_server_with_core(config, core).await
+        })],
+        BuiltServerConfig::Vless(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_vless_server_with_core(config, core).await
+        })],
+        BuiltServerConfig::Vmess(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_vmess_server_with_core(config, core).await
+        })],
+    };
+    Ok(RunningServer { handles })
+}
+
+fn spawn_aerion_task<F>(protocol: ProtocolKind, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(error) = future.await {
+            error!(protocol = protocol.as_str(), %error, "Aerion server exited");
+        }
+    })
 }
 
 async fn build_server_config(
