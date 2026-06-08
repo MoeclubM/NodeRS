@@ -1,80 +1,8 @@
-use anyhow::{Context, bail};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::Notify;
-use tokio::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::panel::PanelUser;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserEntry {
-    pub id: i64,
-    pub uuid: String,
-    pub password_sha256: [u8; 32],
-    pub speed_limit: i64,
-    pub device_limit: i64,
-}
-
-impl UserEntry {
-    pub fn from_panel_user(user: &PanelUser) -> Self {
-        let uuid = user.uuid.trim();
-        Self {
-            id: user.id,
-            uuid: uuid.to_string(),
-            password_sha256: sha256_bytes(uuid.as_bytes()),
-            speed_limit: user.speed_limit,
-            device_limit: user.device_limit,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct SpeedLimiter {
-    bytes_per_second: AtomicU64,
-    next: Mutex<Instant>,
-}
-
-impl SpeedLimiter {
-    fn new(bytes_per_second: u64) -> Arc<Self> {
-        Arc::new(Self {
-            bytes_per_second: AtomicU64::new(bytes_per_second),
-            next: Mutex::new(Instant::now()),
-        })
-    }
-
-    fn set_bytes_per_second(&self, bytes_per_second: u64) {
-        let previous = self
-            .bytes_per_second
-            .swap(bytes_per_second, Ordering::Relaxed);
-        if previous != bytes_per_second {
-            *self.next.lock().expect("speed limiter lock poisoned") = Instant::now();
-        }
-    }
-
-    pub async fn wait(&self, bytes: u64, control: &SessionControl) {
-        let bytes_per_second = self.bytes_per_second.load(Ordering::Relaxed);
-        if bytes == 0 || bytes_per_second == 0 || control.is_cancelled() {
-            return;
-        }
-
-        let wait_until = {
-            let mut next = self.next.lock().expect("speed limiter lock poisoned");
-            let now = Instant::now();
-            if *next < now {
-                *next = now;
-            }
-            *next += Duration::from_secs_f64(bytes as f64 / bytes_per_second as f64);
-            *next
-        };
-
-        tokio::select! {
-            _ = control.cancelled() => {}
-            _ = tokio::time::sleep_until(wait_until) => {}
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct UsageCounter {
@@ -103,12 +31,7 @@ impl UsageCounter {
             return None;
         }
         if total < min_traffic_bytes {
-            if upload > 0 {
-                self.upload.fetch_add(upload, Ordering::Release);
-            }
-            if download > 0 {
-                self.download.fetch_add(download, Ordering::Release);
-            }
+            self.restore(upload, download);
             return None;
         }
         Some([upload, download])
@@ -124,68 +47,9 @@ impl UsageCounter {
     }
 }
 
-#[derive(Debug)]
-pub struct SessionControl {
-    cancelled: AtomicBool,
-    notify: Notify,
-}
-
-impl SessionControl {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            cancelled: AtomicBool::new(false),
-            notify: Notify::new(),
-        })
-    }
-
-    pub fn cancel(&self) {
-        if !self.cancelled.swap(true, Ordering::SeqCst) {
-            self.notify.notify_waiters();
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    pub async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        self.notify.notified().await;
-    }
-}
-
-pub struct SessionLease {
-    accounting: Arc<Accounting>,
-    uid: i64,
-    ip: String,
-    session_id: u64,
-    control: Arc<SessionControl>,
-}
-
-impl SessionLease {
-    pub fn control(&self) -> Arc<SessionControl> {
-        self.control.clone()
-    }
-}
-
-impl Drop for SessionLease {
-    fn drop(&mut self) {
-        self.accounting
-            .close_session(self.uid, &self.ip, self.session_id);
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct Accounting {
-    users: RwLock<HashMap<[u8; 32], UserEntry>>,
     traffic: RwLock<HashMap<i64, Arc<UsageCounter>>>,
-    speed_limiters: RwLock<HashMap<i64, Arc<SpeedLimiter>>>,
-    online: Mutex<HashMap<i64, HashMap<String, usize>>>,
-    external_alive: Mutex<HashMap<i64, usize>>,
-    sessions: Mutex<HashMap<i64, HashMap<u64, Arc<SessionControl>>>>,
-    session_seq: AtomicU64,
 }
 
 impl Accounting {
@@ -193,129 +57,15 @@ impl Accounting {
         Arc::new(Self::default())
     }
 
-    pub fn replace_users(self: &Arc<Self>, users: &[PanelUser]) {
-        let previous_by_id = self
-            .users
-            .read()
-            .expect("users lock poisoned")
-            .values()
-            .map(|entry| (entry.id, entry.clone()))
-            .collect::<HashMap<_, _>>();
-
-        let mapped = users
-            .iter()
-            .map(|user| {
-                let entry = UserEntry::from_panel_user(user);
-                (entry.password_sha256, entry)
-            })
-            .collect::<HashMap<_, _>>();
-
-        let valid_ids = mapped
-            .values()
-            .map(|entry| entry.id)
-            .collect::<HashSet<_>>();
-        let rotated_ids = users
-            .iter()
-            .filter_map(|user| {
-                previous_by_id.get(&user.id).and_then(|previous| {
-                    if previous.uuid != user.uuid {
-                        Some(user.id)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect::<HashSet<_>>();
-
-        *self.users.write().expect("users lock poisoned") = mapped;
-        {
-            let mut traffic = self.traffic.write().expect("traffic lock poisoned");
-            for user in users {
-                traffic
-                    .entry(user.id)
-                    .or_insert_with(|| Arc::new(UsageCounter::default()));
-            }
-            traffic.retain(|uid, _| valid_ids.contains(uid));
-        }
-        {
-            let mut speed_limiters = self
-                .speed_limiters
-                .write()
-                .expect("speed limiter lock poisoned");
-            for user in users {
-                let bytes_per_second = speed_limit_bytes_per_second(user.speed_limit);
-                speed_limiters
-                    .entry(user.id)
-                    .or_insert_with(|| SpeedLimiter::new(bytes_per_second))
-                    .set_bytes_per_second(bytes_per_second);
-            }
-            speed_limiters.retain(|uid, _| valid_ids.contains(uid));
-        }
-        self.online
-            .lock()
-            .expect("online lock poisoned")
-            .retain(|uid, _| valid_ids.contains(uid));
-        self.external_alive
-            .lock()
-            .expect("external alive lock poisoned")
-            .retain(|uid, _| valid_ids.contains(uid));
-
-        let removed_ids = previous_by_id
-            .keys()
-            .filter(|uid| !valid_ids.contains(uid))
-            .copied()
-            .collect::<HashSet<_>>();
-        self.cancel_sessions_for_ids(&removed_ids);
-        self.cancel_sessions_for_ids(&rotated_ids);
-    }
-
-    pub fn set_external_alive_counts(&self, alive: &HashMap<String, i64>) {
-        let mut parsed = HashMap::new();
-        for (uid, count) in alive {
-            if let (Ok(uid), Ok(count)) = (uid.parse::<i64>(), usize::try_from((*count).max(0))) {
-                parsed.insert(uid, count);
-            }
-        }
-        *self
-            .external_alive
-            .lock()
-            .expect("external alive lock poisoned") = parsed;
-    }
-
-    pub fn find_user_by_hash(&self, hash: &[u8; 32]) -> Option<UserEntry> {
-        self.users
-            .read()
-            .expect("users lock poisoned")
-            .get(hash)
-            .cloned()
-    }
-
-    pub fn open_session(
-        self: &Arc<Self>,
-        user: &UserEntry,
-        source: std::net::SocketAddr,
-    ) -> anyhow::Result<SessionLease> {
-        let ip = normalize_ip(source.ip().to_string());
-        self.reserve_session_slot(user, &ip)
-            .with_context(|| format!("device limit reject for user {}", user.uuid))?;
-
-        let session_id = self.session_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let control = SessionControl::new();
-        {
-            let mut sessions = self.sessions.lock().expect("session lock poisoned");
-            sessions
+    pub fn replace_users(&self, users: &[PanelUser]) {
+        let valid_ids = users.iter().map(|user| user.id).collect::<HashSet<_>>();
+        let mut traffic = self.traffic.write().expect("traffic lock poisoned");
+        for user in users {
+            traffic
                 .entry(user.id)
-                .or_default()
-                .insert(session_id, control.clone());
+                .or_insert_with(|| Arc::new(UsageCounter::default()));
         }
-
-        Ok(SessionLease {
-            accounting: self.clone(),
-            uid: user.id,
-            ip,
-            session_id,
-            control,
-        })
+        traffic.retain(|uid, _| valid_ids.contains(uid));
     }
 
     pub fn traffic_counter(&self, uid: i64) -> Arc<UsageCounter> {
@@ -332,26 +82,6 @@ impl Accounting {
         guard
             .entry(uid)
             .or_insert_with(|| Arc::new(UsageCounter::default()))
-            .clone()
-    }
-
-    pub fn speed_limiter(&self, uid: i64) -> Arc<SpeedLimiter> {
-        if let Some(limiter) = self
-            .speed_limiters
-            .read()
-            .expect("speed limiter lock poisoned")
-            .get(&uid)
-            .cloned()
-        {
-            return limiter;
-        }
-        let mut guard = self
-            .speed_limiters
-            .write()
-            .expect("speed limiter lock poisoned");
-        guard
-            .entry(uid)
-            .or_insert_with(|| SpeedLimiter::new(0))
             .clone()
     }
 
@@ -373,103 +103,10 @@ impl Accounting {
     }
 
     pub fn restore_traffic(&self, traffic: &HashMap<i64, [u64; 2]>) {
-        if traffic.is_empty() {
-            return;
-        }
         for (uid, [upload, download]) in traffic {
             self.traffic_counter(*uid).restore(*upload, *download);
         }
     }
-
-    pub fn snapshot_alive(&self) -> HashMap<i64, Vec<String>> {
-        self.online
-            .lock()
-            .expect("online lock poisoned")
-            .iter()
-            .map(|(uid, ips)| (*uid, ips.keys().cloned().collect::<Vec<_>>()))
-            .collect()
-    }
-
-    fn reserve_session_slot(&self, user: &UserEntry, ip: &str) -> anyhow::Result<()> {
-        let external = self
-            .external_alive
-            .lock()
-            .expect("external alive lock poisoned");
-        let mut online = self.online.lock().expect("online lock poisoned");
-        let ip_map = online.entry(user.id).or_default();
-        if user.device_limit > 0 && !ip_map.contains_key(ip) {
-            let local_unique = ip_map.len();
-            let external_count = external.get(&user.id).copied().unwrap_or(0);
-            let adjusted_external = external_count.saturating_sub(local_unique);
-            if adjusted_external + local_unique >= user.device_limit as usize {
-                bail!(
-                    "device limit exceeded: uid={}, limit={}, local_unique={}, external_alive={}",
-                    user.id,
-                    user.device_limit,
-                    local_unique,
-                    external_count
-                );
-            }
-        }
-        *ip_map.entry(ip.to_string()).or_default() += 1;
-        Ok(())
-    }
-
-    fn close_session(&self, uid: i64, ip: &str, session_id: u64) {
-        {
-            let mut sessions = self.sessions.lock().expect("session lock poisoned");
-            if let Some(entries) = sessions.get_mut(&uid) {
-                entries.remove(&session_id);
-                if entries.is_empty() {
-                    sessions.remove(&uid);
-                }
-            }
-        }
-        let mut online = self.online.lock().expect("online lock poisoned");
-        if let Some(ip_map) = online.get_mut(&uid) {
-            if let Some(count) = ip_map.get_mut(ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    ip_map.remove(ip);
-                }
-            }
-            if ip_map.is_empty() {
-                online.remove(&uid);
-            }
-        }
-    }
-
-    pub(crate) fn cancel_sessions_for_ids(&self, ids: &HashSet<i64>) {
-        if ids.is_empty() {
-            return;
-        }
-        let controls = {
-            let sessions = self.sessions.lock().expect("session lock poisoned");
-            ids.iter()
-                .filter_map(|uid| sessions.get(uid))
-                .flat_map(|entries| entries.values().cloned())
-                .collect::<Vec<_>>()
-        };
-        for control in controls {
-            control.cancel();
-        }
-    }
-}
-
-fn sha256_bytes(input: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hasher.finalize().into()
-}
-
-fn normalize_ip(ip: String) -> String {
-    ip.trim_start_matches("::ffff:").to_string()
-}
-
-fn speed_limit_bytes_per_second(speed_limit: i64) -> u64 {
-    u64::try_from(speed_limit)
-        .unwrap_or(0)
-        .saturating_mul(125_000)
 }
 
 #[cfg(test)]
@@ -477,73 +114,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replaces_users_and_resolves_hash() {
+    fn replace_users_removes_old_counters() {
         let accounting = Accounting::new();
         accounting.replace_users(&[PanelUser {
             id: 1,
-            uuid: "abc".to_string(),
             ..Default::default()
         }]);
-        let hash = sha256_bytes(b"abc");
-        assert_eq!(accounting.find_user_by_hash(&hash).map(|it| it.id), Some(1));
-    }
+        accounting.traffic_counter(1).record_upload(100);
 
-    #[test]
-    fn device_limit_blocks_new_ip() {
-        let accounting = Accounting::new();
         accounting.replace_users(&[PanelUser {
-            id: 1,
-            uuid: "abc".to_string(),
-            device_limit: 1,
-            ..Default::default()
-        }]);
-        let user = accounting
-            .find_user_by_hash(&sha256_bytes(b"abc"))
-            .expect("user exists");
-        let _lease = accounting
-            .open_session(&user, "1.1.1.1:1234".parse().expect("socket addr"))
-            .expect("first session should pass");
-        assert!(
-            accounting
-                .open_session(&user, "2.2.2.2:2345".parse().expect("socket addr"))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn removing_user_cancels_active_session() {
-        let accounting = Accounting::new();
-        accounting.replace_users(&[PanelUser {
-            id: 1,
-            uuid: "abc".to_string(),
-            ..Default::default()
-        }]);
-        let user = accounting
-            .find_user_by_hash(&sha256_bytes(b"abc"))
-            .expect("user exists");
-        let lease = accounting
-            .open_session(&user, "1.1.1.1:1234".parse().expect("socket addr"))
-            .expect("session should open");
-        let control = lease.control();
-        accounting.replace_users(&[]);
-        assert!(control.is_cancelled());
-    }
-
-    #[test]
-    fn trims_uuid_before_hashing() {
-        let accounting = Accounting::new();
-        accounting.replace_users(&[PanelUser {
-            id: 7,
-            uuid: "  abc  ".to_string(),
+            id: 2,
             ..Default::default()
         }]);
 
-        assert_eq!(
-            accounting
-                .find_user_by_hash(&sha256_bytes(b"abc"))
-                .map(|entry| entry.id),
-            Some(7)
-        );
+        assert!(accounting.snapshot_traffic(0).is_empty());
+        accounting.traffic_counter(2).record_download(40);
+        assert_eq!(accounting.snapshot_traffic(0).get(&2), Some(&[0, 40]));
     }
 
     #[test]
@@ -561,26 +147,15 @@ mod tests {
         assert_eq!(accounting.snapshot_traffic(0).get(&1), Some(&[100, 40]));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn speed_limiter_waits_for_configured_user_rate() {
+    #[test]
+    fn keeps_small_traffic_until_threshold_is_met() {
         let accounting = Accounting::new();
-        accounting.replace_users(&[PanelUser {
-            id: 1,
-            uuid: "abc".to_string(),
-            speed_limit: 1,
-            ..Default::default()
-        }]);
-        let control = SessionControl::new();
-        let limiter = accounting.speed_limiter(1);
-        let wait = limiter.wait(125_000, &control);
-        tokio::pin!(wait);
+        let counter = accounting.traffic_counter(1);
+        counter.record_upload(10);
+        counter.record_download(5);
 
-        tokio::select! {
-            _ = &mut wait => panic!("speed limiter completed before configured interval"),
-            _ = tokio::time::sleep(Duration::from_millis(999)) => {}
-        }
-
-        tokio::time::advance(Duration::from_millis(1)).await;
-        wait.await;
+        assert!(accounting.snapshot_traffic(20).is_empty());
+        counter.record_upload(5);
+        assert_eq!(accounting.snapshot_traffic(20).get(&1), Some(&[15, 5]));
     }
 }

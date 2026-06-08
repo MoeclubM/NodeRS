@@ -15,7 +15,7 @@ dependencies = [
 [[package]]
 name = "aerion"
 version = "0.1.0"
-source = "git+https://github.com/MoeclubM/Aerion.git?rev=fc9ef6853611c02ade9f168408e31254e3f38864#fc9ef6853611c02ade9f168408e31254e3f38864"
+source = "git+https://github.com/MoeclubM/Aerion.git?rev=942c5fb689b54a669415e7d4d27bc4bfe5e99ca1#942c5fb689b54a669415e7d4d27bc4bfe5e99ca1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -370,7 +370,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "regex",
@@ -1422,17 +1422,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "h3-datagram"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
-dependencies = [
- "bytes",
- "h3",
- "pin-project-lite",
-]
-
-[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1441,7 +1430,6 @@ dependencies = [
  "bytes",
  "futures",
  "h3",
- "h3-datagram",
  "quinn",
  "tokio",
  "tokio-util",
@@ -1818,15 +1806,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,60 +2140,32 @@ dependencies = [
 
 [[package]]
 name = "noders"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "aerion",
  "anyhow",
  "base64",
- "blake2",
- "blake3",
  "boring",
- "bytes",
  "futures-util",
- "h2",
- "h3",
- "h3-quinn",
  "hex",
- "hkdf",
  "hmac",
- "http",
  "libc",
- "md-5",
  "p256",
- "parking_lot",
- "pbkdf2",
  "percent-encoding",
- "pqc_kyber",
- "prost",
- "quinn",
- "rand 0.10.1",
- "rand_core 0.6.4",
  "rcgen 0.14.8",
- "regex",
  "reqwest",
- "rustc-hash",
  "rustls",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
- "socket2",
  "time",
  "tokio",
- "tokio-boring",
- "tokio-rustls",
  "tokio-tungstenite",
- "tokio-yamux",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
-
-[[package]]
-name = "nohash-hasher"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -2365,16 +2316,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "pbkdf2"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
-dependencies = [
- "digest",
- "hmac",
-]
-
-[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2509,15 +2450,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pqc_kyber"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b23e1823e8a78ad67990c5cb843d5eba75ab3b8a44d041f3814fde89463dc6f"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2543,29 +2475,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "prost"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
-dependencies = [
- "bytes",
- "prost-derive",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
-dependencies = [
- "anyhow",
- "itertools 0.14.0",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -3716,21 +3625,6 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tokio-yamux"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6489207fc5dedea9723f5dc1c3ab96103c001449fa6056ca6cdba74ffbd84512"
-dependencies = [
- "bytes",
- "futures",
- "log",
- "nohash-hasher",
- "tokio",
- "tokio-util",
- "web-time",
 ]
 
 [[package]]

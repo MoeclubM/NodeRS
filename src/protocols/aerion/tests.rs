@@ -29,6 +29,107 @@ fn builds_mieru_server_config() {
 }
 
 #[test]
+fn builds_shadowsocks_legacy_server_config() {
+    let remote = NodeConfigResponse {
+        listen_ip: "127.0.0.1".to_string(),
+        server_port: 8388,
+        cipher: "aead_aes_128_gcm".to_string(),
+        ..Default::default()
+    };
+    let users = vec![PanelUser {
+        id: 1001,
+        password: "ss-secret".to_string(),
+        ..Default::default()
+    }];
+
+    let BuiltServerConfig::Shadowsocks(config) =
+        shadowsocks::build_config(&remote, &users).expect("build Shadowsocks config")
+    else {
+        panic!("expected Shadowsocks config");
+    };
+    assert_eq!(config.listen, "127.0.0.1:8388".parse().unwrap());
+    assert_eq!(config.method, "aes-128-gcm");
+    assert_eq!(config.password, "ss-secret");
+    assert!(config.users.is_empty());
+    assert!(config.tcp);
+    assert!(!config.udp);
+}
+
+#[test]
+fn builds_shadowsocks_2022_udp_multi_user_config() {
+    let remote = NodeConfigResponse {
+        listen_ip: "127.0.0.1".to_string(),
+        server_port: 8388,
+        network: "udp".to_string(),
+        cipher: "2022-blake3-aes-128-gcm".to_string(),
+        server_key: "QUJDREVGR0hJSktMTU5PUA==".to_string(),
+        ..Default::default()
+    };
+    let users = vec![
+        PanelUser {
+            id: 1001,
+            password: "MTIzNDU2Nzg5MGFiY2RlZg==".to_string(),
+            ..Default::default()
+        },
+        PanelUser {
+            id: 1002,
+            password: "YWJjZGVmMTIzNDU2Nzg5MA==".to_string(),
+            ..Default::default()
+        },
+    ];
+
+    let BuiltServerConfig::Shadowsocks(config) =
+        shadowsocks::build_config(&remote, &users).expect("build Shadowsocks config")
+    else {
+        panic!("expected Shadowsocks config");
+    };
+    assert_eq!(config.password, "QUJDREVGR0hJSktMTU5PUA==");
+    assert_eq!(
+        config.users,
+        vec![
+            "1001:MTIzNDU2Nzg5MGFiY2RlZg==".to_string(),
+            "1002:YWJjZGVmMTIzNDU2Nzg5MA==".to_string()
+        ]
+    );
+    assert!(!config.tcp);
+    assert!(config.udp);
+
+    let core_users = shadowsocks::core_users(&remote, &users).expect("core users");
+    assert_eq!(core_users[0].id, "1001");
+    assert_eq!(core_users[0].credential, "MTIzNDU2Nzg5MGFiY2RlZg==");
+    assert_eq!(core_users[1].id, "1002");
+}
+
+#[test]
+fn rejects_shadowsocks_tcp_multi_user_accounting_gap() {
+    let remote = NodeConfigResponse {
+        listen_ip: "127.0.0.1".to_string(),
+        server_port: 8388,
+        cipher: "2022-blake3-aes-128-gcm".to_string(),
+        server_key: "QUJDREVGR0hJSktMTU5PUA==".to_string(),
+        ..Default::default()
+    };
+    let users = vec![
+        PanelUser {
+            id: 1001,
+            password: "MTIzNDU2Nzg5MGFiY2RlZg==".to_string(),
+            ..Default::default()
+        },
+        PanelUser {
+            id: 1002,
+            password: "YWJjZGVmMTIzNDU2Nzg5MA==".to_string(),
+            ..Default::default()
+        },
+    ];
+
+    let error = match shadowsocks::build_config(&remote, &users) {
+        Ok(_) => panic!("tcp multi-user should fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("TCP multi-user accounting"));
+}
+
+#[test]
 fn builds_mieru_server_config_ignores_xboard_tls_and_cert() {
     let remote = NodeConfigResponse {
         listen_ip: "127.0.0.1".to_string(),

@@ -8,6 +8,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{error, info};
 
 mod runner;
+mod shadowsocks;
 mod users;
 
 use crate::accounting::Accounting;
@@ -42,6 +43,7 @@ enum BuiltServerConfig {
     Hysteria2(::aerion::Hysteria2ServerConfig),
     Mieru(::aerion::MieruServerConfig),
     Naive(::aerion::NaiveServerConfig),
+    Shadowsocks(::aerion::ShadowsocksServerConfig),
     Trojan(::aerion::TrojanServerConfig),
     Tuic(::aerion::TuicServerConfig),
     Vless(::aerion::VlessServerConfig),
@@ -74,7 +76,6 @@ impl ServerController {
     pub async fn replace_users(&self, users: &[PanelUser]) -> anyhow::Result<()> {
         self.flush_traffic().await?;
         self.accounting.replace_users(users);
-        self.core.replace_users(core_users(self.protocol, users)?)?;
         let active = users
             .iter()
             .map(|user| user.id.to_string())
@@ -156,11 +157,14 @@ impl ServerController {
         };
         if users.is_empty() {
             self.stop_locked(&mut inner).await;
+            self.core.replace_users(Vec::new())?;
             return Ok(());
         }
 
         let config = build_server_config(self.protocol, &remote, &users).await?;
+        let core_users = core_users(self.protocol, &remote, &users)?;
         self.stop_locked(&mut inner).await;
+        self.core.replace_users(core_users)?;
         *inner = Some(spawn_running_server(
             self.protocol,
             config,
@@ -204,11 +208,11 @@ async fn build_server_config(
         ProtocolKind::Hysteria2 => build_hysteria2_config(remote, users).await,
         ProtocolKind::Mieru => build_mieru_config(remote, users),
         ProtocolKind::Naive => build_naive_config(remote, users).await,
+        ProtocolKind::Shadowsocks => shadowsocks::build_config(remote, users),
         ProtocolKind::Trojan => build_trojan_config(remote, users).await,
         ProtocolKind::Tuic => build_tuic_config(remote, users).await,
         ProtocolKind::Vless => build_vless_config(remote, users).await,
         ProtocolKind::Vmess => build_vmess_config(remote, users).await,
-        ProtocolKind::Shadowsocks => bail!("Shadowsocks is not handled by Aerion controller"),
     }
 }
 

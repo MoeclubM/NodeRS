@@ -472,19 +472,6 @@ pub enum RouteMatch {
     Strings(Vec<String>),
 }
 
-impl RouteMatch {
-    pub fn items(&self) -> Vec<String> {
-        let raw = match self {
-            Self::String(text) => text.split(',').map(ToString::to_string).collect(),
-            Self::Strings(items) => items.clone(),
-        };
-        raw.into_iter()
-            .map(|item| item.trim().to_string())
-            .filter(|item| !item.is_empty())
-            .collect()
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RouteConfig {
     pub id: i64,
@@ -498,15 +485,6 @@ pub struct RouteConfig {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub action_value: String,
-}
-
-impl RouteConfig {
-    pub fn match_items(&self) -> Vec<String> {
-        self.match_value
-            .as_ref()
-            .map(RouteMatch::items)
-            .unwrap_or_default()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -574,12 +552,6 @@ pub struct PanelUser {
         deserialize_with = "deserialize_default_on_null"
     )]
     pub device_limit: i64,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct AliveListResponse {
-    #[serde(default)]
-    pub alive: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
@@ -737,19 +709,6 @@ impl NodePanelClient {
         etag: Option<&str>,
     ) -> anyhow::Result<FetchState<UsersResponse>> {
         self.fetch_etag("/api/v2/server/user", etag).await
-    }
-
-    pub async fn fetch_alive_list(&self) -> anyhow::Result<AliveListResponse> {
-        let response = self
-            .machine
-            .client
-            .get(self.machine.url("/api/v2/server/alivelist"))
-            .query(&self.query())
-            .send()
-            .await
-            .context("request Xboard alive list")?;
-        ensure_success(response.status(), "fetch alive list")?;
-        response.json().await.context("decode alive list")
     }
 
     pub async fn report_traffic(
