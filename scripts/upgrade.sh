@@ -775,9 +775,10 @@ main() {
     return
   fi
 
-  ensure_existing_installation
   if legacy_layout_detected; then
     migrate_legacy_layout
+  else
+    ensure_existing_installation
   fi
   discover_units
   refresh_systemd_unit_files
