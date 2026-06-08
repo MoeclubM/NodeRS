@@ -233,6 +233,61 @@ EOF
   assert_contains "Migrating legacy noders-anytls layout" "$stdout_path" "upgrade.sh did not report migration"
 )
 
+test_upgrade_removes_stale_numeric_systemd_unit() (
+  local tmp_root bundle_root fake_bin systemctl_log unit_path stderr_path stdout_path upgrade_path
+
+  tmp_root="$(mktemp -d)"
+  unit_path="/etc/systemd/system/noders-998877665.service"
+  cleanup_upgrade_stale_unit_test() {
+    rm -f "$unit_path"
+    rm -rf "$tmp_root"
+  }
+  trap cleanup_upgrade_stale_unit_test EXIT
+
+  PREFIX="$tmp_root/prefix"
+  CONFIG_DIR="$tmp_root/config"
+  STATE_DIR="$tmp_root/state"
+  OPENRC_DIR="$tmp_root/openrc"
+  install -d "$PREFIX/bin" "$CONFIG_DIR/machines" "$STATE_DIR" "$OPENRC_DIR" /etc/systemd/system
+  install -m 0755 /bin/sh "$PREFIX/bin/noders"
+  cat > "$unit_path" <<'EOF'
+[Unit]
+Description=stale numeric NodeRS service
+EOF
+
+  fake_bin="$tmp_root/fake-bin"
+  systemctl_log="$tmp_root/systemctl.log"
+  mkdir -p "$fake_bin"
+  : > "$systemctl_log"
+  make_fake_command "$fake_bin/systemctl" '#!/usr/bin/env bash
+{
+  for arg in "$@"; do
+    printf "[%s]\n" "$arg"
+  done
+} >> "$NODERS_FAKE_SYSTEMCTL_LOG"'
+
+  bundle_root="$tmp_root/bundle"
+  prepare_fake_release_bundle "$bundle_root"
+
+  stdout_path="$tmp_root/stdout"
+  stderr_path="$tmp_root/stderr"
+  upgrade_path="$bundle_root/upgrade.sh"
+  if ! PATH="$fake_bin:$PATH" \
+    NODERS_FAKE_SYSTEMCTL_LOG="$systemctl_log" \
+    bash "$upgrade_path" --prefix "$PREFIX" --config-dir "$CONFIG_DIR" --no-restart >"$stdout_path" 2>"$stderr_path"; then
+    echo "upgrade.sh failed to remove stale numeric systemd unit" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+
+  [[ ! -e "$unit_path" ]] || {
+    echo "upgrade.sh left the stale numeric systemd unit behind" >&2
+    exit 1
+  }
+  assert_contains "[noders-998877665]" "$systemctl_log" "upgrade.sh did not stop the stale numeric systemd unit"
+  assert_contains "Migrating legacy noders-anytls layout" "$stdout_path" "upgrade.sh did not report stale unit migration"
+)
+
 test_install_management_support_skips_self_copy() (
   local tmp_root stdout_path stderr_path support_dir
 
@@ -309,6 +364,7 @@ main() {
   test_install_common_defaults_service_names
   test_management_script_filters_invalid_units
   test_upgrade_migrates_legacy_layout
+  test_upgrade_removes_stale_numeric_systemd_unit
   test_install_management_support_skips_self_copy
   test_upgrade_skips_binary_self_copy
 }

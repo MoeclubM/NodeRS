@@ -247,7 +247,45 @@ ensure_existing_installation() {
 }
 
 legacy_layout_detected() {
-  local config_path unit_path
+  legacy_config_or_binary_detected || legacy_service_units_detected
+}
+
+legacy_service_units_detected() {
+  local unit_path unit_name
+
+  shopt -s nullglob
+  for unit_path in \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
+    /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service \
+    /etc/systemd/system/${SERVICE_NAME}-*.service; do
+    [[ -e "$unit_path" ]] || continue
+    unit_name="$(basename "$unit_path" .service)"
+    if [[ "$unit_name" == "$LEGACY_SERVICE_NAME" || "$unit_name" == "$LEGACY_SERVICE_NAME"-* || "$unit_name" =~ ^${SERVICE_NAME}-[0-9]+$ ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+
+  shopt -s nullglob
+  for unit_path in \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}" \
+    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-"* \
+    "${OPENRC_DIR%/}/${SERVICE_NAME}-"*; do
+    [[ -e "$unit_path" ]] || continue
+    unit_name="$(basename "$unit_path")"
+    if [[ "$unit_name" == "$LEGACY_SERVICE_NAME" || "$unit_name" == "$LEGACY_SERVICE_NAME"-* || "$unit_name" =~ ^${SERVICE_NAME}-[0-9]+$ ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+
+  return 1
+}
+
+legacy_config_or_binary_detected() {
+  local config_path
 
   if [[ -x "$PREFIX/bin/${SERVICE_NAME}-anytls" && ! -x "$(runtime_binary_path)" ]]; then
     return 0
@@ -264,18 +302,6 @@ legacy_layout_detected() {
     done
     shopt -u nullglob
   fi
-
-  shopt -s nullglob
-  for unit_path in \
-    /etc/systemd/system/${LEGACY_SERVICE_NAME}.service \
-    /etc/systemd/system/${LEGACY_SERVICE_NAME}-*.service \
-    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}" \
-    "${OPENRC_DIR%/}/${LEGACY_SERVICE_NAME}-"*; do
-    [[ -e "$unit_path" ]] || continue
-    shopt -u nullglob
-    return 0
-  done
-  shopt -u nullglob
 
   return 1
 }
@@ -412,11 +438,11 @@ migrate_legacy_openrc_units() {
 
 migrate_legacy_layout() {
   migrate_legacy_configs
-  if [[ -x "$PREFIX/bin/${SERVICE_NAME}-anytls" || ${#MIGRATED_LEGACY_INSTANCES[@]} -gt 0 ]]; then
+  if legacy_config_or_binary_detected || [[ ${#MIGRATED_LEGACY_INSTANCES[@]} -gt 0 ]] || legacy_service_units_detected; then
     echo "Migrating legacy noders-anytls layout to current noders runtime layout."
-    migrate_legacy_systemd_units
-    migrate_legacy_openrc_units
   fi
+  migrate_legacy_systemd_units
+  migrate_legacy_openrc_units
 }
 
 discover_units() {
