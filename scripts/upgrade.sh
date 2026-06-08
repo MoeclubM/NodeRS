@@ -535,13 +535,18 @@ discover_restart_targets() {
 }
 
 backup_current_binary() {
-  need_cmd mktemp
-  TMP_ROOT="${TMP_ROOT:-$(mktemp -d)}"
-  BACKUP_BINARY="$TMP_ROOT/noders.previous"
   if [[ -x "$(runtime_binary_path)" ]]; then
+    need_cmd mktemp
+    TMP_ROOT="${TMP_ROOT:-$(mktemp -d)}"
+    BACKUP_BINARY="$TMP_ROOT/noders.previous"
     cp "$(runtime_binary_path)" "$BACKUP_BINARY"
-  else
+  elif [[ -x "$PREFIX/bin/${SERVICE_NAME}-anytls" ]]; then
+    need_cmd mktemp
+    TMP_ROOT="${TMP_ROOT:-$(mktemp -d)}"
+    BACKUP_BINARY="$TMP_ROOT/noders.previous"
     cp "$PREFIX/bin/${SERVICE_NAME}-anytls" "$BACKUP_BINARY"
+  else
+    BACKUP_BINARY=""
   fi
 }
 
