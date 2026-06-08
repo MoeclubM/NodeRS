@@ -1,22 +1,24 @@
 use anyhow::{Context, bail, ensure};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tokio::task::JoinHandle;
 use tracing::{error, info};
+
+mod runner;
+mod users;
 
 use crate::accounting::Accounting;
 use crate::acme;
 use crate::panel::{NodeConfigResponse, PanelUser};
 use crate::protocols::ProtocolKind;
 
-use super::shared::{
-    EffectiveTlsConfig, aerion_ech_keys, bind_listeners, bind_udp_sockets, effective_listen_ip, tls,
-};
+use super::shared::{EffectiveTlsConfig, aerion_ech_keys, effective_listen_ip, tls};
+
+use runner::{RunningServer, spawn_running_server};
+use users::{core_users, credentials_for_server, mieru_identity, split_primary};
 
 pub struct ServerController {
     protocol: ProtocolKind,
@@ -26,10 +28,6 @@ pub struct ServerController {
     remote: RwLock<Option<NodeConfigResponse>>,
     last_traffic: Mutex<HashMap<String, [u64; 2]>>,
     inner: AsyncMutex<Option<RunningServer>>,
-}
-
-struct RunningServer {
-    handles: Vec<JoinHandle<()>>,
 }
 
 struct AerionTlsIdentity {
@@ -194,112 +192,6 @@ impl ServerController {
             }
         }
     }
-}
-
-fn spawn_running_server(
-    protocol: ProtocolKind,
-    config: BuiltServerConfig,
-    core: ::aerion::core::ProxyCore,
-) -> anyhow::Result<RunningServer> {
-    let handles = match config {
-        BuiltServerConfig::Anytls(config) => {
-            let listeners =
-                bind_listeners(&config.listen.ip().to_string(), config.listen.port())
-                    .with_context(|| format!("bind Aerion AnyTLS server on {}", config.listen))?;
-            listeners
-                .into_iter()
-                .map(|listener| {
-                    let config = config.clone();
-                    let core = core.clone();
-                    spawn_aerion_task(protocol, async move {
-                        ::aerion::run_server_listener_with_core(listener, config, core).await
-                    })
-                })
-                .collect()
-        }
-        BuiltServerConfig::Hysteria2(config) => {
-            let sockets = bind_udp_sockets(&config.listen.ip().to_string(), config.listen.port())
-                .with_context(|| {
-                format!("bind Aerion Hysteria2 server on {}", config.listen)
-            })?;
-            let mut handles = Vec::new();
-            for socket in sockets {
-                let socket = socket
-                    .into_std()
-                    .context("convert Hysteria2 UDP socket to std")?;
-                let config = config.clone();
-                let core = core.clone();
-                handles.push(spawn_aerion_task(protocol, async move {
-                    ::aerion::run_hysteria2_server_socket_with_core(socket, config, core).await
-                }));
-            }
-            handles
-        }
-        BuiltServerConfig::Mieru(config) => {
-            if config.transport == ::aerion::MieruTransport::Udp {
-                let sockets =
-                    bind_udp_sockets(&config.listen.ip().to_string(), config.listen.port())
-                        .with_context(|| {
-                            format!("bind Aerion Mieru UDP server on {}", config.listen)
-                        })?;
-                sockets
-                    .into_iter()
-                    .map(|socket| {
-                        let config = config.clone();
-                        let core = core.clone();
-                        spawn_aerion_task(protocol, async move {
-                            ::aerion::run_mieru_packet_server_socket_with_core(socket, config, core)
-                                .await
-                        })
-                    })
-                    .collect()
-            } else {
-                let listeners =
-                    bind_listeners(&config.listen.ip().to_string(), config.listen.port())
-                        .with_context(|| {
-                            format!("bind Aerion Mieru server on {}", config.listen)
-                        })?;
-                listeners
-                    .into_iter()
-                    .map(|listener| {
-                        let config = config.clone();
-                        let core = core.clone();
-                        spawn_aerion_task(protocol, async move {
-                            ::aerion::run_mieru_server_listener_with_core(listener, config, core)
-                                .await
-                        })
-                    })
-                    .collect()
-            }
-        }
-        BuiltServerConfig::Naive(config) => vec![spawn_aerion_task(protocol, async move {
-            ::aerion::run_naive_server_with_core(config, core).await
-        })],
-        BuiltServerConfig::Trojan(config) => vec![spawn_aerion_task(protocol, async move {
-            ::aerion::run_trojan_server_with_core(config, core).await
-        })],
-        BuiltServerConfig::Tuic(config) => vec![spawn_aerion_task(protocol, async move {
-            ::aerion::run_tuic_server_with_core(config, core).await
-        })],
-        BuiltServerConfig::Vless(config) => vec![spawn_aerion_task(protocol, async move {
-            ::aerion::run_vless_server_with_core(config, core).await
-        })],
-        BuiltServerConfig::Vmess(config) => vec![spawn_aerion_task(protocol, async move {
-            ::aerion::run_vmess_server_with_core(config, core).await
-        })],
-    };
-    Ok(RunningServer { handles })
-}
-
-fn spawn_aerion_task<F>(protocol: ProtocolKind, future: F) -> JoinHandle<()>
-where
-    F: Future<Output = anyhow::Result<()>> + Send + 'static,
-{
-    tokio::spawn(async move {
-        if let Err(error) = future.await {
-            error!(protocol = protocol.as_str(), %error, "Aerion server exited");
-        }
-    })
 }
 
 async fn build_server_config(
@@ -856,140 +748,6 @@ fn reality_config(
     })
 }
 
-fn core_users(
-    protocol: ProtocolKind,
-    users: &[PanelUser],
-) -> anyhow::Result<Vec<::aerion::core::CoreUser>> {
-    let mut entries = Vec::new();
-    for user in users {
-        for credential in credentials_for_user(protocol, user)? {
-            let mut entry = ::aerion::core::CoreUser::password(user.id.to_string(), credential);
-            let rate = speed_limit_bytes_per_second(user.speed_limit);
-            entry.upload_limit_bps = rate;
-            entry.download_limit_bps = rate;
-            entry.max_online_ips = u64::try_from(user.device_limit)
-                .ok()
-                .filter(|limit| *limit > 0);
-            entries.push(entry);
-        }
-    }
-    Ok(entries)
-}
-
-fn credentials_for_server(
-    protocol: ProtocolKind,
-    users: &[PanelUser],
-) -> anyhow::Result<Vec<String>> {
-    let mut credentials = Vec::new();
-    for user in users {
-        credentials.extend(credentials_for_user(protocol, user)?);
-    }
-    Ok(credentials)
-}
-
-fn credentials_for_user(protocol: ProtocolKind, user: &PanelUser) -> anyhow::Result<Vec<String>> {
-    let mut credentials = Vec::new();
-    match protocol {
-        ProtocolKind::Anytls | ProtocolKind::Vless | ProtocolKind::Vmess => {
-            let uuid = user.uuid.trim();
-            ensure!(
-                !uuid.is_empty(),
-                "{} user {} is missing uuid",
-                protocol.as_str(),
-                user.id
-            );
-            credentials.push(uuid.to_string());
-        }
-        ProtocolKind::Hysteria2 => {
-            push_unique_credential(&mut credentials, user.password.trim());
-            push_unique_credential(&mut credentials, user.uuid.trim());
-            ensure!(
-                !credentials.is_empty(),
-                "HY2 user {} is missing password/uuid",
-                user.id
-            );
-        }
-        ProtocolKind::Mieru => {
-            let identity = mieru_identity(user).ok_or_else(|| {
-                anyhow::anyhow!("Mieru user {} is missing password/uuid", user.id)
-            })?;
-            credentials.push(identity.to_string());
-        }
-        ProtocolKind::Naive => {
-            credentials.push(naive_credential(user)?);
-        }
-        ProtocolKind::Trojan => {
-            let credential = trojan_password(user).ok_or_else(|| {
-                anyhow::anyhow!("Trojan user {} is missing password/uuid", user.id)
-            })?;
-            credentials.push(credential.to_string());
-        }
-        ProtocolKind::Tuic => {
-            let uuid = user.uuid.trim();
-            ensure!(!uuid.is_empty(), "TUIC user {} is missing uuid", user.id);
-            credentials.push(uuid.to_string());
-        }
-        ProtocolKind::Shadowsocks => bail!("Shadowsocks users are not mapped to Aerion"),
-    }
-    Ok(credentials)
-}
-
-fn push_unique_credential(credentials: &mut Vec<String>, value: &str) {
-    if !value.is_empty() && !credentials.iter().any(|credential| credential == value) {
-        credentials.push(value.to_string());
-    }
-}
-
-fn split_primary(mut credentials: Vec<String>) -> anyhow::Result<(String, Vec<String>)> {
-    ensure!(
-        !credentials.is_empty(),
-        "Aerion server requires at least one user credential"
-    );
-    let first = credentials.remove(0);
-    Ok((first, credentials))
-}
-
-fn trojan_password(user: &PanelUser) -> Option<&str> {
-    let password = user.password.trim();
-    if password.is_empty() {
-        let uuid = user.uuid.trim();
-        (!uuid.is_empty()).then_some(uuid)
-    } else {
-        Some(password)
-    }
-}
-
-fn mieru_identity(user: &PanelUser) -> Option<&str> {
-    let uuid = user.uuid.trim();
-    if uuid.is_empty() {
-        let password = user.password.trim();
-        (!password.is_empty()).then_some(password)
-    } else {
-        Some(uuid)
-    }
-}
-
-fn naive_credential(user: &PanelUser) -> anyhow::Result<String> {
-    let username = user.uuid.trim();
-    let username = if username.is_empty() {
-        user.id.to_string()
-    } else {
-        username.to_string()
-    };
-    let password = user.password.trim();
-    let password = if password.is_empty() {
-        user.uuid.trim()
-    } else {
-        password
-    };
-    ensure!(
-        !password.is_empty(),
-        "Naive user {} is missing password/uuid",
-        user.id
-    );
-    Ok(format!("{username}:{password}"))
-}
-
 fn vless_transport(
     remote: &NodeConfigResponse,
 ) -> anyhow::Result<::aerion::vless_transport::VlessTransportConfig> {
@@ -1218,217 +976,9 @@ fn vless_tls_enabled(remote: &NodeConfigResponse) -> bool {
     remote.tls_mode() != 0 || remote.tls.is_none()
 }
 
-fn speed_limit_bytes_per_second(speed_limit: i64) -> Option<u64> {
-    u64::try_from(speed_limit)
-        .ok()
-        .filter(|limit| *limit > 0)
-        .map(|limit| limit.saturating_mul(125_000))
-}
-
 fn normalize_ip(ip: String) -> String {
     ip.trim_start_matches("::ffff:").to_string()
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn builds_mieru_server_config() {
-        let remote = NodeConfigResponse {
-            listen_ip: "127.0.0.1".to_string(),
-            server_port: 8964,
-            network: "tcp".to_string(),
-            ..Default::default()
-        };
-        let users = vec![PanelUser {
-            id: 1001,
-            uuid: "mieru-secret".to_string(),
-            ..Default::default()
-        }];
-
-        let BuiltServerConfig::Mieru(config) =
-            build_mieru_config(&remote, &users).expect("build Mieru config")
-        else {
-            panic!("expected Mieru config");
-        };
-        assert_eq!(config.listen, "127.0.0.1:8964".parse().unwrap());
-        assert_eq!(config.users.len(), 1);
-        assert_eq!(config.users[0].username, "mieru-secret");
-        assert_eq!(config.users[0].password, "mieru-secret");
-        assert_eq!(config.transport, ::aerion::MieruTransport::Tcp);
-    }
-
-    #[test]
-    fn builds_mieru_server_config_ignores_xboard_tls_and_cert() {
-        let remote = NodeConfigResponse {
-            listen_ip: "127.0.0.1".to_string(),
-            server_port: 8964,
-            network: "ws".to_string(),
-            network_settings: Some(json!({ "path": "/ignored" })),
-            tls: Some(json!(1)),
-            tls_settings: crate::panel::NodeTlsSettings {
-                server_name: "tls.example.com".to_string(),
-                allow_insecure: true,
-                ..Default::default()
-            },
-            reality_settings: crate::panel::NodeRealitySettings {
-                server_name: "reality.example.com".to_string(),
-                private_key: "ignored".to_string(),
-                ..Default::default()
-            },
-            multiplex: Some(json!({ "enabled": true })),
-            cert_config: Some(crate::panel::CertConfig {
-                cert_mode: "acme".to_string(),
-                domain: "tls.example.com".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let users = vec![PanelUser {
-            id: 1001,
-            uuid: "mieru-secret".to_string(),
-            ..Default::default()
-        }];
-
-        let BuiltServerConfig::Mieru(config) =
-            build_mieru_config(&remote, &users).expect("build Mieru config")
-        else {
-            panic!("expected Mieru config");
-        };
-        assert_eq!(config.listen, "127.0.0.1:8964".parse().unwrap());
-        assert_eq!(config.users[0].username, "mieru-secret");
-    }
-
-    #[tokio::test]
-    async fn builds_naive_server_config() {
-        let remote = NodeConfigResponse {
-            listen_ip: "127.0.0.1".to_string(),
-            server_port: 8443,
-            network: "quic".to_string(),
-            server_name: "naive.example.com".to_string(),
-            congestion_control: "cubic".to_string(),
-            udp_relay_mode: "native".to_string(),
-            ..Default::default()
-        };
-        let users = vec![
-            PanelUser {
-                id: 1001,
-                uuid: "alice".to_string(),
-                password: "alice-pass".to_string(),
-                ..Default::default()
-            },
-            PanelUser {
-                id: 1002,
-                uuid: "bob".to_string(),
-                password: "bob-pass".to_string(),
-                ..Default::default()
-            },
-        ];
-
-        let BuiltServerConfig::Naive(config) = build_naive_config(&remote, &users)
-            .await
-            .expect("build Naive config")
-        else {
-            panic!("expected Naive config");
-        };
-        assert_eq!(config.listen, "127.0.0.1:8443".parse().unwrap());
-        assert_eq!(config.username, "alice");
-        assert_eq!(config.password, "alice-pass");
-        assert_eq!(config.users, vec!["bob:bob-pass"]);
-        assert!(config.udp_over_tcp);
-        assert!(config.tcp);
-        assert!(config.quic);
-        assert_eq!(config.quic_congestion_control, "cubic");
-    }
-
-    #[tokio::test]
-    async fn builds_naive_server_config_from_uuid_only_user() {
-        let remote = NodeConfigResponse {
-            listen_ip: "127.0.0.1".to_string(),
-            server_port: 8443,
-            server_name: "naive.example.com".to_string(),
-            ..Default::default()
-        };
-        let users = vec![PanelUser {
-            id: 1001,
-            uuid: "uuid-secret".to_string(),
-            ..Default::default()
-        }];
-
-        let BuiltServerConfig::Naive(config) = build_naive_config(&remote, &users)
-            .await
-            .expect("build Naive config")
-        else {
-            panic!("expected Naive config");
-        };
-        assert_eq!(config.username, "uuid-secret");
-        assert_eq!(config.password, "uuid-secret");
-    }
-
-    #[tokio::test]
-    async fn builds_hysteria2_server_config_from_xboard_obfs_fields() {
-        let remote = NodeConfigResponse {
-            listen_ip: "127.0.0.1".to_string(),
-            server_port: 8444,
-            network: "udp".to_string(),
-            server_name: "hy2.example.com".to_string(),
-            version: Some(json!(2)),
-            up_mbps: Some(json!(100)),
-            server_key: "xboard-obfs-secret".to_string(),
-            is_obfs: true,
-            congestion_control: "reno".to_string(),
-            udp_relay_mode: "native".to_string(),
-            ..Default::default()
-        };
-        let users = vec![PanelUser {
-            id: 1001,
-            uuid: "uuid-secret".to_string(),
-            password: "password-secret".to_string(),
-            ..Default::default()
-        }];
-
-        let BuiltServerConfig::Hysteria2(config) = build_hysteria2_config(&remote, &users)
-            .await
-            .expect("build Hysteria2 config")
-        else {
-            panic!("expected Hysteria2 config");
-        };
-        assert_eq!(config.listen, "127.0.0.1:8444".parse().unwrap());
-        assert_eq!(config.users, vec!["password-secret", "uuid-secret"]);
-        assert_eq!(config.obfs.as_deref(), Some("salamander"));
-        assert_eq!(config.obfs_password.as_deref(), Some("xboard-obfs-secret"));
-        assert_eq!(config.upload_bandwidth, Some(100));
-        assert_eq!(config.cc_rx, "12500000");
-        assert_eq!(config.congestion_control, "reno");
-        assert!(config.udp);
-        assert_eq!(config.cert_path, PathBuf::new());
-        assert!(config.key.is_some());
-        assert_eq!(config.certificates.len(), 1);
-    }
-
-    #[test]
-    fn trojan_accepts_websocket_transport() {
-        let remote = NodeConfigResponse {
-            network: "ws".to_string(),
-            network_settings: Some(json!({
-                "path": "trojan",
-                "headers": {
-                    "Host": "trojan.example.com"
-                }
-            })),
-            ..Default::default()
-        };
-
-        validate_trojan_remote(&remote).expect("validate Trojan transport");
-        let transport = vless_transport(&remote).expect("parse Trojan transport");
-        assert_eq!(
-            transport.kind,
-            ::aerion::vless_transport::VlessTransportKind::WebSocket
-        );
-        assert_eq!(transport.path, "/trojan");
-        assert_eq!(transport.host.as_deref(), Some("trojan.example.com"));
-    }
-}
+mod tests;
