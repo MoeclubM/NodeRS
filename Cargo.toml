@@ -1,11 +1,11 @@
 [package]
 name = "noders"
-version = "0.1.23"
+version = "0.1.24"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "762469178a23ae0b7747b3a28aa15f3cd2202e35" }
+aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "9c2235385e0cca332d42a2f043b2d6eced3b7b49" }
 base64 = "0.22.1"
 boring = "5.1.0"
 futures-util = "0.3.32"
