@@ -21,11 +21,10 @@ fn parses_route_match_from_string() {
     }))
     .expect("parse route");
     assert_eq!(
-        route.match_items(),
-        vec![
-            "protocol:tcp".to_string(),
-            r"regexp:^example\.com$".to_string()
-        ]
+        route.match_value,
+        Some(RouteMatch::String(
+            r" protocol:tcp , regexp:^example\.com$ ".to_string()
+        ))
     );
 }
 
@@ -39,11 +38,11 @@ fn parses_route_match_from_array() {
     }))
     .expect("parse route");
     assert_eq!(
-        route.match_items(),
-        vec![
+        route.match_value,
+        Some(RouteMatch::Strings(vec![
             r"regexp:^example\.org$".to_string(),
             "protocol:udp".to_string()
-        ]
+        ]))
     );
 }
 

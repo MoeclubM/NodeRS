@@ -1,5 +1,5 @@
 use anyhow::Context;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use std::path::Path;
 use tokio::fs;
 
@@ -22,56 +22,6 @@ pub struct PanelConfig {
     #[serde(alias = "token")]
     pub key: String,
     pub machine_id: i64,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct OutboundConfig {
-    #[serde(default)]
-    pub dns_resolver: DnsResolver,
-    #[serde(default)]
-    pub ip_strategy: IpStrategy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum DnsResolver {
-    #[default]
-    System,
-    Custom(String),
-}
-
-impl DnsResolver {
-    pub fn nameserver(&self) -> Option<&str> {
-        match self {
-            Self::System => None,
-            Self::Custom(server) => Some(server.as_str()),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for DnsResolver {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
-        let value = value.trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("system") {
-            Ok(Self::System)
-        } else {
-            Ok(Self::Custom(value.to_string()))
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum IpStrategy {
-    #[default]
-    System,
-    #[serde(alias = "ipv4_prefer", alias = "ipv4_first")]
-    PreferIpv4,
-    #[serde(alias = "ipv6_prefer", alias = "ipv6_first")]
-    PreferIpv6,
 }
 
 #[cfg(test)]

@@ -238,14 +238,18 @@ impl MachineRuntime {
         node_id: i64,
         users: HashMap<String, Vec<String>>,
     ) -> anyhow::Result<()> {
-        let Some(node) = self.node(node_id) else {
+        let Some(_node) = self.node(node_id) else {
             warn!(
                 node_id,
                 "received sync.devices for unknown node; refreshing machine nodes"
             );
             return self.refresh_machine_nodes().await;
         };
-        node.set_external_alive_counts(&alive_counts(&users));
+        debug!(
+            node_id,
+            users = users.len(),
+            "received sync.devices; Aerion core owns online session state"
+        );
         Ok(())
     }
 
@@ -408,10 +412,6 @@ impl ManagedNode {
 
     async fn initialize(&self) -> anyhow::Result<()> {
         self.sync_config(true).await?;
-        match self.panel.fetch_alive_list().await {
-            Ok(alive_list) => self.accounting.set_external_alive_counts(&alive_list.alive),
-            Err(error) => warn!(node_id = self.node_id, %error, "initial alive list fetch failed"),
-        }
         self.sync_users(true).await
     }
 
@@ -437,23 +437,10 @@ impl ManagedNode {
                     warn!(node_id = sync_node.node_id, %error, "user sync failed");
                 }
 
-                match sync_node.panel.fetch_alive_list().await {
-                    Ok(alive_list) => {
-                        let alive_count = alive_list.alive.len();
-                        sync_node
-                            .accounting
-                            .set_external_alive_counts(&alive_list.alive);
-                        if alive_count > 0 {
-                            debug!(
-                                node_id = sync_node.node_id,
-                                alive_count, "panel alive list fetched"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        warn!(node_id = sync_node.node_id, %error, "alive list fetch failed")
-                    }
-                }
+                debug!(
+                    node_id = sync_node.node_id,
+                    "Aerion core owns online session state; skipping panel alive list fetch"
+                );
             }
         }));
 
@@ -502,9 +489,15 @@ impl ManagedNode {
                     }
                 }
 
-                let alive = report_node.snapshot_alive().await;
-                if let Err(error) = report_node.panel.report_alive(alive).await {
-                    warn!(node_id = report_node.node_id, %error, "alive report failed");
+                match report_node.snapshot_alive().await {
+                    Ok(alive) => {
+                        if let Err(error) = report_node.panel.report_alive(alive).await {
+                            warn!(node_id = report_node.node_id, %error, "alive report failed");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(node_id = report_node.node_id, %error, "protocol alive snapshot failed")
+                    }
                 }
             }
         }));
@@ -606,15 +599,8 @@ impl ManagedNode {
         self.controller.flush_traffic().await
     }
 
-    async fn snapshot_alive(&self) -> HashMap<i64, Vec<String>> {
-        match self.controller.snapshot_alive().await {
-            Ok(Some(alive)) => alive,
-            Ok(None) => self.accounting.snapshot_alive(),
-            Err(error) => {
-                warn!(node_id = self.node_id, %error, "protocol alive snapshot failed");
-                self.accounting.snapshot_alive()
-            }
-        }
+    async fn snapshot_alive(&self) -> anyhow::Result<HashMap<i64, Vec<String>>> {
+        self.controller.snapshot_alive().await
     }
 
     async fn shutdown(&self) {
@@ -628,7 +614,6 @@ impl ManagedNode {
         }
 
         let _ = self.replace_users(&[]).await;
-        self.accounting.set_external_alive_counts(&HashMap::new());
         self.controller.shutdown().await;
     }
 
@@ -638,10 +623,6 @@ impl ManagedNode {
 
     fn protocol(&self) -> ProtocolKind {
         self.controller.kind()
-    }
-
-    fn set_external_alive_counts(&self, alive: &HashMap<String, i64>) {
-        self.accounting.set_external_alive_counts(alive);
     }
 
     fn set_machine_base_config(&self, base_config: Option<BaseConfig>) {
@@ -690,13 +671,6 @@ async fn wait_for_interval_or_shutdown(
         _ = tokio::time::sleep(interval) => false,
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
     }
-}
-
-fn alive_counts(users: &HashMap<String, Vec<String>>) -> HashMap<String, i64> {
-    users
-        .iter()
-        .map(|(uid, ips)| (uid.clone(), ips.len() as i64))
-        .collect()
 }
 
 pub(crate) fn pull_interval_seconds(base_config: Option<&BaseConfig>) -> u64 {

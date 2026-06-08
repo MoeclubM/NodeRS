@@ -1,12 +1,17 @@
 use anyhow::{bail, ensure};
 
-use crate::panel::PanelUser;
+use crate::panel::{NodeConfigResponse, PanelUser};
 use crate::protocols::ProtocolKind;
 
 pub(super) fn core_users(
     protocol: ProtocolKind,
+    remote: &NodeConfigResponse,
     users: &[PanelUser],
 ) -> anyhow::Result<Vec<::aerion::core::CoreUser>> {
+    if protocol == ProtocolKind::Shadowsocks {
+        return super::shadowsocks::core_users(remote, users);
+    }
+
     let mut entries = Vec::new();
     for user in users {
         for credential in credentials_for_user(protocol, user)? {
@@ -76,7 +81,7 @@ fn credentials_for_user(protocol: ProtocolKind, user: &PanelUser) -> anyhow::Res
             ensure!(!uuid.is_empty(), "TUIC user {} is missing uuid", user.id);
             credentials.push(uuid.to_string());
         }
-        ProtocolKind::Shadowsocks => bail!("Shadowsocks users are not mapped to Aerion"),
+        ProtocolKind::Shadowsocks => bail!("Shadowsocks users require node config"),
     }
     Ok(credentials)
 }
