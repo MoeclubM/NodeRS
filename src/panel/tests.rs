@@ -1019,10 +1019,7 @@ fn normalizes_nodeexpand_api_prefix() {
     })
     .expect("panel client");
 
-    assert_eq!(
-        panel.machine_nodes_path(),
-        "/api/v1/nodeexpand/server/machine/nodes"
-    );
+    assert_eq!(panel.machine_nodes_path(), "/api/v1/nodeexpand/server/machine/nodes");
     let node = panel
         .node_client(12, true)
         .expect("nodeexpand panel client");
