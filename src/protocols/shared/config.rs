@@ -316,12 +316,6 @@ fn effective_ech_config(
     if !ech.is_enabled() {
         return Ok(None);
     }
-    ensure!(
-        ech.config.trim().is_empty()
-            && ech.config_path.trim().is_empty()
-            && ech.query_server_name.trim().is_empty(),
-        "Aerion server ECH requires Xray-format ech.key or ech.key_path; split ECH config/config_path/queryServerName is not supported"
-    );
     if !ech.key_path.trim().is_empty() {
         return Ok(Some(tls::EchConfigSource::Files {
             key_path: ech.key_path.trim().into(),
@@ -331,9 +325,6 @@ fn effective_ech_config(
         return Ok(Some(tls::EchConfigSource::Inline {
             key: ech.key.trim().as_bytes().to_vec(),
         }));
-    }
-    if ech.enabled {
-        anyhow::bail!("Xboard ECH is enabled but ech.key or ech.key_path is missing");
     }
     Ok(None)
 }
