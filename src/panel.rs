@@ -25,14 +25,12 @@ pub struct MachinePanelClient {
     base_url: String,
     token: String,
     machine_id: i64,
-    nodeexpand_api_prefix: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct NodePanelClient {
     machine: MachinePanelClient,
     node_id: i64,
-    use_nodeexpand_api: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -611,11 +609,6 @@ impl MachinePanelClient {
             base_url: config.api.trim_end_matches('/').to_string(),
             token: config.key.clone(),
             machine_id: config.machine_id,
-            nodeexpand_api_prefix: config
-                .nodeexpand_api_prefix
-                .as_deref()
-                .map(normalize_path_prefix)
-                .transpose()?,
         })
     }
 
@@ -623,23 +616,11 @@ impl MachinePanelClient {
         self.machine_id
     }
 
-    pub fn uses_nodeexpand_api(&self) -> bool {
-        self.nodeexpand_api_prefix.is_some()
-    }
-
-    pub fn node_client(
-        &self,
-        node_id: i64,
-        use_nodeexpand_api: bool,
-    ) -> anyhow::Result<NodePanelClient> {
-        if use_nodeexpand_api && self.nodeexpand_api_prefix.is_none() {
-            bail!("panel.nodeexpand_api_prefix is required for NodeExpand nodes");
-        }
-        Ok(NodePanelClient {
+    pub fn node_client(&self, node_id: i64) -> NodePanelClient {
+        NodePanelClient {
             machine: self.clone(),
             node_id,
-            use_nodeexpand_api,
-        })
+        }
     }
 
     pub fn websocket_url(&self, ws_url: &str) -> anyhow::Result<String> {
@@ -680,10 +661,9 @@ impl MachinePanelClient {
     }
 
     pub async fn fetch_machine_nodes(&self) -> anyhow::Result<MachineNodesResponse> {
-        let path = self.machine_nodes_path();
         let response = self
             .client
-            .post(self.url(&path))
+            .post(self.url("/api/v2/server/machine/nodes"))
             .query(&self.machine_query())
             .send()
             .await
@@ -714,13 +694,6 @@ impl MachinePanelClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
-
-    fn machine_nodes_path(&self) -> String {
-        match &self.nodeexpand_api_prefix {
-            Some(prefix) => format!("{prefix}/machine/nodes"),
-            None => "/api/v2/server/machine/nodes".to_string(),
-        }
-    }
 }
 
 impl NodePanelClient {
@@ -728,16 +701,14 @@ impl NodePanelClient {
         &self,
         etag: Option<&str>,
     ) -> anyhow::Result<FetchState<NodeConfigResponse>> {
-        let path = self.request_path("/api/v2/server/config", "config")?;
-        self.fetch_etag(&path, etag).await
+        self.fetch_etag("/api/v2/server/config", etag).await
     }
 
     pub async fn fetch_users(
         &self,
         etag: Option<&str>,
     ) -> anyhow::Result<FetchState<UsersResponse>> {
-        let path = self.request_path("/api/v2/server/user", "user")?;
-        self.fetch_etag(&path, etag).await
+        self.fetch_etag("/api/v2/server/user", etag).await
     }
 
     pub async fn report_traffic(
@@ -842,18 +813,6 @@ impl NodePanelClient {
             ("node_id", self.node_id.to_string()),
         ]
     }
-
-    fn request_path(&self, core_path: &str, suffix: &str) -> anyhow::Result<String> {
-        if !self.use_nodeexpand_api {
-            return Ok(core_path.to_string());
-        }
-        let prefix = self
-            .machine
-            .nodeexpand_api_prefix
-            .as_ref()
-            .context("panel.nodeexpand_api_prefix is required for NodeExpand nodes")?;
-        Ok(format!("{prefix}/{suffix}"))
-    }
 }
 
 fn ensure_success(status: StatusCode, action: &str) -> anyhow::Result<()> {
@@ -861,18 +820,6 @@ fn ensure_success(status: StatusCode, action: &str) -> anyhow::Result<()> {
         Ok(())
     } else {
         bail!("Xboard {action} failed with status {status}")
-    }
-}
-
-fn normalize_path_prefix(value: &str) -> anyhow::Result<String> {
-    let prefix = value.trim().trim_end_matches('/');
-    if prefix.is_empty() {
-        bail!("panel.nodeexpand_api_prefix cannot be empty");
-    }
-    if prefix.starts_with('/') {
-        Ok(prefix.to_string())
-    } else {
-        Ok(format!("/{prefix}"))
     }
 }
 

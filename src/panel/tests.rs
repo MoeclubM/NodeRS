@@ -978,7 +978,6 @@ fn websocket_url_uses_machine_credentials() {
         api: "https://xboard.example.com".to_string(),
         key: "replace-me".to_string(),
         machine_id: 9,
-        nodeexpand_api_prefix: None,
     })
     .expect("panel client");
 
@@ -996,7 +995,6 @@ fn websocket_url_accepts_http_scheme_from_panel() {
         api: "https://xboard.example.com".to_string(),
         key: "replace-me".to_string(),
         machine_id: 9,
-        nodeexpand_api_prefix: None,
     })
     .expect("panel client");
 
@@ -1007,44 +1005,6 @@ fn websocket_url_accepts_http_scheme_from_panel() {
     assert!(ws_url.starts_with("wss://panel.example.com/ws"));
     assert!(ws_url.contains("machine_id=9"));
     assert!(ws_url.contains("token=replace-me"));
-}
-
-#[test]
-fn normalizes_nodeexpand_api_prefix() {
-    let panel = MachinePanelClient::new(&PanelConfig {
-        api: "https://xboard.example.com".to_string(),
-        key: "replace-me".to_string(),
-        machine_id: 9,
-        nodeexpand_api_prefix: Some("api/v1/nodeexpand/server/".to_string()),
-    })
-    .expect("panel client");
-
-    assert_eq!(panel.machine_nodes_path(), "/api/v1/nodeexpand/server/machine/nodes");
-    let node = panel
-        .node_client(12, true)
-        .expect("nodeexpand panel client");
-    assert_eq!(
-        node.request_path("/api/v2/server/config", "config")
-            .expect("nodeexpand config path"),
-        "/api/v1/nodeexpand/server/config"
-    );
-}
-
-#[test]
-fn nodeexpand_node_client_requires_plugin_prefix() {
-    let panel = MachinePanelClient::new(&PanelConfig {
-        api: "https://xboard.example.com".to_string(),
-        key: "replace-me".to_string(),
-        machine_id: 9,
-        nodeexpand_api_prefix: None,
-    })
-    .expect("panel client");
-
-    let error = match panel.node_client(12, true) {
-        Ok(_) => panic!("nodeexpand prefix is required"),
-        Err(error) => error.to_string(),
-    };
-    assert!(error.contains("panel.nodeexpand_api_prefix"));
 }
 
 #[test]
