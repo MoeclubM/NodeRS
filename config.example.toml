@@ -2,6 +2,3 @@
 api = "https://xboard.example.com"
 key = "replace-me"
 machine_id = 1
-# Enable this when the Xboard-NodeExpand plugin is installed and NodeRS should
-# discover plugin-expanded NodeExpand nodes.
-# nodeexpand_api_prefix = "/api/v1/nodeexpand/server"

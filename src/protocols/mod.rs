@@ -13,7 +13,6 @@ pub enum ProtocolKind {
     Hysteria2,
     Mieru,
     Naive,
-    NodeExpand,
     Shadowsocks,
     Trojan,
     Tuic,
@@ -38,8 +37,6 @@ impl ProtocolKind {
             Some(Self::Mieru)
         } else if matches!(normalized.as_str(), "naive" | "naiveproxy" | "naivehttps") {
             Some(Self::Naive)
-        } else if matches!(normalized.as_str(), "nodeexpand" | "aerionmp") {
-            Some(Self::NodeExpand)
         } else if matches!(
             normalized.as_str(),
             "shadowsocks" | "ss" | "shadowsocks2022" | "ss2022"
@@ -64,7 +61,6 @@ impl ProtocolKind {
             Self::Hysteria2 => "hysteria2",
             Self::Mieru => "mieru",
             Self::Naive => "naive",
-            Self::NodeExpand => "nodeexpand",
             Self::Shadowsocks => "shadowsocks",
             Self::Trojan => "trojan",
             Self::Tuic => "tuic",
@@ -83,10 +79,6 @@ mod tests {
         assert_eq!(ProtocolKind::parse("mieru"), Some(ProtocolKind::Mieru));
         assert_eq!(ProtocolKind::parse("naive"), Some(ProtocolKind::Naive));
         assert_eq!(ProtocolKind::parse("hy2"), Some(ProtocolKind::Hysteria2));
-        assert_eq!(
-            ProtocolKind::parse("node-expand"),
-            Some(ProtocolKind::NodeExpand)
-        );
         assert_eq!(ProtocolKind::parse("ss"), Some(ProtocolKind::Shadowsocks));
         assert_eq!(ProtocolKind::parse("tuic"), Some(ProtocolKind::Tuic));
         assert_eq!(

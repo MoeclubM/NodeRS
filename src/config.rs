@@ -22,8 +22,6 @@ pub struct PanelConfig {
     #[serde(alias = "token")]
     pub key: String,
     pub machine_id: i64,
-    #[serde(default)]
-    pub nodeexpand_api_prefix: Option<String>,
 }
 
 #[cfg(test)]
@@ -50,7 +48,6 @@ mod tests {
         assert_eq!(parsed.panel.machine_id, 9);
         assert_eq!(parsed.panel.api, "https://xboard.example.com");
         assert_eq!(parsed.panel.key, "replace-me");
-        assert_eq!(parsed.panel.nodeexpand_api_prefix, None);
     }
 
     #[test]
@@ -72,29 +69,5 @@ mod tests {
 
         assert_eq!(parsed.panel.api, "https://xboard.example.com");
         assert_eq!(parsed.panel.key, "replace-me");
-    }
-
-    #[test]
-    fn parses_nodeexpand_plugin_prefix() {
-        #[derive(Deserialize)]
-        struct Wrapper {
-            panel: PanelConfig,
-        }
-
-        let parsed: Wrapper = toml::from_str(
-            r#"
-                [panel]
-                url = "https://xboard.example.com"
-                token = "replace-me"
-                machine_id = 9
-                nodeexpand_api_prefix = "/api/v1/nodeexpand/server"
-            "#,
-        )
-        .expect("parse nodeexpand panel config");
-
-        assert_eq!(
-            parsed.panel.nodeexpand_api_prefix.as_deref(),
-            Some("/api/v1/nodeexpand/server")
-        );
     }
 }
