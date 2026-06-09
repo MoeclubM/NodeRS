@@ -1,6 +1,6 @@
 use crate::panel::NodeConfigResponse;
 
-const DEFAULT_LISTEN_IP: &str = "0.0.0.0";
+const DEFAULT_LISTEN_IP: &str = "::";
 
 pub(crate) fn effective_listen_ip(remote: &NodeConfigResponse) -> String {
     let listen_ip = remote.listen_ip.trim();
