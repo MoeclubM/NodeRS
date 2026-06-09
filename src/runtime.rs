@@ -79,7 +79,11 @@ impl MachineRuntime {
         let handshake = self.panel.fetch_handshake().await?;
         self.refresh_machine_nodes().await?;
 
-        if handshake.websocket.enabled {
+        if self.panel.uses_nodeexpand_api() {
+            info!(
+                "Xboard NodeExpand plugin API is enabled; using HTTP polling for plugin-expanded node sync"
+            );
+        } else if handshake.websocket.enabled {
             let ws_url = handshake.websocket.ws_url.trim();
             if ws_url.is_empty() {
                 warn!("Xboard websocket handshake succeeded but ws_url is empty");
@@ -331,7 +335,8 @@ impl MachineRuntime {
             let node = Arc::new(ManagedNode::new(
                 summary.id,
                 protocol,
-                self.panel.node_client(summary.id),
+                self.panel
+                    .node_client(summary.id, protocol == ProtocolKind::NodeExpand)?,
                 machine_base_config.clone(),
             ));
             node.initialize().await?;
