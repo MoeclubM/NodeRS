@@ -30,6 +30,9 @@ pub(super) fn spawn_running_server(
         BuiltServerConfig::Naive(config) => vec![spawn_aerion_task(protocol, async move {
             ::aerion::run_naive_server_with_core(config, core).await
         })],
+        BuiltServerConfig::NodeExpand(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_nodeexpand_server_with_core(config, core).await
+        })],
         BuiltServerConfig::Shadowsocks(config) => vec![spawn_aerion_task(protocol, async move {
             ::aerion::run_shadowsocks_server_with_core(config, core).await
         })],

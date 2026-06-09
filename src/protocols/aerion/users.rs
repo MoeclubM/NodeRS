@@ -42,7 +42,10 @@ pub(super) fn credentials_for_server(
 fn credentials_for_user(protocol: ProtocolKind, user: &PanelUser) -> anyhow::Result<Vec<String>> {
     let mut credentials = Vec::new();
     match protocol {
-        ProtocolKind::Anytls | ProtocolKind::Vless | ProtocolKind::Vmess => {
+        ProtocolKind::Anytls
+        | ProtocolKind::NodeExpand
+        | ProtocolKind::Vless
+        | ProtocolKind::Vmess => {
             let uuid = user.uuid.trim();
             ensure!(
                 !uuid.is_empty(),

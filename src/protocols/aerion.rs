@@ -43,6 +43,7 @@ enum BuiltServerConfig {
     Hysteria2(::aerion::Hysteria2ServerConfig),
     Mieru(::aerion::MieruServerConfig),
     Naive(::aerion::NaiveServerConfig),
+    NodeExpand(::aerion::NodeExpandServerConfig),
     Shadowsocks(::aerion::ShadowsocksServerConfig),
     Trojan(::aerion::TrojanServerConfig),
     Tuic(::aerion::TuicServerConfig),
@@ -208,6 +209,7 @@ async fn build_server_config(
         ProtocolKind::Hysteria2 => build_hysteria2_config(remote, users).await,
         ProtocolKind::Mieru => build_mieru_config(remote, users),
         ProtocolKind::Naive => build_naive_config(remote, users).await,
+        ProtocolKind::NodeExpand => build_nodeexpand_config(remote, users),
         ProtocolKind::Shadowsocks => shadowsocks::build_config(remote, users),
         ProtocolKind::Trojan => build_trojan_config(remote, users).await,
         ProtocolKind::Tuic => build_tuic_config(remote, users).await,
@@ -303,6 +305,36 @@ fn build_mieru_config(
         transport: mieru_transport(remote.transport.as_ref())?,
         traffic_pattern: mieru_traffic_pattern(remote)?,
     }))
+}
+
+fn build_nodeexpand_config(
+    remote: &NodeConfigResponse,
+    users: &[PanelUser],
+) -> anyhow::Result<BuiltServerConfig> {
+    require_tcp_network(remote, "NodeExpand")?;
+    ensure!(
+        remote.tls_mode() == 0
+            && remote.server_name.trim().is_empty()
+            && remote.alpn.is_empty()
+            && !remote.tls_settings.is_configured()
+            && !remote.tls_settings.ech.is_enabled()
+            && !remote.tls_settings.has_reality_key_material()
+            && !remote.reality_settings.is_configured(),
+        "NodeExpand is a non-TLS protocol; Xboard TLS/REALITY settings are not valid"
+    );
+    Ok(BuiltServerConfig::NodeExpand(
+        ::aerion::NodeExpandServerConfig {
+            listen: listen_addr(remote)?,
+            password: String::new(),
+            users: credentials_for_server(ProtocolKind::NodeExpand, users)?,
+            padding_scheme: if remote.padding_scheme.is_empty() {
+                ::aerion::padding::PaddingScheme::default_lines()
+            } else {
+                remote.padding_scheme.clone()
+            },
+            heartbeat_interval_secs: heartbeat_interval_secs(remote)?,
+        },
+    ))
 }
 
 async fn build_naive_config(
