@@ -21,7 +21,7 @@ fn builds_mieru_server_config() {
     else {
         panic!("expected Mieru config");
     };
-    assert_eq!(config.listen, "127.0.0.1:8964".parse().unwrap());
+    assert_eq!(config.listen, "[::]:8964".parse().unwrap());
     assert_eq!(config.users.len(), 1);
     assert_eq!(config.users[0].username, "mieru-secret");
     assert_eq!(config.users[0].password, "mieru-secret");
@@ -47,7 +47,7 @@ fn builds_shadowsocks_legacy_server_config() {
     else {
         panic!("expected Shadowsocks config");
     };
-    assert_eq!(config.listen, "127.0.0.1:8388".parse().unwrap());
+    assert_eq!(config.listen, "[::]:8388".parse().unwrap());
     assert_eq!(config.method, "aes-128-gcm");
     assert_eq!(config.password, "ss-secret");
     assert!(config.users.is_empty());
@@ -166,7 +166,7 @@ fn builds_mieru_server_config_ignores_xboard_tls_and_cert() {
     else {
         panic!("expected Mieru config");
     };
-    assert_eq!(config.listen, "127.0.0.1:8964".parse().unwrap());
+    assert_eq!(config.listen, "[::]:8964".parse().unwrap());
     assert_eq!(config.users[0].username, "mieru-secret");
 }
 
@@ -202,7 +202,7 @@ async fn builds_naive_server_config() {
     else {
         panic!("expected Naive config");
     };
-    assert_eq!(config.listen, "127.0.0.1:8443".parse().unwrap());
+    assert_eq!(config.listen, "[::]:8443".parse().unwrap());
     assert_eq!(config.username, "alice");
     assert_eq!(config.password, "alice-pass");
     assert_eq!(config.users, vec!["bob:bob-pass"]);
@@ -264,7 +264,7 @@ async fn builds_hysteria2_server_config_from_xboard_obfs_fields() {
     else {
         panic!("expected Hysteria2 config");
     };
-    assert_eq!(config.listen, "127.0.0.1:8444".parse().unwrap());
+    assert_eq!(config.listen, "[::]:8444".parse().unwrap());
     assert_eq!(config.users, vec!["password-secret", "uuid-secret"]);
     assert_eq!(config.obfs.as_deref(), Some("salamander"));
     assert_eq!(config.obfs_password.as_deref(), Some("xboard-obfs-secret"));
