@@ -77,7 +77,7 @@ def base_node_config(protocol, server_port, extra=None):
 PROTOCOL_CONFIGS = {
     "shadowsocks": lambda port: base_node_config(
         "shadowsocks", port,
-        {"network": "tcp", "cipher": "2022-blake3-aes-128-gcm",
+        {"network": "tcp,udp", "cipher": "2022-blake3-aes-128-gcm",
          "server_key": "vaR5nc1yDpQ707N7bRV2aA==",
          "tls": None, "tls_settings": None,
          "reality_settings": None, "cert_config": None,
