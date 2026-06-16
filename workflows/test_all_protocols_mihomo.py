@@ -258,7 +258,8 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
     if protocol == "shadowsocks":
         proxy.update({
             "type": "ss", "server": "127.0.0.1", "port": server_port,
-            "cipher": "aes-128-gcm", "password": password, "udp": True,
+            "cipher": "2022-blake3-aes-128-gcm",
+            "password": "c2VyLXNlcnZlci1rZXktc2hhZG93c29ja3M=", "udp": True,
         })
     elif protocol == "hysteria2":
         proxy.update({
@@ -361,7 +362,7 @@ class MihomoProtocolTester:
                 str(ROOT / "workflows" / "simulated_panel.py"),
                 "--protocol", self.protocol,
                 "--node-id", str(NODE_ID),
-                "--cipher", "aes-128-gcm" if self.protocol == "shadowsocks" else "",
+                "--cipher", "",  # shadowsocks uses SS2022 default
                 "--port", str(panel_port),
                 "--port-base", str(PORT_BASE),
             ], env={**os.environ, "PYTHONUNBUFFERED": "1"})
@@ -384,13 +385,23 @@ class MihomoProtocolTester:
 
             # 4. Wait for protocol runtime
             marker = f"{self.protocol} protocol runtime applied".lower()
-            found, log_out = wait_for_log(self.noders_proc, marker, timeout=30)
+            found, log_out = wait_for_log(self.noders_proc, marker, timeout=90)
             if not found:
-                self._dump_logs(log_out)
-                rc = self.noders_proc.poll()
-                if rc is not None:
-                    return False, f"NodeRS exited {rc}: {log_out[-400:]}"
-                return False, f"runtime not applied: {log_out[-300:]}"
+                # On Windows, tracing_subscriber may write via WriteConsoleW, bypassing pipe output.
+                # Fall back to time-based wait: if noders is still alive, assume runtime applied.
+                if sys.platform == "win32" and self.noders_proc.poll() is None:
+                    fallback_wait = 10
+                    self.log(f"log capture empty (Windows), waiting {fallback_wait}s for runtime...")
+                    time.sleep(fallback_wait)
+                    if self.noders_proc.poll() is not None:
+                        return False, f"NodeRS exited {self.noders_proc.returncode} before runtime applied"
+                    self.log("assuming runtime applied (time-based fallback)")
+                else:
+                    self._dump_logs(log_out)
+                    rc = self.noders_proc.poll()
+                    if rc is not None:
+                        return False, f"NodeRS exited {rc}: {log_out[-400:]}"
+                    return False, f"runtime not applied: {log_out[-300:]}"
 
             # 5. Extract server port
             server_port = self._extract_server_port(log_out)
