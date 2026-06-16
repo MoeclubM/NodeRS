@@ -68,9 +68,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download -R MetaCubeX/mihomo Prerelease-Alpha \
-            -p 'mihomo-linux-amd64-*.gz' \
-            -O /tmp/mihomo.gz
+          MIHOMO_URL=$(gh api repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha \
+            --jq '.assets[] | select(.name | test("mihomo-linux-amd64-.*\\.gz$") and (test("go[0-9]") | not)) | .browser_download_url' \
+            | head -1)
+          echo "Downloading: $MIHOMO_URL"
+          curl -fsSLo /tmp/mihomo.gz "$MIHOMO_URL"
           gunzip /tmp/mihomo.gz
           chmod +x /tmp/mihomo
           /tmp/mihomo --version
