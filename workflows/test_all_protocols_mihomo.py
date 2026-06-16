@@ -421,7 +421,7 @@ class MihomoProtocolTester:
             # 6. Mihomo config
             self.mixed_port = free_port()
             self.socks_port = free_port()
-            pw = "BranEefsCu8ZvBtzs3vA1g==" if self.protocol == "shadowsocks" else DEFAULT_PASSWORD
+            pw = "vaR5nc1yDpQ707N7bRV2aA==" if self.protocol == "shadowsocks" else DEFAULT_PASSWORD
             uuid_val = DEFAULT_UUID
             config = generate_mihomo_config(
                 self.protocol, server_port, pw, uuid_val,
