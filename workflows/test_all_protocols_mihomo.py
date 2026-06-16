@@ -41,6 +41,9 @@ PROTOCOLS = [
     "trojan", "tuic", "vless", "vmess", "anytls",
 ]
 
+DEFAULT_PASSWORD = "test-password-1001"
+DEFAULT_UUID = "a3482e88-686a-4a58-8126-99c9df64b7bf"
+
 NATIVE_UDP_PROTOCOLS = {
     "shadowsocks", "hysteria2", "mieru", "trojan", "tuic", "vless", "vmess",
 }
@@ -259,7 +262,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
         proxy.update({
             "type": "ss", "server": "127.0.0.1", "port": server_port,
             "cipher": "2022-blake3-aes-128-gcm",
-            "password": "c2VyLXNlcnZlci1rZXktc2hhZG93c29ja3M=", "udp": True,
+            "password": password, "udp": True,
         })
     elif protocol == "hysteria2":
         proxy.update({
@@ -286,7 +289,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
         })
     elif protocol == "tuic":
         if not uuid_val:
-            uuid_val = "a3482e88-686a-4a58-8126-99c9df64b7bf"
+            uuid_val = DEFAULT_UUID
         proxy.update({
             "type": "tuic", "server": "127.0.0.1", "port": server_port,
             "uuid": uuid_val, "password": password,
@@ -295,7 +298,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
         })
     elif protocol == "vless":
         if not uuid_val:
-            uuid_val = "a3482e88-686a-4a58-8126-99c9df64b7bf"
+            uuid_val = DEFAULT_UUID
         proxy.update({
             "type": "vless", "server": "127.0.0.1", "port": server_port,
             "uuid": uuid_val, "tls": True, "servername": "node-test.local",
@@ -303,7 +306,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
         })
     elif protocol == "vmess":
         if not uuid_val:
-            uuid_val = "a3482e88-686a-4a58-8126-99c9df64b7bf"
+            uuid_val = DEFAULT_UUID
         proxy.update({
             "type": "vmess", "server": "127.0.0.1", "port": server_port,
             "uuid": uuid_val, "cipher": "auto", "udp": True,
@@ -384,7 +387,7 @@ class MihomoProtocolTester:
                 [str(self.noders_bin), config_path], cwd=self.workdir)
 
             # 4. Wait for protocol runtime
-            marker = f"{self.protocol} protocol runtime applied".lower()
+            marker = "aerion protocol runtime applied"
             found, log_out = wait_for_log(self.noders_proc, marker, timeout=90)
             if not found:
                 # On Windows, tracing_subscriber may write via WriteConsoleW, bypassing pipe output.
@@ -418,10 +421,10 @@ class MihomoProtocolTester:
             # 6. Mihomo config
             self.mixed_port = free_port()
             self.socks_port = free_port()
-            password = "test-password-1001"
-            uuid_val = "a3482e88-686a-4a58-8126-99c9df64b7bf"
+            pw = "BranEefsCu8ZvBtzs3vA1g==" if self.protocol == "shadowsocks" else DEFAULT_PASSWORD
+            uuid_val = DEFAULT_UUID
             config = generate_mihomo_config(
-                self.protocol, server_port, password, uuid_val,
+                self.protocol, server_port, pw, uuid_val,
                 self.mixed_port, self.socks_port)
             import yaml
             mihomo_yaml = os.path.join(self.workdir, "config.yaml")

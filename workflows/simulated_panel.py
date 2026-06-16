@@ -120,6 +120,12 @@ DEFAULT_USERS = [
      "password": "test-password-1002", "alter_id": 0, "speed_limit": 0, "device_limit": 0},
 ]
 
+# Shadowsocks 2022 user PSK keys (base64-encoded 16-byte keys)
+SS_USER_KEYS = {
+    1001: "BranEefsCu8ZvBtzs3vA1g==",
+    1002: "Lvm9yna6eOUygd731v0jbA==",
+}
+
 
 class PanelHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -161,7 +167,15 @@ class PanelHandler(BaseHTTPRequestHandler):
                 cfg = self._node_config()
                 self._send_json(200, cfg)
             elif path == "/api/v2/server/user":
-                self._send_json(200, {"users": DEFAULT_USERS})
+                if self.server.protocol == "shadowsocks":
+                    users = []
+                    for u in DEFAULT_USERS:
+                        u2 = dict(u)
+                        u2["password"] = SS_USER_KEYS.get(u["id"], u["password"])
+                        users.append(u2)
+                    self._send_json(200, {"users": users})
+                else:
+                    self._send_json(200, {"users": DEFAULT_USERS})
             elif path == "/api/v2/server/report":
                 self._send_json(200, {})
             else:
