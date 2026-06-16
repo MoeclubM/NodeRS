@@ -78,7 +78,7 @@ PROTOCOL_CONFIGS = {
     "shadowsocks": lambda port: base_node_config(
         "shadowsocks", port,
         {"network": "tcp", "cipher": "2022-blake3-aes-128-gcm",
-         "server_key": "c2VyLXNlcnZlci1rZXktc2hhZG93c29ja3M=",
+         "server_key": "vaR5nc1yDpQ707N7bRV2aA==",
          "tls": None, "tls_settings": None,
          "reality_settings": None, "cert_config": None,
          "udp_relay_mode": "native"}),
@@ -91,9 +91,6 @@ PROTOCOL_CONFIGS = {
         "mieru", port,
         {"network": "tcp", "tls": None, "tls_settings": None,
          "reality_settings": None, "cert_config": None}),
-    "naive": lambda port: base_node_config(
-        "naive", port,
-        {"network": "tcp", "udp_relay_mode": "native"}),
     "trojan": lambda port: base_node_config(
         "trojan", port,
         {"network": "tcp", "udp_relay_mode": "native"}),
@@ -122,8 +119,8 @@ DEFAULT_USERS = [
 
 # Shadowsocks 2022 user PSK keys (base64-encoded 16-byte keys)
 SS_USER_KEYS = {
-    1001: "BranEefsCu8ZvBtzs3vA1g==",
-    1002: "Lvm9yna6eOUygd731v0jbA==",
+    1001: "vaR5nc1yDpQ707N7bRV2aA==",
+    1002: "vaR5nc1yDpQ707N7bRV2aA==",
 }
 
 

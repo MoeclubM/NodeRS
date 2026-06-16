@@ -37,7 +37,7 @@ PORT_BASE = 22000
 PANEL_TOKEN = "test-token-noders-e2e"
 
 PROTOCOLS = [
-    "shadowsocks", "hysteria2", "mieru", "naive",
+    "shadowsocks", "hysteria2", "mieru",
     "trojan", "tuic", "vless", "vmess", "anytls",
 ]
 
@@ -274,12 +274,6 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
         proxy.update({
             "type": "mieru", "server": "127.0.0.1", "port": server_port,
             "username": password, "password": password,
-        })
-    elif protocol == "naive":
-        proxy.update({
-            "type": "naive", "server": "127.0.0.1", "port": server_port,
-            "username": password, "password": password,
-            "sni": "node-test.local", "skip-cert-verify": True,
         })
     elif protocol == "trojan":
         proxy.update({

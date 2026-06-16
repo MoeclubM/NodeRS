@@ -10,7 +10,7 @@ For each protocol, this script:
 5. Runs SOCKS5 TCP echo test through the full proxy chain
 
 Protocols tested:
-  shadowsocks, hysteria2, mieru, naive, trojan, tuic, vless, vmess, anytls
+  shadowsocks, hysteria2, mieru, trojan, tuic, vless, vmess, anytls
 
 Usage:
   python test_all_protocols.py [--protocol hysteria2] [--only-protocols X,Y]
@@ -42,7 +42,6 @@ PROTOCOLS = [
     "shadowsocks",
     "hysteria2",
     "mieru",
-    "naive",
     "trojan",
     "tuic",
     "vless",
