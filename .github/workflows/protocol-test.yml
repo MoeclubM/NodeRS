@@ -12,7 +12,7 @@ on:
     inputs:
       protocol:
         description: 'Protocol to test (comma-separated)'
-        default: ''  # empty = run all
+        default: ''
         required: false
 
 jobs:
@@ -24,8 +24,13 @@ jobs:
     steps:
       - name: Install CI dependencies
         run: |
+          mkdir -p -m 755 /usr/share/keyrings
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake clang libclang-dev llvm-dev python3 python3-pip sudo zstd
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake clang libclang-dev llvm-dev python3 python3-pip sudo zstd gh
           echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
           pip3 install --break-system-packages pyyaml
 
@@ -55,9 +60,12 @@ jobs:
         run: cargo build
 
       - name: Download mihomo Alpha pre-built
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          MIHOMO_URL=$(curl -sL https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha | python3 -c "import sys,json; d=json.load(sys.stdin); assets=[a['browser_download_url'] for a in d['assets'] if 'linux-amd64-alpha' in a['name'] and a['name'].endswith('.gz')]; print(assets[0])")
-          curl -fsSLo /tmp/mihomo.gz "$MIHOMO_URL"
+          gh release download -R MetaCubeX/mihomo Prerelease-Alpha \
+            -p 'mihomo-linux-amd64-*.gz' \
+            -O /tmp/mihomo.gz
           gunzip /tmp/mihomo.gz
           chmod +x /tmp/mihomo
           /tmp/mihomo --version
