@@ -78,7 +78,8 @@ PROTOCOL_CONFIGS = {
     "shadowsocks": lambda port: base_node_config(
         "shadowsocks", port,
         {"network": "tcp", "cipher": "2022-blake3-aes-128-gcm",
-         "server_key": "c2VyLXNlcnZlci1rZXktc2hhZG93c29ja3M=", "tls": None, "tls_settings": None,
+         "server_key": "c2VyLXNlcnZlci1rZXktc2hhZG93c29ja3M=",
+         "tls": None, "tls_settings": None,
          "reality_settings": None, "cert_config": None,
          "udp_relay_mode": "native"}),
     "hysteria2": lambda port: base_node_config(
@@ -109,13 +110,13 @@ PROTOCOL_CONFIGS = {
          "reality_settings": None, "cert_config": None, "udp_relay_mode": "native"}),
     "anytls": lambda port: base_node_config(
         "anytls", port,
-        {"network": "tcp", "padding_scheme": ["0:10-20:100-200"]}),
+        {"network": "tcp"}),
 }
 
 DEFAULT_USERS = [
     {"id": 1001, "uuid": "a3482e88-686a-4a58-8126-99c9df64b7bf",
      "password": "test-password-1001", "alter_id": 0, "speed_limit": 0, "device_limit": 0},
-    {"id": 1002, "uuid": "b4593f99-797b-5b69-9237-aa0de075c8cg",
+    {"id": 1002, "uuid": "b4593f99-797b-5b69-9237-aa0de075c8cf",
      "password": "test-password-1002", "alter_id": 0, "speed_limit": 0, "device_limit": 0},
 ]
 
