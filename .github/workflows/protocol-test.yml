@@ -57,7 +57,7 @@ jobs:
       - name: Download mihomo
         run: |
           MIHOMO_VER="v1.19.27"
-          curl -fsSLo /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-compatible-${MIHOMO_VER}.gz"
+          curl -fsSLo /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz"
           gunzip /tmp/mihomo.gz
           chmod +x /tmp/mihomo
 
