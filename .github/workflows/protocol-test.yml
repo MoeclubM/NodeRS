@@ -75,7 +75,7 @@ jobs:
           curl -fsSLo /tmp/mihomo.gz "$MIHOMO_URL"
           gunzip /tmp/mihomo.gz
           chmod +x /tmp/mihomo
-          /tmp/mihomo --version
+          /tmp/mihomo -v
 
       - name: Run protocol integration test
         env:
