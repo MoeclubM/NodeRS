@@ -62,7 +62,7 @@ jobs:
           echo "PATH=/usr/local/go/bin:$PATH" >> "$GITHUB_ENV"
           git clone --depth 1 --branch Alpha https://github.com/MetaCubeX/mihomo.git /tmp/mihomo-src
           cd /tmp/mihomo-src
-          go build -o /tmp/mihomo -trimpath ./cmd/mihomo
+          CGO_ENABLED=0 go build -o /tmp/mihomo -trimpath .
           /tmp/mihomo --version
           chmod +x /tmp/mihomo
 
