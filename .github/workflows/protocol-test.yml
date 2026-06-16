@@ -54,11 +54,16 @@ jobs:
       - name: Build noders binary
         run: cargo build
 
-      - name: Download mihomo
+      - name: Build mihomo from Alpha branch
         run: |
-          MIHOMO_VER="v1.19.27"
-          curl -fsSLo /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz"
-          gunzip /tmp/mihomo.gz
+          curl -fsSLo /tmp/go.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz
+          tar -C /usr/local -xzf /tmp/go.tar.gz
+          export PATH="/usr/local/go/bin:$PATH"
+          echo "PATH=/usr/local/go/bin:$PATH" >> "$GITHUB_ENV"
+          git clone --depth 1 --branch Alpha https://github.com/MetaCubeX/mihomo.git /tmp/mihomo-src
+          cd /tmp/mihomo-src
+          go build -o /tmp/mihomo -trimpath ./cmd/mihomo
+          /tmp/mihomo --version
           chmod +x /tmp/mihomo
 
       - name: Run protocol integration test
