@@ -274,7 +274,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
         proxy.update({
             "type": "mieru", "server": "127.0.0.1", "port": server_port,
             "transport": "TCP",
-            "username": password, "password": password, "udp": True,
+            "username": uuid_val or DEFAULT_UUID, "password": uuid_val or DEFAULT_UUID, "udp": True,
         })
     elif protocol == "trojan":
         proxy.update({
@@ -309,7 +309,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
     elif protocol == "anytls":
         proxy.update({
             "type": "anytls", "server": "127.0.0.1", "port": server_port,
-            "password": password, "sni": "node-test.local",
+            "password": uuid_val or DEFAULT_UUID, "sni": "node-test.local",
             "udp": True,
             "skip-cert-verify": True,
         })
