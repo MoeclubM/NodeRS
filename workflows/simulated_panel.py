@@ -105,9 +105,6 @@ PROTOCOL_CONFIGS = {
         "vmess", port,
         {"network": "tcp", "tls": None, "tls_settings": None,
          "reality_settings": None, "cert_config": None, "udp_relay_mode": "native"}),
-    "anytls": lambda port: base_node_config(
-        "anytls", port,
-        {"network": "tcp"}),
 }
 
 DEFAULT_USERS = [

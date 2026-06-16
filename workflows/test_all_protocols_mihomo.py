@@ -38,7 +38,7 @@ PANEL_TOKEN = "test-token-noders-e2e"
 
 PROTOCOLS = [
     "shadowsocks", "hysteria2", "mieru",
-    "trojan", "tuic", "vless", "vmess", "anytls",
+    "trojan", "tuic", "vless", "vmess",
 ]
 
 DEFAULT_PASSWORD = "test-password-1001"
