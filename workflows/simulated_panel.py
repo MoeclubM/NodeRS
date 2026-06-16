@@ -110,7 +110,7 @@ PROTOCOL_CONFIGS = {
          "reality_settings": None, "cert_config": None, "udp_relay_mode": "native"}),
     "anytls": lambda port: base_node_config(
         "anytls", port,
-        {"network": "tcp", "padding_scheme": ["0:10-100:500-1000"]}),
+        {"network": "tcp"}),
 }
 
 DEFAULT_USERS = [
