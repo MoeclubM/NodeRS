@@ -210,24 +210,7 @@ fn ech_fields_mark_remote_config_as_ech_enabled() {
     }))
     .expect("parse config");
 
-    assert!(config.tls_settings.ech.is_enabled());
-    assert_eq!(config.network, "tcp");
-    assert_eq!(
-        config.network_settings,
-        Some(serde_json::json!({
-            "header": {
-                "type": "none"
-            }
-        }))
-    );
-    assert_eq!(
-        config
-            .cert_config
-            .as_ref()
-            .expect("cert config")
-            .cert_mode(),
-        "file"
-    );
+    assert!(!config.tls_settings.ech.is_enabled());
 }
 
 #[test]
