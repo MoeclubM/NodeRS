@@ -178,6 +178,54 @@ def wait_for_log(proc, marker, timeout=30):
 
     return marker_lower in buf.lower(), buf
 
+
+def drain_proc_output(proc, timeout=2.0):
+    """Non-blocking drain of proc stdout/stderr for debugging."""
+    if sys.platform == "win32":
+        result = ""
+        for s in [proc.stdout, proc.stderr]:
+            if s is None or s.closed:
+                continue
+            try:
+                while True:
+                    data = s.read(4096)
+                    if not data:
+                        break
+                    result += data
+            except Exception:
+                pass
+        return result
+    import select
+    import fcntl
+    streams = [s for s in [proc.stdout, proc.stderr] if s is not None and not s.closed]
+    for s in streams:
+        try:
+            fd = s.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        except Exception:
+            pass
+    result = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline and streams:
+        try:
+            readable, _, _ = select.select(streams, [], [], 0.2)
+        except (ValueError, OSError):
+            break
+        if not readable:
+            continue
+        for s in readable:
+            try:
+                data = s.read(4096)
+                if data:
+                    result += data
+                else:
+                    streams.remove(s)
+            except Exception:
+                pass
+    return result
+
+
 class TcpEchoServer:
     def __init__(self):
         self.socket = None
@@ -475,6 +523,14 @@ class MihomoProtocolTester:
                     self.log("UDP PASS")
                 else:
                     self.log(f"UDP FAIL ({udp_msg})")
+                    noders_logs = drain_proc_output(self.noders_proc, timeout=2.0)
+                    mihomo_logs = drain_proc_output(self.mihomo_proc, timeout=2.0)
+                    if noders_logs:
+                        for line in noders_logs[-3000:].strip().split("\n"):
+                            self.log(f"  [noders] {line}")
+                    if mihomo_logs:
+                        for line in mihomo_logs[-3000:].strip().split("\n"):
+                            self.log(f"  [mihomo] {line}")
 
             return True, f"TCP ok, UDP {udp_msg}"
 
