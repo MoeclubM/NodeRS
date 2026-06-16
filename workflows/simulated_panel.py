@@ -110,7 +110,7 @@ PROTOCOL_CONFIGS = {
          "reality_settings": None, "cert_config": None, "udp_relay_mode": "native"}),
     "anytls": lambda port: base_node_config(
         "anytls", port,
-        {"network": "tcp"}),
+        {"network": "tcp", "padding_scheme": ["0:10-100:500-1000"]}),
 }
 
 DEFAULT_USERS = [
@@ -168,12 +168,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._send_json(200, cfg)
             elif path == "/api/v2/server/user":
                 if self.server.protocol == "shadowsocks":
-                    users = []
-                    for u in DEFAULT_USERS:
-                        u2 = dict(u)
-                        u2["password"] = SS_USER_KEYS.get(u["id"], u["password"])
-                        users.append(u2)
-                    self._send_json(200, {"users": users})
+                    # Shadowsocks 2022 multi-user TCP requires crate feature; test with 1 user
+                    u = dict(DEFAULT_USERS[0])
+                    u["password"] = SS_USER_KEYS.get(u["id"], u["password"])
+                    self._send_json(200, {"users": [u]})
                 else:
                     self._send_json(200, {"users": DEFAULT_USERS})
             elif path == "/api/v2/server/report":

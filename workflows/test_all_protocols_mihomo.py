@@ -273,13 +273,13 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
     elif protocol == "mieru":
         proxy.update({
             "type": "mieru", "server": "127.0.0.1", "port": server_port,
-            "username": password, "password": password, "transport": "tcp",
+            "username": password, "password": password,
         })
     elif protocol == "naive":
         proxy.update({
             "type": "naive", "server": "127.0.0.1", "port": server_port,
             "username": password, "password": password,
-            "sni": "node-test.local", "skip-cert-verify": True, "udp-over-tcp": True,
+            "sni": "node-test.local", "skip-cert-verify": True,
         })
     elif protocol == "trojan":
         proxy.update({
@@ -309,7 +309,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
             uuid_val = DEFAULT_UUID
         proxy.update({
             "type": "vmess", "server": "127.0.0.1", "port": server_port,
-            "uuid": uuid_val, "cipher": "auto", "udp": True,
+            "uuid": uuid_val, "cipher": "auto", "udp": True, "alterId": 0,
         })
     elif protocol == "anytls":
         proxy.update({
@@ -433,11 +433,34 @@ class MihomoProtocolTester:
 
             # 7. Start mihomo
             self.mihomo_proc = run_in_background(
-                [str(self.mihomo_bin), "-f", mihomo_yaml], cwd=self.workdir)
+                [str(self.mihomo_bin), "-f", mihomo_yaml,
+                 "-d", self.workdir], cwd=self.workdir)
             if not wait_for_server("127.0.0.1", self.mixed_port, timeout=15):
-                stderr = self.mihomo_proc.stderr.read() if self.mihomo_proc.stderr else ""
+                import select as _sel
+                stderr = ""
+                if self.mihomo_proc.stderr:
+                    try:
+                        import fcntl
+                        fd = self.mihomo_proc.stderr.fileno()
+                        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                    except Exception:
+                        pass
+                    for _ in range(50):
+                        if self.mihomo_proc.poll() is not None:
+                            break
+                        try:
+                            data = self.mihomo_proc.stderr.read(4096)
+                            if data:
+                                stderr += data
+                        except Exception:
+                            pass
+                try:
+                    self.mihomo_proc.stderr.close()
+                except Exception:
+                    pass
                 rc = self.mihomo_proc.poll()
-                return False, f"mihomo not started (rc={rc}): {stderr[-300:]}"
+                return False, f"mihomo not started (rc={rc}): {stderr[-500:-1] if stderr else 'no stderr'}"
             self.log("mihomo ready")
 
             # 8. TCP echo
@@ -484,6 +507,9 @@ class MihomoProtocolTester:
             resp = sock.recv(10)
             if resp[1] != 0:
                 return False, f"connect rejected ({resp[1]})"
+            # Small delay to let the proxy relay fully establish
+            sock.settimeout(15)
+            time.sleep(0.3)
             payload = b"hello-" + label + b"-" + self.protocol.encode()[:12]
             sock.sendall(payload)
             echoed = b""
