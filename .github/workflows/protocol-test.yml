@@ -1,0 +1,82 @@
+name: Protocol Integration Test (mihomo)
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'src/protocols/**'
+      - 'workflows/**'
+      - '.github/workflows/protocol-test.yml'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: 'Protocol to test (comma-separated)'
+        default: ''  # empty = run all
+        required: false
+
+jobs:
+  protocol-test:
+    name: Test protocols (mihomo)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    steps:
+      - name: Install CI dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config cmake clang libclang-dev llvm-dev python3 python3-pip sudo zstd
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+          pip3 install --break-system-packages pyyaml
+
+      - name: Checkout NodeRS
+        uses: actions/checkout@v5
+
+      - name: Checkout Aerion
+        uses: actions/checkout@v5
+        with:
+          repository: MoeclubM/Aerion
+          path: Aerion
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts (NodeRS)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            Aerion
+
+      - name: Build aerion binary
+        run: cargo build --manifest-path Aerion/Cargo.toml
+
+      - name: Build noders binary
+        run: cargo build
+
+      - name: Download mihomo
+        run: |
+          MIHOMO_VER="v1.19.27"
+          curl -fsSLo /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz"
+          gunzip /tmp/mihomo.gz
+          chmod +x /tmp/mihomo
+
+      - name: Run protocol integration test
+        env:
+          PROTO: ${{ github.event.inputs.protocol || '' }}
+          AERION_DIR: ${{ github.workspace }}/Aerion
+        run: |
+          if [ -n "${PROTO}" ]; then
+            python3 workflows/test_all_protocols_mihomo.py \
+              --only-protocols "${PROTO}" \
+              --aerion-bin "${AERION_DIR}/target/debug/aerion" \
+              --noders-bin "${PWD}/target/debug/noders" \
+              --mihomo-bin /tmp/mihomo \
+              --verbose
+          else
+            python3 workflows/test_all_protocols_mihomo.py \
+              --aerion-bin "${AERION_DIR}/target/debug/aerion" \
+              --noders-bin "${PWD}/target/debug/noders" \
+              --mihomo-bin /tmp/mihomo \
+              --verbose
+          fi
