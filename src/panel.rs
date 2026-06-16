@@ -417,11 +417,6 @@ pub struct NodeEchSettings {
 impl NodeEchSettings {
     pub fn is_enabled(&self) -> bool {
         self.enabled
-            || !self.config.trim().is_empty()
-            || !self.query_server_name.trim().is_empty()
-            || !self.key.trim().is_empty()
-            || !self.key_path.trim().is_empty()
-            || !self.config_path.trim().is_empty()
     }
 }
 
