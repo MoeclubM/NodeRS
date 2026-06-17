@@ -467,45 +467,70 @@ class MihomoProtocolTester:
             self.socks_port = free_port()
             pw = "vaR5nc1yDpQ707N7bRV2aA==" if self.protocol == "shadowsocks" else DEFAULT_PASSWORD
             uuid_val = DEFAULT_UUID
-            config = generate_mihomo_config(
-                self.protocol, server_port, pw, uuid_val,
-                self.mixed_port, self.socks_port)
-            import yaml
-            mihomo_yaml = os.path.join(self.workdir, "config.yaml")
-            with open(mihomo_yaml, "w") as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
-            # 7. Start mihomo
-            self.mihomo_proc = run_in_background(
-                [str(self.mihomo_bin), "-f", mihomo_yaml,
-                 "-d", self.workdir], cwd=self.workdir)
-            if not wait_for_server("127.0.0.1", self.mixed_port, timeout=15):
-                import select as _sel
-                stderr = ""
-                if self.mihomo_proc.stderr:
-                    try:
-                        import fcntl
-                        fd = self.mihomo_proc.stderr.fileno()
-                        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-                    except Exception:
-                        pass
-                    for _ in range(50):
-                        if self.mihomo_proc.poll() is not None:
-                            break
+            # SS UDP via mihomo Alpha panics in sing-shadowsocks2 v0.2.7 read-waiter
+            # (addr=0x20). Drive SS with the Aerion SOCKS5 client so TCP+UDP both go
+            # through a known-good SS2022 implementation.
+            if self.protocol == "shadowsocks":
+                aerion_toml = os.path.join(self.workdir, "aerion-client.toml")
+                with open(aerion_toml, "w") as f:
+                    f.write("[client]\n")
+                    f.write('protocol = "shadowsocks"\n')
+                    f.write(f'listen = "127.0.0.1:{self.mixed_port}"\n')
+                    f.write(f'server = "127.0.0.1:{server_port}"\n')
+                    f.write(f'password = "{pw}"\n')
+                    f.write('security = "2022-blake3-aes-128-gcm"\n')
+                    f.write("udp = true\n")
+                self.mihomo_proc = run_in_background(
+                    [str(self.aerion_bin), "run", "--config", aerion_toml],
+                    cwd=self.workdir,
+                    env={**os.environ, "RUST_LOG": "aerion=info"},
+                )
+                if not wait_for_server("127.0.0.1", self.mixed_port, timeout=15):
+                    rc = self.mihomo_proc.poll()
+                    logs = drain_proc_output(self.mihomo_proc, timeout=2.0)
+                    return False, f"aerion client not started (rc={rc}): {logs[-500:] if logs else 'no output'}"
+                self.log("aerion SOCKS5 client ready")
+            else:
+                config = generate_mihomo_config(
+                    self.protocol, server_port, pw, uuid_val,
+                    self.mixed_port, self.socks_port)
+                import yaml
+                mihomo_yaml = os.path.join(self.workdir, "config.yaml")
+                with open(mihomo_yaml, "w") as f:
+                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+                # 7. Start mihomo
+                self.mihomo_proc = run_in_background(
+                    [str(self.mihomo_bin), "-f", mihomo_yaml,
+                     "-d", self.workdir], cwd=self.workdir)
+                if not wait_for_server("127.0.0.1", self.mixed_port, timeout=15):
+                    import select as _sel
+                    stderr = ""
+                    if self.mihomo_proc.stderr:
                         try:
-                            data = self.mihomo_proc.stderr.read(4096)
-                            if data:
-                                stderr += data
+                            import fcntl
+                            fd = self.mihomo_proc.stderr.fileno()
+                            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
                         except Exception:
                             pass
-                try:
-                    self.mihomo_proc.stderr.close()
-                except Exception:
-                    pass
-                rc = self.mihomo_proc.poll()
-                return False, f"mihomo not started (rc={rc}): {stderr[-500:-1] if stderr else 'no stderr'}"
-            self.log("mihomo ready")
+                        for _ in range(50):
+                            if self.mihomo_proc.poll() is not None:
+                                break
+                            try:
+                                data = self.mihomo_proc.stderr.read(4096)
+                                if data:
+                                    stderr += data
+                            except Exception:
+                                pass
+                    try:
+                        self.mihomo_proc.stderr.close()
+                    except Exception:
+                        pass
+                    rc = self.mihomo_proc.poll()
+                    return False, f"mihomo not started (rc={rc}): {stderr[-500:-1] if stderr else 'no stderr'}"
+                self.log("mihomo ready")
 
             # 8. TCP echo
             tcp_ok, tcp_msg = self._socks_echo_test(
