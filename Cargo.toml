@@ -4,32 +4,32 @@ version = "0.1.27"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.102"
-aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "07e21d474667f84e9d4d8da8da9989a728c56054" }
+anyhow = "1.0.103"
+aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "a3a761bb317323ab3ce38280fb1c744455e996a9" }
 base64 = "0.22.1"
 boring = "5.1.0"
 futures-util = "0.3.32"
 hex = "0.4.3"
 hmac = "0.12.1"
-libc = "0.2.183"
+libc = "0.2.186"
 p256 = { version = "0.13.2", features = ["ecdsa", "pem", "pkcs8"] }
 percent-encoding = "2.3.2"
-rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "query", "rustls", "http2"] }
-rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls", "http2"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-sha1 = "0.10.6"
+serde_json = "1.0.150"
+sha1 = "0.10.7"
 sha2 = "0.10.9"
-tokio = { version = "1.50.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-time = { version = "0.3.41", features = ["formatting"] }
-toml = "1.0.6"
+tokio = { version = "1.52.4", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+time = { version = "0.3.53", features = ["formatting"] }
+toml = "1.1.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "std"] }
 
 [dev-dependencies]
-tokio = { version = "1.50.0", features = ["macros", "rt", "time", "test-util", "io-util"] }
+tokio = { version = "1.52.4", features = ["macros", "rt", "time", "test-util", "io-util"] }
 
 [profile.test]
 debug = 0

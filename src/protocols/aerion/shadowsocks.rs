@@ -1,7 +1,6 @@
 use anyhow::{Context, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use sha2::{Digest as _, Sha256};
 
 use crate::panel::{NodeConfigResponse, PanelUser};
 
@@ -317,13 +316,10 @@ fn normalize_psk(value: &str, key_len: usize, context: &str) -> anyhow::Result<S
     ensure!(!value.is_empty(), "Shadowsocks 2022 key is required");
     let decoded = STANDARD.decode(value).context(context.to_string())?;
     ensure!(
-        decoded.len() >= key_len,
-        "Shadowsocks 2022 key is shorter than {key_len} bytes"
+        decoded.len() == key_len,
+        "Shadowsocks 2022 key must be exactly {key_len} bytes"
     );
-    if decoded.len() == key_len {
-        return Ok(STANDARD.encode(decoded));
-    }
-    Ok(STANDARD.encode(&Sha256::digest(decoded)[..key_len]))
+    Ok(STANDARD.encode(decoded))
 }
 
 fn effective_password(user: &PanelUser) -> Option<&str> {

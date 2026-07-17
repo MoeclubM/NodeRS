@@ -237,7 +237,7 @@ machine_id = {MACHINE_ID}
             # 4. Wait for protocol runtime
             found, log_out = wait_for_log(
                 self.noders_proc,
-                f"{self.protocol} protocol runtime applied",
+                "server listening on",
                 timeout=30,
             )
             if not found:
@@ -246,13 +246,15 @@ machine_id = {MACHINE_ID}
                 rc = self.noders_proc.poll()
                 if rc is not None:
                     return False, f"NodeRS exited with code {rc}: {log_out[-600:]}"
-                return False, f"protocol runtime not applied: {log_out[-400:]}"
+                return False, f"server did not start: {log_out[-400:]}"
 
             # 5. Find the server port from logs
             server_port = self._extract_server_port(log_out)
             if not server_port:
                 return False, "could not determine server port"
-            if not wait_for_server("127.0.0.1", server_port, timeout=5):
+            if self.protocol not in ("hysteria2", "tuic") and not wait_for_server(
+                "127.0.0.1", server_port, timeout=5
+            ):
                 return False, f"server not reachable on :{server_port}"
             self.log(f"server ready on :{server_port}")
 
@@ -275,8 +277,7 @@ machine_id = {MACHINE_ID}
             m = re.search(r"listening on.*:(\d+)", line, re.IGNORECASE)
             if m:
                 return int(m.group(1))
-        # Fallback: panel allocates PORT_BASE + 0
-        return PORT_BASE
+        return None
 
     def _aerion_client_test(self, server_port, echo_port):
         client_port = free_port()

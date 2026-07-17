@@ -172,7 +172,7 @@ impl ServerController {
         )?);
         info!(
             protocol = self.protocol.as_str(),
-            "Aerion protocol runtime applied"
+            "Aerion protocol runtime task started"
         );
         Ok(())
     }
@@ -633,6 +633,10 @@ fn validate_tuic_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         !remote.multiplex_enabled(),
         "TUIC multiplex is not a server-side setting"
     );
+    ensure!(
+        !remote.zero_rtt_handshake,
+        "Aerion TUIC server does not expose 0-RTT handshakes"
+    );
     Ok(())
 }
 
@@ -757,7 +761,12 @@ fn vless_transport(
 ) -> anyhow::Result<::aerion::vless_transport::VlessTransportConfig> {
     let object = remote.network_settings.as_ref().and_then(Value::as_object);
     let path = string_field(object, &["path"]);
-    let host = string_field(object, &["host", "Host"]).or_else(|| header_value(object, "host"));
+    let host = string_field(object, &["host", "Host"])
+        .or_else(|| header_value(object, "host"))
+        .or_else(|| {
+            let host = remote.host.trim();
+            (!host.is_empty()).then(|| host.to_string())
+        });
     let headers = headers(object);
     let network = remote.network.trim();
     let normalized = network.to_ascii_lowercase().replace(['-', '_'], "");
@@ -833,9 +842,11 @@ fn heartbeat_interval_secs(remote: &NodeConfigResponse) -> anyhow::Result<u64> {
     if heartbeat.is_empty() {
         return Ok(::aerion::config::default_heartbeat_interval_secs());
     }
-    heartbeat
+    let heartbeat = heartbeat
         .parse::<u64>()
-        .context("parse heartbeat interval seconds")
+        .context("parse heartbeat interval seconds")?;
+    ensure!(heartbeat > 0, "heartbeat interval must be positive");
+    Ok(heartbeat)
 }
 
 fn hysteria2_obfs(remote: &NodeConfigResponse) -> anyhow::Result<(Option<String>, Option<String>)> {
