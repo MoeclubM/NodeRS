@@ -247,6 +247,7 @@ async fn builds_hysteria2_server_config_from_xboard_obfs_fields() {
         up_mbps: Some(json!(100)),
         server_key: "xboard-obfs-secret".to_string(),
         is_obfs: true,
+        auth_timeout: "3s".to_string(),
         congestion_control: "reno".to_string(),
         udp_relay_mode: "native".to_string(),
         ..Default::default()
@@ -271,6 +272,7 @@ async fn builds_hysteria2_server_config_from_xboard_obfs_fields() {
     assert_eq!(config.upload_bandwidth, Some(100));
     assert_eq!(config.cc_rx, "12500000");
     assert_eq!(config.congestion_control, "reno");
+    assert_eq!(config.auth_timeout, Duration::from_secs(3));
     assert!(config.udp);
     assert_eq!(config.cert_path, PathBuf::new());
     assert!(config.key.is_some());
