@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{error, info};
 
@@ -261,6 +262,17 @@ async fn build_hysteria2_config(
     );
     let identity = aerion_tls_identity(&tls, "Hysteria2").await?;
     let (obfs, obfs_password) = hysteria2_obfs(remote)?;
+    let auth_timeout = remote.auth_timeout.trim();
+    let auth_timeout = if auth_timeout.is_empty() {
+        ::aerion::config::default_hy2_auth_timeout_secs()
+    } else {
+        auth_timeout
+            .strip_suffix('s')
+            .unwrap_or(auth_timeout)
+            .parse::<u64>()
+            .context("parse Hysteria2 auth timeout seconds")?
+    };
+    ensure!(auth_timeout > 0, "Hysteria2 auth timeout must be positive");
     Ok(BuiltServerConfig::Hysteria2(
         ::aerion::Hysteria2ServerConfig {
             listen: listen_addr(remote)?,
@@ -276,6 +288,7 @@ async fn build_hysteria2_config(
             udp: hysteria2_udp_enabled(&remote.udp_relay_mode),
             cc_rx: hysteria2_cc_rx(remote.up_mbps.as_ref(), remote.ignore_client_bandwidth)?,
             congestion_control: remote.congestion_control.clone(),
+            auth_timeout: Duration::from_secs(auth_timeout),
         },
     ))
 }
