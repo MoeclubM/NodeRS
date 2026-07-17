@@ -1,12 +1,12 @@
-//! Tracing setup: quiet Aerion hot-path logs by default, overridable via `RUST_LOG`.
+//! Tracing setup, overridable via `RUST_LOG`.
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
 
-/// Default filter when `RUST_LOG` is unset: NodeRS stays informative, Aerion skips per-stream INFO.
-pub const DEFAULT_ENV_FILTER: &str = "info,aerion=warn";
+/// Default filter when `RUST_LOG` is unset.
+pub const DEFAULT_ENV_FILTER: &str = "info";
 
 pub fn init() {
     let env_filter =
