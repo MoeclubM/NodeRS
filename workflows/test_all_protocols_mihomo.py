@@ -46,6 +46,7 @@ DEFAULT_UUID = "a3482e88-686a-4a58-8126-99c9df64b7bf"
 
 NATIVE_UDP_PROTOCOLS = {
     "shadowsocks", "hysteria2", "mieru", "trojan", "tuic", "vless", "vmess",
+    "anytls",
 }
 
 def free_port():
@@ -431,24 +432,14 @@ class MihomoProtocolTester:
                 [str(self.noders_bin), config_path], cwd=self.workdir)
 
             # 4. Wait for protocol runtime
-            marker = "aerion protocol runtime applied"
+            marker = "server listening on"
             found, log_out = wait_for_log(self.noders_proc, marker, timeout=90)
             if not found:
-                # On Windows, tracing_subscriber may write via WriteConsoleW, bypassing pipe output.
-                # Fall back to time-based wait: if noders is still alive, assume runtime applied.
-                if sys.platform == "win32" and self.noders_proc.poll() is None:
-                    fallback_wait = 10
-                    self.log(f"log capture empty (Windows), waiting {fallback_wait}s for runtime...")
-                    time.sleep(fallback_wait)
-                    if self.noders_proc.poll() is not None:
-                        return False, f"NodeRS exited {self.noders_proc.returncode} before runtime applied"
-                    self.log("assuming runtime applied (time-based fallback)")
-                else:
-                    self._dump_logs(log_out)
-                    rc = self.noders_proc.poll()
-                    if rc is not None:
-                        return False, f"NodeRS exited {rc}: {log_out[-400:]}"
-                    return False, f"runtime not applied: {log_out[-300:]}"
+                self._dump_logs(log_out)
+                rc = self.noders_proc.poll()
+                if rc is not None:
+                    return False, f"NodeRS exited {rc}: {log_out[-400:]}"
+                return False, f"server did not start: {log_out[-300:]}"
 
             # 5. Extract server port
             server_port = self._extract_server_port(log_out)
@@ -556,6 +547,7 @@ class MihomoProtocolTester:
                     if mihomo_logs:
                         for line in mihomo_logs[-3000:].strip().split("\n"):
                             self.log(f"  [mihomo] {line}")
+                    return False, f"UDP: {udp_msg}"
 
             return True, f"TCP ok, UDP {udp_msg}"
 
