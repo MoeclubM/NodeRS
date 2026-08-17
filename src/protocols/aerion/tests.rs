@@ -161,7 +161,10 @@ fn rejects_mieru_server_config_with_xboard_tls_ws_or_multiplex() {
         ..Default::default()
     }];
 
-    let error = build_mieru_config(&remote, &users).expect_err("Mieru TLS/WS/multiplex must fail");
+    let error = match build_mieru_config(&remote, &users) {
+        Err(error) => error,
+        Ok(_) => panic!("Mieru TLS/WS/multiplex must fail"),
+    };
     let message = error.to_string();
     assert!(
         message.contains("Mieru does not support"),
@@ -226,9 +229,10 @@ async fn rejects_naive_server_config_without_email() {
         ..Default::default()
     }];
 
-    let error = build_naive_config(&remote, &users)
-        .await
-        .expect_err("Naive without email must fail");
+    let error = match build_naive_config(&remote, &users).await {
+        Err(error) => error,
+        Ok(_) => panic!("Naive without email must fail"),
+    };
     assert!(error.to_string().contains("missing email"));
 }
 
