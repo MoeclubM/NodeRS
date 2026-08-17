@@ -529,6 +529,8 @@ pub struct PanelUser {
     pub uuid: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub password: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub email: String,
     #[serde(
         default,
         alias = "alterId",

@@ -326,7 +326,7 @@ fn effective_ech_config(
             key: ech.key.trim().as_bytes().to_vec(),
         }));
     }
-    Ok(None)
+    anyhow::bail!("Xboard ECH is enabled but ech.key / ech.key_path is missing")
 }
 
 pub(crate) fn aerion_ech_keys(
@@ -426,9 +426,10 @@ fn decode_reality_short_ids(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    if !settings.short_id.trim().is_empty() || values.is_empty() {
+    if !settings.short_id.trim().is_empty() {
         values.insert(0, settings.short_id.as_str());
     }
+    ensure!(!values.is_empty(), "REALITY shortIds must not be empty");
 
     let mut short_ids = Vec::with_capacity(values.len());
     for value in values {

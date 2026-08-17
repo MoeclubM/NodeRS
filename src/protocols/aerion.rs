@@ -86,6 +86,23 @@ impl ServerController {
             .expect("Aerion traffic lock poisoned")
             .retain(|uid, _| active.contains(uid));
         *self.users.write().await = users.to_vec();
+
+        let remote = self.remote.read().await.clone();
+        let Some(remote) = remote else {
+            return Ok(());
+        };
+        let core_users = core_users(self.protocol, &remote, users)?;
+        let mut inner = self.inner.lock().await;
+        if users.is_empty() {
+            self.stop_locked(&mut inner).await;
+            self.core.replace_users(Vec::new())?;
+            return Ok(());
+        }
+        if inner.is_some() {
+            self.core.replace_users(core_users)?;
+            return Ok(());
+        }
+        drop(inner);
         self.restart().await
     }
 
@@ -297,6 +314,7 @@ fn build_mieru_config(
     remote: &NodeConfigResponse,
     users: &[PanelUser],
 ) -> anyhow::Result<BuiltServerConfig> {
+    ensure_mieru_plain(remote)?;
     let users = users
         .iter()
         .map(|user| {
@@ -375,6 +393,7 @@ async fn build_trojan_config(
         key: identity.key,
         transport,
         ech: aerion_ech_keys(&tls, false)?,
+        fallback: ::aerion::TrojanServerConfig::default_fallback(),
     }))
 }
 
@@ -519,6 +538,48 @@ fn ensure_aerion_supported(
 ) -> anyhow::Result<()> {
     ensure_no_routing(remote, protocol.as_str())?;
     ensure_no_fallbacks(remote, protocol.as_str())?;
+    if protocol == ProtocolKind::Mieru {
+        ensure_mieru_plain(remote)?;
+    }
+    Ok(())
+}
+
+fn ensure_mieru_plain(remote: &NodeConfigResponse) -> anyhow::Result<()> {
+    ensure!(
+        remote.tls_mode() == 0,
+        "Mieru does not support TLS/REALITY; disable tls on this node"
+    );
+    ensure!(
+        !remote.tls_settings.is_configured(),
+        "Mieru does not support tlsSettings"
+    );
+    ensure!(
+        !remote.reality_settings.is_configured(),
+        "Mieru does not support realitySettings"
+    );
+    if let Some(cert) = remote.cert_config.as_ref() {
+        ensure!(
+            cert.cert_mode.trim().is_empty()
+                || cert.cert_mode.eq_ignore_ascii_case("none")
+                || cert.cert_mode.eq_ignore_ascii_case("disable"),
+            "Mieru does not support cert_config"
+        );
+    }
+    let network = remote.network.trim().to_ascii_lowercase();
+    ensure!(
+        network.is_empty() || network == "tcp" || network == "udp" || network == "raw",
+        "Mieru does not support network {network}"
+    );
+    ensure!(
+        remote
+            .network_settings
+            .as_ref()
+            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
+        "Mieru does not support networkSettings"
+    );
+    if configured_value(remote.multiplex.as_ref()) {
+        bail!("Mieru does not support multiplex");
+    }
     Ok(())
 }
 
@@ -766,6 +827,9 @@ fn reality_config(
         private_key: reality.private_key,
         short_ids: reality.short_ids.clone(),
         alpn_protocols: transport.alpn_protocols(),
+        max_time_diff_secs: 0,
+        max_client_version: Some([0, 0, 0, 1]),
+        fallback_limit: ::aerion::RealityFallbackLimit::default(),
     })
 }
 
@@ -1001,7 +1065,7 @@ fn is_disabled(value: &str) -> bool {
 }
 
 fn vless_tls_enabled(remote: &NodeConfigResponse) -> bool {
-    remote.tls_mode() != 0 || remote.tls.is_none()
+    remote.tls_mode() != 0
 }
 
 fn normalize_ip(ip: String) -> String {

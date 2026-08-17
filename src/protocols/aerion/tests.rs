@@ -130,7 +130,7 @@ fn rejects_shadowsocks_tcp_multi_user_accounting_gap() {
 }
 
 #[test]
-fn builds_mieru_server_config_ignores_xboard_tls_and_cert() {
+fn rejects_mieru_server_config_with_xboard_tls_ws_or_multiplex() {
     let remote = NodeConfigResponse {
         listen_ip: "127.0.0.1".to_string(),
         server_port: 8964,
@@ -161,13 +161,12 @@ fn builds_mieru_server_config_ignores_xboard_tls_and_cert() {
         ..Default::default()
     }];
 
-    let BuiltServerConfig::Mieru(config) =
-        build_mieru_config(&remote, &users).expect("build Mieru config")
-    else {
-        panic!("expected Mieru config");
-    };
-    assert_eq!(config.listen, "[::]:8964".parse().unwrap());
-    assert_eq!(config.users[0].username, "mieru-secret");
+    let error = build_mieru_config(&remote, &users).expect_err("Mieru TLS/WS/multiplex must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("Mieru does not support"),
+        "unexpected error: {message}"
+    );
 }
 
 #[tokio::test]
@@ -184,13 +183,13 @@ async fn builds_naive_server_config() {
     let users = vec![
         PanelUser {
             id: 1001,
-            uuid: "alice".to_string(),
+            email: "alice@example.com".to_string(),
             password: "alice-pass".to_string(),
             ..Default::default()
         },
         PanelUser {
             id: 1002,
-            uuid: "bob".to_string(),
+            email: "bob@example.com".to_string(),
             password: "bob-pass".to_string(),
             ..Default::default()
         },
@@ -203,9 +202,9 @@ async fn builds_naive_server_config() {
         panic!("expected Naive config");
     };
     assert_eq!(config.listen, "[::]:8443".parse().unwrap());
-    assert_eq!(config.username, "alice");
+    assert_eq!(config.username, "alice@example.com");
     assert_eq!(config.password, "alice-pass");
-    assert_eq!(config.users, vec!["bob:bob-pass"]);
+    assert_eq!(config.users, vec!["bob@example.com:bob-pass"]);
     assert!(config.udp_over_tcp);
     assert!(config.tcp);
     assert!(config.quic);
@@ -213,7 +212,7 @@ async fn builds_naive_server_config() {
 }
 
 #[tokio::test]
-async fn builds_naive_server_config_from_uuid_only_user() {
+async fn rejects_naive_server_config_without_email() {
     let remote = NodeConfigResponse {
         listen_ip: "127.0.0.1".to_string(),
         server_port: 8443,
@@ -223,17 +222,14 @@ async fn builds_naive_server_config_from_uuid_only_user() {
     let users = vec![PanelUser {
         id: 1001,
         uuid: "uuid-secret".to_string(),
+        password: "secret".to_string(),
         ..Default::default()
     }];
 
-    let BuiltServerConfig::Naive(config) = build_naive_config(&remote, &users)
+    let error = build_naive_config(&remote, &users)
         .await
-        .expect("build Naive config")
-    else {
-        panic!("expected Naive config");
-    };
-    assert_eq!(config.username, "uuid-secret");
-    assert_eq!(config.password, "uuid-secret");
+        .expect_err("Naive without email must fail");
+    assert!(error.to_string().contains("missing email"));
 }
 
 #[tokio::test]

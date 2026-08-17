@@ -71,9 +71,8 @@ fn credentials_for_user(protocol: ProtocolKind, user: &PanelUser) -> anyhow::Res
             credentials.push(naive_credential(user)?);
         }
         ProtocolKind::Trojan => {
-            let credential = trojan_password(user).ok_or_else(|| {
-                anyhow::anyhow!("Trojan user {} is missing password/uuid", user.id)
-            })?;
+            let credential = trojan_password(user)
+                .ok_or_else(|| anyhow::anyhow!("Trojan user {} is missing uuid", user.id))?;
             credentials.push(credential.to_string());
         }
         ProtocolKind::Tuic => {
@@ -102,13 +101,8 @@ pub(super) fn split_primary(mut credentials: Vec<String>) -> anyhow::Result<(Str
 }
 
 fn trojan_password(user: &PanelUser) -> Option<&str> {
-    let password = user.password.trim();
-    if password.is_empty() {
-        let uuid = user.uuid.trim();
-        (!uuid.is_empty()).then_some(uuid)
-    } else {
-        Some(password)
-    }
+    let uuid = user.uuid.trim();
+    (!uuid.is_empty()).then_some(uuid)
 }
 
 pub(super) fn mieru_identity(user: &PanelUser) -> Option<&str> {
@@ -122,21 +116,16 @@ pub(super) fn mieru_identity(user: &PanelUser) -> Option<&str> {
 }
 
 fn naive_credential(user: &PanelUser) -> anyhow::Result<String> {
-    let username = user.uuid.trim();
-    let username = if username.is_empty() {
-        user.id.to_string()
-    } else {
-        username.to_string()
-    };
+    let username = user.email.trim();
+    ensure!(
+        !username.is_empty(),
+        "Naive user {} is missing email (Naive username cannot be inferred from uuid)",
+        user.id
+    );
     let password = user.password.trim();
-    let password = if password.is_empty() {
-        user.uuid.trim()
-    } else {
-        password
-    };
     ensure!(
         !password.is_empty(),
-        "Naive user {} is missing password/uuid",
+        "Naive user {} is missing password",
         user.id
     );
     Ok(format!("{username}:{password}"))

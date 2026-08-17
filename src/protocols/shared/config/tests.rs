@@ -187,7 +187,7 @@ fn reality_config_defaults_port_and_accepts_camel_case_fields() {
             "server_name": "reality.example.com",
             "publicKey": REALITY_KEY_B64,
             "privateKey": REALITY_KEY_B64,
-            "shortId": ""
+            "shortId": "a1b2"
         },
         "padding_scheme": [],
         "routes": [],
@@ -203,7 +203,7 @@ fn reality_config_defaults_port_and_accepts_camel_case_fields() {
         .expect("reality config")
         .expect("reality config present");
     assert_eq!(reality.server_port, 2443);
-    assert_eq!(reality.short_ids, vec![[0u8; 8]]);
+    assert_eq!(reality.short_ids, vec![[0xa1, 0xb2, 0, 0, 0, 0, 0, 0]]);
 }
 
 #[test]
