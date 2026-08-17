@@ -328,7 +328,7 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
     elif protocol == "trojan":
         proxy.update({
             "type": "trojan", "server": "127.0.0.1", "port": server_port,
-            "password": password, "sni": "node-test.local",
+            "password": uuid_val or DEFAULT_UUID, "sni": "node-test.local",
             "skip-cert-verify": True, "udp": True,
         })
     elif protocol == "tuic":
