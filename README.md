@@ -1,177 +1,151 @@
 # NodeRS
 
-NodeRS is a pure Rust Xboard machine-node runtime. Runtime protocol handling is backed by Aerion for AnyTLS, Hysteria2, Mieru, Naive, Shadowsocks, Trojan, TUIC, VLESS, and VMess.
+面向 [Xboard](https://github.com/cedar2025/Xboard) 的 Linux 机器节点。
 
-## Overview
+一条命令把服务器接到面板：节点、用户、监听端口和证书都从面板下发，本机只保留 API 地址、机器密钥和 `machine_id`。协议由 [Aerion](https://github.com/MoeclubM/Aerion) 提供，和 [XBClient](https://github.com/MoeclubM/XBClient) 共用同一套实现。
 
-- Linux only
-- Prebuilt release bundles are published for `linux-amd64`, `linux-amd64-musl`, `linux-arm64`, and `linux-arm64-musl`; GNU bundles target glibc 2.36 or newer, and install/upgrade scripts auto-detect `x86_64`/`aarch64` plus `glibc`/`musl`
-- Compatible with Xboard `/api/v2/server/*` and `/api/v2/server/machine/*`
-- One local process manages every node assigned to the same Xboard machine
-- Node membership, users, routes, listen address, port, and TLS are supplied by the panel
-- Device-limit and `speed_limit` control are supported by the active protocol runtime
+[![Release](https://img.shields.io/github/v/release/MoeclubM/NodeRS?style=flat-square)](https://github.com/MoeclubM/NodeRS/releases)
+[![License](https://img.shields.io/github/license/MoeclubM/NodeRS?style=flat-square)](LICENSE)
 
-## Runtime Model
+## 特性
 
-NodeRS currently runs in Xboard machine mode only.
+- **对接 Xboard 机器模式**：兼容 `/api/v2/server/*` 与 `/api/v2/server/machine/*`，节点增减、用户同步、流量与在线状态自动回报。
+- **一机一进程**：挂到同一台 Xboard 机器上的节点，都由同一个 NodeRS 进程管理。
+- **配置极简**：服务器上只需 `panel.api`、`panel.key`、`panel.machine_id`。
+- **证书跟面板走**：文件路径、内联 PEM、Let's Encrypt（HTTP-01 / DNS-01）或本机自签，都由 `cert_config` 决定。
+- **多用户与限速**：设备数限制、`speed_limit` 在协议运行时生效。
+- **现成 Linux 包**：`amd64` / `arm64`，GNU（glibc 2.36+）与 musl；安装脚本自动识别架构和 libc。
 
-- Local config contains only `panel.api`, `panel.key`, and `panel.machine_id`
-- `panel.key` must be the machine key for the target Xboard machine
-- Node membership comes from `/api/v2/server/machine/nodes`
-- Per-node config and users come from `/api/v2/server/config` and `/api/v2/server/user`
-- Traffic, alive state, and node status are reported through `/api/v2/server/report`
-- Host status is reported through `/api/v2/server/machine/status`
-- WebSocket sync uses the machine connection returned by `/api/v2/server/handshake`
+## 协议
 
-## TLS Delivery
+| 协议 | TCP | UDP | 说明 |
+| --- | :---: | :---: | --- |
+| AnyTLS | ✓ | UoT | 多路复用、padding |
+| Hysteria2 | ✓ | 原生 | Salamander、BBR |
+| Mieru | ✓ | 原生 / 流内 | TCP 与 UDP underlay |
+| Naive | ✓ | UoT | HTTP/1.1、H2、H3 |
+| Shadowsocks | ✓ | ✓ | AEAD / 2022 |
+| Trojan | ✓ | 流内 | WS / H2 / gRPC / XHTTP |
+| TUIC v5 | ✓ | 原生 / 流 | QUIC |
+| VLESS | ✓ | ✓ | TLS、REALITY、Vision |
+| VMess | ✓ | ✓ | AEAD |
 
-TLS is no longer read from the local config file.
+能力边界见 [Aerion 文档](https://github.com/MoeclubM/Aerion)。
 
-- AnyTLS, Hysteria2, Naive, Trojan, TUIC, VLESS, and VMess nodes receive TLS from Xboard `cert_config`
-- `listen_ip`, `server_port`, `server_name`, and `tls_settings` are taken from the panel response; `padding_scheme` is currently AnyTLS-specific
-- Supported `cert_config.cert_mode` values are `file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, and `dns`
-- File or path mode requires `cert_path` and `key_path`
-- Inline or PEM mode requires certificate PEM content and private key PEM content; the pushed certificate may be CA-issued or self-signed because NodeRS only validates that the PEM/key pair is usable
-- Xboard passes `cert_config` through as a JSON object; NodeRS accepts both `mode` and `cert_mode`, along with common aliases for certificate paths, inline PEM content, domains, and provider credentials
-- ACME mode supports multiple domains and uses `cert_config.domain`, `cert_config.domains`, or the panel `server_name` / `tls_settings.server_name`
-- `cert_mode = http` uses ACME HTTP-01; `cert_mode = dns` uses ACME DNS-01; `cert_mode = acme` / `letsencrypt` defaults to HTTP-01 unless a DNS challenge or DNS provider is supplied
-- DNS-01 currently supports Cloudflare and AliDNS provider APIs
-- If ACME mode does not deliver `cert_path` or `key_path`, NodeRS stores them under `acme/<domain>/fullchain.pem` and `acme/<domain>/privkey.pem` relative to the working directory; in the installed service this resolves under `/var/lib/noders/anytls`
-- Optional ACME fields are `email`, `directory_url` or `directory`, `challenge_listen` or `http01_listen`, `renew_before_days`, `account_key_path`, DNS propagation settings, and provider-specific credentials such as Cloudflare API tokens or AliDNS access keys
-- `cert_mode = none`, `self_signed`, or `self-signed` generates a local self-signed certificate automatically when the panel does not push a PEM or ACME configuration
-- Any other `cert_mode` fails explicitly during config sync
+## 快速开始
 
-## Support Matrix
-
-- Protocol-specific panel fields are validated and translated into Aerion server settings; unsupported configured fields fail explicitly instead of being ignored
-- Supported certificate modes: `cert_config.cert_mode = file`, `path`, `inline`, `pem`, `content`, `acme`, `letsencrypt`, `http`, or `dns`
-- Server-side ECH keys are passed to Aerion for supported TLS stream protocols; ECH is rejected where it conflicts with REALITY
-- `padding_scheme` is consumed by AnyTLS only; VLESS and Trojan ignore it because their wire formats do not use AnyTLS padding frames
-- Xboard routing/custom outbounds/custom routes/fallbacks are not currently exposed by Aerion-backed protocol runtimes; configured values fail explicitly instead of being ignored silently
-
-## Install
-
-### systemd
+在 Xboard 里创建机器，记下 **机器 ID** 和 **机器密钥**，把要跑的节点挂到这台机器上，并在面板里配好端口、协议和证书。然后在服务器执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
   --api https://api.example.com \
-  --key machine_key \
+  --key 机器密钥 \
   --machine-id 1
 ```
 
-### OpenRC
+没有 systemd、使用 OpenRC 的发行版：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install-openrc.sh | bash -s -- \
   --api https://api.example.com \
-  --key machine_key \
+  --key 机器密钥 \
   --machine-id 1
 ```
 
-### Multiple machine configs on one host
+一台机器对接多个面板时，重复 `--machine` 即可（不同 API 可以共用同一个 `machine_id`，本地实例名按 `api + machine_id` 区分）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
-  --machine https://secapi.example.com machine_key_a 10 \
-  --machine https://api.example.com machine_key_b 10
+  --machine https://secapi.example.com 密钥A 10 \
+  --machine https://api.example.com 密钥B 10
 ```
 
-Multiple APIs may reuse the same `machine_id` on one host. NodeRS derives a stable local instance suffix from `api + machine_id`, so config files and service names do not conflict.
-
-## Runtime Paths
-
-- Project name in documentation: `NodeRS`
-- Binary: `/usr/local/lib/noders/noders`
-- Manager command: `/usr/local/bin/noders`
-- Config root: `/etc/noders/anytls`
-- Machine config: `/etc/noders/anytls/machines/<machine_id>-<api_hash>.toml`
-- State: `/var/lib/noders/anytls`
-- systemd service: `noders-<machine_id>-<api_hash>`
-- OpenRC service: `noders-<machine_id>-<api_hash>`
-
-## Manager Script
-
-After installation, the `noders` command provides a small management entrypoint similar to V2bX-style helper scripts.
-
-- `noders` without arguments opens an interactive menu
-- `noders update` upgrades the installed binary
-- `noders uninstall --all` removes the whole installation
-- `noders start`, `noders stop`, and `noders restart` operate on all discovered NodeRS services by default
-- `noders log` shows logs for all discovered services by default
-- When multiple instances exist, you may pass a full service name, a `machine_id`, or an instance suffix to target one or more services
-
-Examples:
+安装完成后：
 
 ```bash
-noders
-noders update
-noders restart
-noders restart 1
+noders          # 交互菜单
+noders log -f   # 看日志，确认节点已监听
+```
+
+## 日常运维
+
+`noders` 默认作用于本机发现的全部实例；也可以传服务名、`machine_id` 或实例后缀，只操作其中一部分。
+
+```bash
+noders update              # 升级到最新 Release
+noders restart             # 重启全部
+noders restart 1           # 只重启 machine_id = 1
 noders log -f
 noders uninstall --machine-id 1
 noders uninstall --all
 ```
 
-## Common Operations
-
-### systemd
-
-```bash
-systemctl status noders-1-123456789 --no-pager -l
-journalctl -u noders-1-123456789 -n 100 --no-pager
-journalctl -u noders-1-123456789 -f
-systemctl restart noders-1-123456789
-systemctl stop noders-1-123456789
-systemctl enable noders-1-123456789
-```
-
-### OpenRC
-
-```bash
-rc-service noders-1-123456789 status
-rc-service noders-1-123456789 restart
-tail -n 100 /var/log/noders/noders-1-123456789.log
-tail -f /var/log/noders/noders-1-123456789.log
-```
-
-## Upgrade
+也可以直接升到指定版本（会保留机器配置、证书和 ACME 账号）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/upgrade.sh | bash -s --
 ```
 
-`upgrade.sh` preserves existing machine configs, certificates, ACME account files, and state. Hosts that still have the old `noders-anytls` binary or plain `noders-<machine_id>` config names are migrated in place to the current `noders-<machine_id>-<api_hash>` instance layout before the binary is replaced.
+### 路径
 
-## Uninstall
+| 项目 | 路径 |
+| --- | --- |
+| 程序 | `/usr/local/lib/noders/noders` |
+| 管理命令 | `/usr/local/bin/noders` |
+| 机器配置 | `/etc/noders/anytls/machines/<machine_id>-<api_hash>.toml` |
+| 运行数据 | `/var/lib/noders/anytls` |
+| 服务名 | `noders-<machine_id>-<api_hash>` |
 
-### Remove one machine instance
+### systemd / OpenRC
 
 ```bash
+systemctl status noders-1-123456789 --no-pager -l
+journalctl -u noders-1-123456789 -f
+systemctl restart noders-1-123456789
+```
+
+```bash
+rc-service noders-1-123456789 status
+rc-service noders-1-123456789 restart
+tail -f /var/log/noders/noders-1-123456789.log
+```
+
+## 证书
+
+证书不再写在本地 toml 里，全部来自面板 `cert_config`：
+
+| `cert_mode` | 行为 |
+| --- | --- |
+| `file` / `path` | 使用面板给出的证书和私钥路径 |
+| `inline` / `pem` / `content` | 使用面板下发的 PEM |
+| `http` / `acme` / `letsencrypt` | Let's Encrypt HTTP-01 |
+| `dns` | Let's Encrypt DNS-01（Cloudflare、AliDNS） |
+| `none` / `self_signed` | 本机生成自签证书 |
+
+ACME 证书默认落在工作目录的 `acme/<域名>/` 下；安装后的服务工作目录是 `/var/lib/noders/anytls`。
+
+## 卸载
+
+```bash
+# 按 machine_id 删除该机器在本机的全部实例
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
   --uninstall \
   --machine-id 1
-```
 
-This removes every local instance whose `machine_id` is `1`. To remove one exact instance when multiple APIs share the same `machine_id`, pass the original `--machine <url> <key> <id>` triplet together with `--uninstall`.
-
-### Remove everything
-
-```bash
+# 清空本机 NodeRS
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
   --uninstall \
   --all
 ```
 
-## Local Run
+多个 API 共用同一个 `machine_id` 时，带上原来的 `--machine <url> <key> <id>` 只删那一个实例。
 
-```bash
-cp config.example.toml config.toml
-cargo run --offline -- config.toml
-```
+## 相关项目
 
-Required fields:
+- [Aerion](https://github.com/MoeclubM/Aerion) — 协议与 TUN 核心
+- [XBClient](https://github.com/MoeclubM/XBClient) — Xboard 用户端（Android / Windows / Linux）
+- [Xboard](https://github.com/cedar2025/Xboard) — 面板
 
-- `panel.api`
-- `panel.key`
-- `panel.machine_id`
+## 许可
+
+MIT。详见 [LICENSE](LICENSE)。
