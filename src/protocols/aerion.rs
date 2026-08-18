@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod runner;
 mod shadowsocks;
@@ -69,7 +69,7 @@ impl ServerController {
     }
 
     pub async fn apply_remote_config(&self, remote: &NodeConfigResponse) -> anyhow::Result<()> {
-        ensure_aerion_supported(self.protocol, remote)?;
+        ignore_unmapped_routing_and_fallbacks(self.protocol.as_str(), remote);
         *self.remote.write().await = Some(remote.clone());
         self.restart().await
     }
@@ -244,10 +244,7 @@ async fn build_anytls_config(
         tls.reality.is_none(),
         "REALITY settings are not valid for AnyTLS nodes"
     );
-    ensure!(
-        tls.alpn.is_empty(),
-        "Aerion AnyTLS server does not expose server ALPN configuration"
-    );
+    ignore_unsupported_field("anytls", "alpn", !tls.alpn.is_empty());
     let identity = aerion_tls_identity(&tls, "AnyTLS").await?;
     Ok(BuiltServerConfig::Anytls(::aerion::ServerConfig {
         listen: listen_addr(remote)?,
@@ -314,7 +311,7 @@ fn build_mieru_config(
     remote: &NodeConfigResponse,
     users: &[PanelUser],
 ) -> anyhow::Result<BuiltServerConfig> {
-    ensure_mieru_plain(remote)?;
+    ignore_mieru_unused_fields(remote);
     let users = users
         .iter()
         .map(|user| {
@@ -331,7 +328,7 @@ fn build_mieru_config(
         users,
         mtu: 0,
         user_hint_mandatory: false,
-        transport: mieru_transport(remote.transport.as_ref())?,
+        transport: mieru_underlay(remote),
         traffic_pattern: mieru_traffic_pattern(remote)?,
     }))
 }
@@ -532,119 +529,82 @@ async fn build_vmess_config(
     }))
 }
 
-fn ensure_aerion_supported(
-    protocol: ProtocolKind,
-    remote: &NodeConfigResponse,
-) -> anyhow::Result<()> {
-    ensure_no_routing(remote, protocol.as_str())?;
-    ensure_no_fallbacks(remote, protocol.as_str())?;
-    if protocol == ProtocolKind::Mieru {
-        ensure_mieru_plain(remote)?;
-    }
-    Ok(())
+fn ignore_mieru_unused_fields(remote: &NodeConfigResponse) {
+    const PROTOCOL: &str = "mieru";
+    ignore_unsupported_field(PROTOCOL, "tls", remote.tls_mode() != 0);
+    ignore_unsupported_field(
+        PROTOCOL,
+        "tlsSettings",
+        remote.tls_settings.is_configured() || remote.tls_settings.has_reality_key_material(),
+    );
+    ignore_unsupported_field(
+        PROTOCOL,
+        "realitySettings",
+        remote.reality_settings.is_configured(),
+    );
+    ignore_unsupported_field(PROTOCOL, "cert_config", remote.cert_config.is_some());
+    ignore_unsupported_field(
+        PROTOCOL,
+        "networkSettings",
+        configured_value(remote.network_settings.as_ref()),
+    );
+    ignore_unsupported_field(
+        PROTOCOL,
+        "multiplex",
+        configured_value(remote.multiplex.as_ref()),
+    );
 }
 
-fn ensure_mieru_plain(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    ensure!(
-        remote.tls_mode() == 0,
-        "Mieru does not support TLS/REALITY; disable tls on this node"
+fn ignore_unmapped_routing_and_fallbacks(protocol: &str, remote: &NodeConfigResponse) {
+    ignore_unsupported_field(
+        protocol,
+        "routes",
+        !remote.routes.is_empty()
+            || !remote.custom_outbounds.is_empty()
+            || !remote.custom_routes.is_empty(),
     );
-    ensure!(
-        !remote.tls_settings.is_configured(),
-        "Mieru does not support tlsSettings"
+    ignore_unsupported_field(
+        protocol,
+        "fallback",
+        configured_value(remote.fallback.as_ref())
+            || configured_value(remote.fallbacks.as_ref())
+            || configured_value(remote.fallback_for_alpn.as_ref()),
     );
-    ensure!(
-        !remote.reality_settings.is_configured(),
-        "Mieru does not support realitySettings"
-    );
-    if let Some(cert) = remote.cert_config.as_ref() {
-        ensure!(
-            cert.cert_mode.trim().is_empty()
-                || cert.cert_mode.eq_ignore_ascii_case("none")
-                || cert.cert_mode.eq_ignore_ascii_case("disable"),
-            "Mieru does not support cert_config"
-        );
-    }
-    let network = remote.network.trim().to_ascii_lowercase();
-    ensure!(
-        network.is_empty() || network == "tcp" || network == "udp" || network == "raw",
-        "Mieru does not support network {network}"
-    );
-    ensure!(
-        remote
-            .network_settings
-            .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Mieru does not support networkSettings"
-    );
-    if configured_value(remote.multiplex.as_ref()) {
-        bail!("Mieru does not support multiplex");
-    }
-    Ok(())
-}
-
-fn ensure_no_routing(remote: &NodeConfigResponse, protocol: &str) -> anyhow::Result<()> {
-    if !remote.routes.is_empty()
-        || !remote.custom_outbounds.is_empty()
-        || !remote.custom_routes.is_empty()
-    {
-        bail!(
-            "Aerion {protocol} server does not support Xboard routing/custom outbounds/custom routes yet"
-        );
-    }
-    Ok(())
-}
-
-fn ensure_no_fallbacks(remote: &NodeConfigResponse, protocol: &str) -> anyhow::Result<()> {
-    if configured_value(remote.fallback.as_ref())
-        || configured_value(remote.fallbacks.as_ref())
-        || configured_value(remote.fallback_for_alpn.as_ref())
-    {
-        bail!("Aerion {protocol} server does not support Xboard fallback configuration yet");
-    }
-    Ok(())
 }
 
 fn require_tcp_network(remote: &NodeConfigResponse, protocol: &str) -> anyhow::Result<()> {
     let network = remote.network.trim().to_ascii_lowercase();
-    ensure!(
-        network.is_empty() || network == "tcp" || network == "raw",
-        "Xboard network must be tcp/raw for {protocol} nodes"
+    ignore_unsupported_field(
+        protocol,
+        "network",
+        !network.is_empty() && network != "tcp" && network != "raw",
     );
-    ensure!(
-        remote
-            .network_settings
-            .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Xboard networkSettings is not supported by Aerion {protocol} server"
+    ignore_unsupported_field(
+        protocol,
+        "networkSettings",
+        configured_value(remote.network_settings.as_ref()),
     );
-    ensure!(
-        remote
-            .transport
-            .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Xboard transport extension is not supported by Aerion {protocol} server"
+    ignore_unsupported_field(
+        protocol,
+        "transport",
+        configured_value(remote.transport.as_ref()),
     );
     Ok(())
 }
 
 fn validate_hysteria2_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     let network = remote.network.trim().to_ascii_lowercase();
-    ensure!(
-        network.is_empty() || matches!(network.as_str(), "udp" | "quic" | "hysteria2" | "hy2"),
-        "HY2 network must be empty, udp, quic, hysteria2 or hy2"
+    ignore_unsupported_field(
+        "hysteria2",
+        "network",
+        !network.is_empty() && !matches!(network.as_str(), "udp" | "quic" | "hysteria2" | "hy2"),
     );
-    ensure!(
-        !remote.udp_over_stream,
-        "HY2 udp_over_stream is not supported by Aerion server"
-    );
-    ensure!(
-        !remote.multiplex_enabled(),
-        "HY2 multiplex is not a server-side setting"
-    );
-    ensure!(
-        !configured_value(remote.masquerade.as_ref()),
-        "Aerion HY2 server does not support masquerade configuration yet"
+    ignore_unsupported_field("hysteria2", "udp_over_stream", remote.udp_over_stream);
+    ignore_unsupported_field("hysteria2", "multiplex", remote.multiplex_enabled());
+    ignore_unsupported_field(
+        "hysteria2",
+        "masquerade",
+        configured_value(remote.masquerade.as_ref()),
     );
     if let Some(version) = &remote.version {
         let version = value_to_u64(version).context("parse HY2 version")?;
@@ -663,20 +623,12 @@ fn validate_naive_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             ),
         "Naive network must be empty, tcp/raw/http/https/h2 or quic/h3/http3"
     );
-    ensure!(
-        !remote.multiplex_enabled(),
-        "Naive multiplex is not a server-side setting"
-    );
-    ensure!(
-        !remote.udp_over_stream,
-        "Naive uses native UDP-over-TCP and does not support Xboard udp_over_stream"
-    );
-    ensure!(
-        remote
-            .network_settings
-            .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Xboard networkSettings is not supported by Aerion Naive server"
+    ignore_unsupported_field("naive", "multiplex", remote.multiplex_enabled());
+    ignore_unsupported_field("naive", "udp_over_stream", remote.udp_over_stream);
+    ignore_unsupported_field(
+        "naive",
+        "networkSettings",
+        configured_value(remote.network_settings.as_ref()),
     );
     Ok(())
 }
@@ -686,31 +638,24 @@ fn validate_trojan_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
         !matches!(remote.tls_mode(), 2),
         "Aerion Trojan server does not support REALITY TLS mode"
     );
-    ensure!(
-        !remote.reality_settings.is_configured() && !remote.tls_settings.has_reality_key_material(),
-        "REALITY settings are not supported for Trojan nodes"
+    ignore_unsupported_field(
+        "trojan",
+        "realitySettings",
+        remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material(),
     );
     Ok(())
 }
 
 fn validate_tuic_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
     let network = remote.network.trim().to_ascii_lowercase();
-    ensure!(
-        network.is_empty() || matches!(network.as_str(), "udp" | "quic" | "tuic"),
-        "TUIC network must be empty, udp, quic or tuic"
+    ignore_unsupported_field(
+        "tuic",
+        "network",
+        !network.is_empty() && !matches!(network.as_str(), "udp" | "quic" | "tuic"),
     );
-    ensure!(
-        !remote.udp_over_stream,
-        "TUIC udp_over_stream is not supported by Aerion server"
-    );
-    ensure!(
-        !remote.multiplex_enabled(),
-        "TUIC multiplex is not a server-side setting"
-    );
-    ensure!(
-        !remote.zero_rtt_handshake,
-        "Aerion TUIC server does not expose 0-RTT handshakes"
-    );
+    ignore_unsupported_field("tuic", "udp_over_stream", remote.udp_over_stream);
+    ignore_unsupported_field("tuic", "multiplex", remote.multiplex_enabled());
+    ignore_unsupported_field("tuic", "zero_rtt_handshake", remote.zero_rtt_handshake);
     Ok(())
 }
 
@@ -721,9 +666,11 @@ fn validate_vless_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             remote.tls_mode()
         );
     }
-    if remote.tls_mode() == 0 && remote.tls_settings.is_configured() {
-        bail!("Xboard tls_settings requires tls mode 1 or 2 for VLESS nodes");
-    }
+    ignore_unsupported_field(
+        "vless",
+        "tlsSettings",
+        remote.tls_mode() == 0 && remote.tls_settings.is_configured(),
+    );
     let packet_encoding = remote.packet_encoding.trim();
     ensure!(
         packet_encoding.is_empty()
@@ -731,9 +678,11 @@ fn validate_vless_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
             || packet_encoding.eq_ignore_ascii_case("xudp"),
         "unsupported VLESS packet_encoding {packet_encoding}"
     );
-    if !remote.decryption.trim().is_empty() && !remote.decryption.eq_ignore_ascii_case("none") {
-        bail!("Xboard decryption is not supported for VLESS nodes");
-    }
+    ignore_unsupported_field(
+        "vless",
+        "decryption",
+        !remote.decryption.trim().is_empty() && !remote.decryption.eq_ignore_ascii_case("none"),
+    );
     Ok(())
 }
 
@@ -744,19 +693,21 @@ fn validate_vmess_remote(remote: &NodeConfigResponse, users: &[PanelUser]) -> an
             remote.tls_mode()
         );
     }
-    if remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material() {
-        bail!("REALITY settings are not supported for VMess nodes");
-    }
-    if remote.tls_mode() == 0 && remote.tls_settings.is_configured() {
-        bail!("Xboard tls_settings requires tls mode 1 for VMess nodes");
-    }
-    for user in users {
-        ensure!(
-            user.alter_id <= 0,
-            "VMess alterId > 0 is not supported for user {}",
-            user.id
-        );
-    }
+    ignore_unsupported_field(
+        "vmess",
+        "realitySettings",
+        remote.reality_settings.is_configured() || remote.tls_settings.has_reality_key_material(),
+    );
+    ignore_unsupported_field(
+        "vmess",
+        "tlsSettings",
+        remote.tls_mode() == 0 && remote.tls_settings.is_configured(),
+    );
+    ignore_unsupported_field(
+        "vmess",
+        "alterId",
+        users.iter().any(|user| user.alter_id > 0),
+    );
     Ok(())
 }
 
@@ -1003,19 +954,45 @@ fn hysteria2_cc_rx(value: Option<&Value>, ignore_client_bandwidth: bool) -> anyh
     Ok(value_to_u64(value)?.saturating_mul(125_000).to_string())
 }
 
-fn mieru_transport(value: Option<&Value>) -> anyhow::Result<::aerion::MieruTransport> {
+fn mieru_underlay(remote: &NodeConfigResponse) -> ::aerion::MieruTransport {
+    match parse_mieru_transport_value(remote.transport.as_ref()) {
+        MieruTransportParse::Tcp => return ::aerion::MieruTransport::Tcp,
+        MieruTransportParse::Udp => return ::aerion::MieruTransport::Udp,
+        MieruTransportParse::Absent => {}
+        MieruTransportParse::Unsupported => {
+            ignore_unsupported_field("mieru", "transport", true);
+        }
+    }
+    match remote.network.trim().to_ascii_lowercase().as_str() {
+        "" | "tcp" | "raw" => ::aerion::MieruTransport::Tcp,
+        "udp" => ::aerion::MieruTransport::Udp,
+        _ => {
+            ignore_unsupported_field("mieru", "network", true);
+            ::aerion::MieruTransport::Tcp
+        }
+    }
+}
+
+enum MieruTransportParse {
+    Absent,
+    Tcp,
+    Udp,
+    Unsupported,
+}
+
+fn parse_mieru_transport_value(value: Option<&Value>) -> MieruTransportParse {
     if value.is_some_and(|value| !crate::panel::json_value_is_enabled(value)) {
-        return Ok(::aerion::MieruTransport::Tcp);
+        return MieruTransportParse::Absent;
     }
     match value {
-        None | Some(Value::Null) => Ok(::aerion::MieruTransport::Tcp),
+        None | Some(Value::Null) => MieruTransportParse::Absent,
         Some(Value::String(text))
             if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("tcp") =>
         {
-            Ok(::aerion::MieruTransport::Tcp)
+            MieruTransportParse::Tcp
         }
         Some(Value::String(text)) if text.trim().eq_ignore_ascii_case("udp") => {
-            Ok(::aerion::MieruTransport::Udp)
+            MieruTransportParse::Udp
         }
         Some(Value::Object(object)) => match object
             .get("type")
@@ -1025,11 +1002,11 @@ fn mieru_transport(value: Option<&Value>) -> anyhow::Result<::aerion::MieruTrans
             .to_ascii_lowercase()
             .as_str()
         {
-            "" | "tcp" => Ok(::aerion::MieruTransport::Tcp),
-            "udp" => Ok(::aerion::MieruTransport::Udp),
-            other => bail!("unsupported Mieru transport {other}"),
+            "" | "tcp" => MieruTransportParse::Tcp,
+            "udp" => MieruTransportParse::Udp,
+            _ => MieruTransportParse::Unsupported,
         },
-        _ => bail!("unsupported Mieru transport"),
+        Some(_) => MieruTransportParse::Unsupported,
     }
 }
 
@@ -1050,6 +1027,12 @@ fn value_to_u64(value: &Value) -> anyhow::Result<u64> {
             .context("value must be a non-negative integer"),
         Value::String(text) => text.trim().parse::<u64>().context("parse decimal integer"),
         _ => bail!("value must be a number or decimal string"),
+    }
+}
+
+pub(super) fn ignore_unsupported_field(protocol: &str, field: &str, configured: bool) {
+    if configured {
+        warn!(protocol, field, "ignoring unsupported panel field");
     }
 }
 

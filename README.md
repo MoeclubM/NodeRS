@@ -15,6 +15,7 @@
 - **证书跟面板走**：文件路径、内联 PEM、Let's Encrypt（HTTP-01 / DNS-01）或本机自签，都由 `cert_config` 决定。
 - **多用户与限速**：设备数限制、`speed_limit` 在协议运行时生效。
 - **现成 Linux 包**：`amd64` / `arm64`，GNU（glibc 2.36+）与 musl；安装脚本自动识别架构和 libc。
+- **面板多余字段不挡启动**：协议用不到的 Xboard 字段会打告警后忽略，缺密码、错误的 cipher 这类真正用到的项仍会失败。
 
 ## 协议
 

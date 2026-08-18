@@ -29,6 +29,51 @@ fn builds_mieru_server_config() {
 }
 
 #[test]
+fn builds_mieru_udp_underlay_from_network() {
+    let remote = NodeConfigResponse {
+        listen_ip: "127.0.0.1".to_string(),
+        server_port: 8964,
+        network: "udp".to_string(),
+        ..Default::default()
+    };
+    let users = vec![PanelUser {
+        id: 1001,
+        uuid: "mieru-secret".to_string(),
+        ..Default::default()
+    }];
+
+    let BuiltServerConfig::Mieru(config) =
+        build_mieru_config(&remote, &users).expect("build Mieru UDP config")
+    else {
+        panic!("expected Mieru config");
+    };
+    assert_eq!(config.transport, ::aerion::MieruTransport::Udp);
+}
+
+#[test]
+fn builds_mieru_udp_underlay_from_transport_field() {
+    let remote = NodeConfigResponse {
+        listen_ip: "127.0.0.1".to_string(),
+        server_port: 8964,
+        network: "tcp".to_string(),
+        transport: Some(json!("udp")),
+        ..Default::default()
+    };
+    let users = vec![PanelUser {
+        id: 1001,
+        uuid: "mieru-secret".to_string(),
+        ..Default::default()
+    }];
+
+    let BuiltServerConfig::Mieru(config) =
+        build_mieru_config(&remote, &users).expect("build Mieru UDP config")
+    else {
+        panic!("expected Mieru config");
+    };
+    assert_eq!(config.transport, ::aerion::MieruTransport::Udp);
+}
+
+#[test]
 fn builds_shadowsocks_legacy_server_config() {
     let remote = NodeConfigResponse {
         listen_ip: "127.0.0.1".to_string(),
@@ -53,6 +98,37 @@ fn builds_shadowsocks_legacy_server_config() {
     assert!(config.users.is_empty());
     assert!(config.tcp);
     assert!(!config.udp);
+}
+
+#[test]
+fn builds_shadowsocks_server_config_ignoring_tls_fields() {
+    let remote = NodeConfigResponse {
+        listen_ip: "127.0.0.1".to_string(),
+        server_port: 8388,
+        cipher: "aead_aes_128_gcm".to_string(),
+        tls: Some(json!(1)),
+        cert_config: Some(crate::panel::CertConfig {
+            cert_mode: "acme".to_string(),
+            domain: "ss.example.com".to_string(),
+            ..Default::default()
+        }),
+        plugin: "obfs-local".to_string(),
+        multiplex: Some(json!({ "enabled": true })),
+        ..Default::default()
+    };
+    let users = vec![PanelUser {
+        id: 1001,
+        password: "ss-secret".to_string(),
+        ..Default::default()
+    }];
+
+    let BuiltServerConfig::Shadowsocks(config) =
+        shadowsocks::build_config(&remote, &users).expect("build Shadowsocks config")
+    else {
+        panic!("expected Shadowsocks config");
+    };
+    assert_eq!(config.method, "aes-128-gcm");
+    assert_eq!(config.password, "ss-secret");
 }
 
 #[test]
@@ -130,7 +206,7 @@ fn rejects_shadowsocks_tcp_multi_user_accounting_gap() {
 }
 
 #[test]
-fn rejects_mieru_server_config_with_xboard_tls_ws_or_multiplex() {
+fn builds_mieru_server_config_ignoring_xboard_tls_ws_or_multiplex() {
     let remote = NodeConfigResponse {
         listen_ip: "127.0.0.1".to_string(),
         server_port: 8964,
@@ -161,15 +237,25 @@ fn rejects_mieru_server_config_with_xboard_tls_ws_or_multiplex() {
         ..Default::default()
     }];
 
-    let error = match build_mieru_config(&remote, &users) {
-        Err(error) => error,
-        Ok(_) => panic!("Mieru TLS/WS/multiplex must fail"),
+    let BuiltServerConfig::Mieru(config) =
+        build_mieru_config(&remote, &users).expect("build Mieru config")
+    else {
+        panic!("expected Mieru config");
     };
-    let message = error.to_string();
-    assert!(
-        message.contains("Mieru does not support"),
-        "unexpected error: {message}"
-    );
+    assert_eq!(config.listen, "[::]:8964".parse().unwrap());
+    assert_eq!(config.users.len(), 1);
+    assert_eq!(config.transport, ::aerion::MieruTransport::Tcp);
+}
+
+#[test]
+fn ignores_xboard_routing_and_fallback_fields() {
+    let remote = NodeConfigResponse {
+        custom_outbounds: vec![json!({ "tag": "ignored" })],
+        fallback: Some(json!({ "dest": "127.0.0.1:80" })),
+        ..Default::default()
+    };
+
+    ignore_unmapped_routing_and_fallbacks(ProtocolKind::Mieru.as_str(), &remote);
 }
 
 #[tokio::test]
@@ -316,12 +402,11 @@ fn transport_uses_top_level_host() {
 }
 
 #[test]
-fn tuic_rejects_unimplemented_zero_rtt() {
+fn tuic_ignores_unimplemented_zero_rtt() {
     let remote = NodeConfigResponse {
         zero_rtt_handshake: true,
         ..Default::default()
     };
 
-    let error = validate_tuic_remote(&remote).expect_err("reject TUIC 0-RTT");
-    assert!(error.to_string().contains("0-RTT"));
+    validate_tuic_remote(&remote).expect("ignore TUIC 0-RTT");
 }

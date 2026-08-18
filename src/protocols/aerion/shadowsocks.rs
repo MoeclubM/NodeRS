@@ -4,7 +4,7 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::panel::{NodeConfigResponse, PanelUser};
 
-use super::{BuiltServerConfig, is_disabled, listen_addr};
+use super::{BuiltServerConfig, ignore_unsupported_field, is_disabled, listen_addr};
 
 #[derive(Clone, Copy)]
 enum ShadowsocksCipher {
@@ -84,35 +84,37 @@ pub(super) fn core_users(
 }
 
 fn validate_remote(remote: &NodeConfigResponse) -> anyhow::Result<()> {
-    if remote.tls.is_some()
-        || remote.tls_settings.is_configured()
-        || remote.tls_settings.has_reality_key_material()
-        || remote.reality_settings.is_configured()
-        || remote.cert_config.is_some()
-    {
-        bail!("Xboard tls/reality settings are not supported for Shadowsocks nodes");
-    }
-    ensure!(
+    const PROTOCOL: &str = "shadowsocks";
+    ignore_unsupported_field(
+        PROTOCOL,
+        "tls",
+        remote.tls_mode() != 0
+            || remote.tls_settings.is_configured()
+            || remote.tls_settings.has_reality_key_material()
+            || remote.reality_settings.is_configured()
+            || remote.cert_config.is_some(),
+    );
+    ignore_unsupported_field(
+        PROTOCOL,
+        "networkSettings",
         remote
             .network_settings
             .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Xboard networkSettings is not supported by Aerion Shadowsocks server"
+            .is_some_and(crate::panel::json_value_is_enabled),
     );
-    ensure!(
-        remote.plugin.trim().is_empty() && remote.plugin_opts.trim().is_empty(),
-        "Aerion Shadowsocks server does not support SIP003 plugin configuration"
+    ignore_unsupported_field(
+        PROTOCOL,
+        "plugin",
+        !remote.plugin.trim().is_empty() || !remote.plugin_opts.trim().is_empty(),
     );
-    ensure!(
-        !remote.multiplex_enabled(),
-        "Aerion Shadowsocks server does not support sing-mux multiplex"
-    );
-    ensure!(
+    ignore_unsupported_field(PROTOCOL, "multiplex", remote.multiplex_enabled());
+    ignore_unsupported_field(
+        PROTOCOL,
+        "transport",
         remote
             .transport
             .as_ref()
-            .is_none_or(|value| !crate::panel::json_value_is_enabled(value)),
-        "Aerion Shadowsocks server does not support Xboard transport extension"
+            .is_some_and(crate::panel::json_value_is_enabled),
     );
     Ok(())
 }
