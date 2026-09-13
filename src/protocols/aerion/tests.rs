@@ -410,3 +410,103 @@ fn tuic_ignores_unimplemented_zero_rtt() {
 
     validate_tuic_remote(&remote).expect("ignore TUIC 0-RTT");
 }
+
+#[test]
+fn protocol_requires_listener_user_reload_identifies_static_listeners() {
+    assert!(protocol_requires_listener_user_reload(ProtocolKind::Mieru));
+    assert!(protocol_requires_listener_user_reload(ProtocolKind::Naive));
+    assert!(protocol_requires_listener_user_reload(ProtocolKind::Shadowsocks));
+    assert!(protocol_requires_listener_user_reload(ProtocolKind::Tuic));
+    assert!(protocol_requires_listener_user_reload(ProtocolKind::Vmess));
+
+    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Anytls));
+    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Hysteria2));
+    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Trojan));
+    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Vless));
+}
+
+#[test]
+fn credentials_changed_detects_user_modifications() {
+    let remote = NodeConfigResponse {
+        network: "tcp".to_string(),
+        ..Default::default()
+    };
+    let base_users = vec![
+        PanelUser {
+            id: 1,
+            uuid: "uuid-1".to_string(),
+            speed_limit: 100,
+            device_limit: 2,
+            ..Default::default()
+        },
+        PanelUser {
+            id: 2,
+            uuid: "uuid-2".to_string(),
+            speed_limit: 200,
+            device_limit: 1,
+            ..Default::default()
+        },
+    ];
+
+    // Same users, same order -> false
+    assert!(!credentials_changed(
+        ProtocolKind::Mieru,
+        &remote,
+        &base_users,
+        &base_users
+    ));
+
+    // Same users, swapped order -> false
+    let reversed_users = vec![base_users[1].clone(), base_users[0].clone()];
+    assert!(!credentials_changed(
+        ProtocolKind::Mieru,
+        &remote,
+        &base_users,
+        &reversed_users
+    ));
+
+    // Only speed limit or device limit changed -> false
+    let mut limits_changed = base_users.clone();
+    limits_changed[0].speed_limit = 500;
+    limits_changed[1].device_limit = 5;
+    assert!(!credentials_changed(
+        ProtocolKind::Mieru,
+        &remote,
+        &base_users,
+        &limits_changed
+    ));
+
+    // User added -> true
+    let mut user_added = base_users.clone();
+    user_added.push(PanelUser {
+        id: 3,
+        uuid: "uuid-3".to_string(),
+        ..Default::default()
+    });
+    assert!(credentials_changed(
+        ProtocolKind::Mieru,
+        &remote,
+        &base_users,
+        &user_added
+    ));
+
+    // User removed -> true
+    let user_removed = vec![base_users[0].clone()];
+    assert!(credentials_changed(
+        ProtocolKind::Mieru,
+        &remote,
+        &base_users,
+        &user_removed
+    ));
+
+    // User credential changed -> true
+    let mut credential_changed = base_users.clone();
+    credential_changed[0].uuid = "new-uuid-1".to_string();
+    assert!(credentials_changed(
+        ProtocolKind::Mieru,
+        &remote,
+        &base_users,
+        &credential_changed
+    ));
+}
+

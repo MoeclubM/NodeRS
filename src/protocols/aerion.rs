@@ -85,7 +85,12 @@ impl ServerController {
             .lock()
             .expect("Aerion traffic lock poisoned")
             .retain(|uid, _| active.contains(uid));
-        *self.users.write().await = users.to_vec();
+        let previous_users = {
+            let mut guard = self.users.write().await;
+            let previous = guard.clone();
+            *guard = users.to_vec();
+            previous
+        };
 
         let remote = self.remote.read().await.clone();
         let Some(remote) = remote else {
@@ -99,6 +104,16 @@ impl ServerController {
             return Ok(());
         }
         if inner.is_some() {
+            if protocol_requires_listener_user_reload(self.protocol)
+                && credentials_changed(self.protocol, &remote, &previous_users, users)
+            {
+                info!(
+                    protocol = self.protocol.as_str(),
+                    "user credentials changed for protocol requiring listener restart; restarting runtime"
+                );
+                drop(inner);
+                return self.restart().await;
+            }
             self.core.replace_users(core_users)?;
             return Ok(());
         }
@@ -1053,6 +1068,47 @@ fn vless_tls_enabled(remote: &NodeConfigResponse) -> bool {
 
 fn normalize_ip(ip: String) -> String {
     ip.trim_start_matches("::ffff:").to_string()
+}
+
+pub(super) fn protocol_requires_listener_user_reload(protocol: ProtocolKind) -> bool {
+    matches!(
+        protocol,
+        ProtocolKind::Mieru
+            | ProtocolKind::Naive
+            | ProtocolKind::Shadowsocks
+            | ProtocolKind::Tuic
+            | ProtocolKind::Vmess
+    )
+}
+
+pub(super) fn credentials_changed(
+    protocol: ProtocolKind,
+    remote: &NodeConfigResponse,
+    previous_users: &[PanelUser],
+    current_users: &[PanelUser],
+) -> bool {
+    let old_creds = match core_users(protocol, remote, previous_users) {
+        Ok(users) => users,
+        Err(_) => return true,
+    };
+    let new_creds = match core_users(protocol, remote, current_users) {
+        Ok(users) => users,
+        Err(_) => return true,
+    };
+    if old_creds.len() != new_creds.len() {
+        return true;
+    }
+    let mut old_pairs: Vec<(&str, &str)> = old_creds
+        .iter()
+        .map(|u| (u.id.as_str(), u.credential.as_str()))
+        .collect();
+    let mut new_pairs: Vec<(&str, &str)> = new_creds
+        .iter()
+        .map(|u| (u.id.as_str(), u.credential.as_str()))
+        .collect();
+    old_pairs.sort_unstable();
+    new_pairs.sort_unstable();
+    old_pairs != new_pairs
 }
 
 #[cfg(test)]
