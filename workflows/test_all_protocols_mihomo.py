@@ -38,7 +38,7 @@ PANEL_TOKEN = "test-token-noders-e2e"
 
 PROTOCOLS = [
     "shadowsocks", "hysteria2", "mieru",
-    "trojan", "tuic", "vless", "vmess", "anytls",
+    "trojan", "tuic", "vless", "vmess", "anytls", "sudoku",
 ]
 
 DEFAULT_PASSWORD = "test-password-1001"
@@ -46,7 +46,7 @@ DEFAULT_UUID = "a3482e88-686a-4a58-8126-99c9df64b7bf"
 
 NATIVE_UDP_PROTOCOLS = {
     "shadowsocks", "hysteria2", "mieru", "trojan", "tuic", "vless", "vmess",
-    "anytls",
+    "anytls", "sudoku",
 }
 
 def free_port():
@@ -324,6 +324,13 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
             "type": "mieru", "server": "127.0.0.1", "port": server_port,
             "transport": "TCP",
             "username": uuid_val or DEFAULT_UUID, "password": uuid_val or DEFAULT_UUID, "udp": True,
+        })
+    elif protocol == "sudoku":
+        proxy.update({
+            "type": "sudoku", "server": "127.0.0.1", "port": server_port,
+            "key": uuid_val or DEFAULT_UUID, "aead-method": "chacha20-poly1305",
+            "table-type": "prefer_entropy", "enable-pure-downlink": False,
+            "padding-min": 5, "padding-max": 15, "multiplex": "off", "udp": True,
         })
     elif protocol == "trojan":
         proxy.update({

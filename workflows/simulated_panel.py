@@ -91,6 +91,13 @@ PROTOCOL_CONFIGS = {
         "mieru", port,
         {"network": "tcp", "tls": None, "tls_settings": None,
          "reality_settings": None, "cert_config": None}),
+    "sudoku": lambda port: base_node_config(
+        "sudoku", port,
+        {"network": "tcp", "tls": None, "tls_settings": None,
+         "reality_settings": None, "cert_config": None,
+         "sudoku": {"aead": "chacha20-poly1305", "table_type": "prefer_entropy",
+                    "padding_min": 5, "padding_max": 15, "enable_pure_downlink": False,
+                    "multiplex": "off", "http_mask": False}}),
     "trojan": lambda port: base_node_config(
         "trojan", port,
         {"network": "tcp", "udp_relay_mode": "native"}),
