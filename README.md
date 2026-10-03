@@ -25,6 +25,7 @@ NodeRS 是跑在 Linux 上的 [Xboard](https://github.com/cedar2025/Xboard) 节�
 | AnyTLS | ✓ | UoT | 多路复用、padding |
 | Hysteria2 | ✓ | 原生 | Salamander、BBR |
 | Mieru | ✓ | 原生 / 流内 | TCP 与 UDP underlay |
+| Sudoku | ✓ | UoT | 独立用户 PSK、KIP、经典/packed 下行、HTTPMask legacy / WS |
 | Naive | ✓ | UoT | HTTP/1.1、H2、H3 |
 | Shadowsocks | ✓ | ✓ | AEAD / 2022 |
 | Trojan | ✓ | 流内 | WS / H2 / gRPC / XHTTP |

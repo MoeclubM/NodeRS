@@ -24,6 +24,9 @@ pub(super) fn spawn_running_server(
         BuiltServerConfig::Hysteria2(config) => vec![spawn_aerion_task(protocol, async move {
             ::aerion::run_hysteria2_server_with_core(config, core).await
         })],
+        BuiltServerConfig::Sudoku(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_sudoku_server_with_core(config, core).await
+        })],
         BuiltServerConfig::Mieru(config) => vec![spawn_aerion_task(protocol, async move {
             ::aerion::run_mieru_server_with_core(config, core).await
         })],

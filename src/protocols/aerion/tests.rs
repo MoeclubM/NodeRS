@@ -2,6 +2,48 @@ use serde_json::json;
 
 use super::*;
 
+#[tokio::test]
+async fn builds_sudoku_with_distinct_users_and_dynamic_revoke() -> anyhow::Result<()> {
+    let remote: NodeConfigResponse = serde_json::from_value(json!({
+        "protocol":"sudoku", "listen_ip":"0.0.0.0", "server_port":8443,
+        "sudoku":{"aead":"aes-128-gcm","table_type":"prefer_ascii","padding_min":0,"padding_max":0,"http_mask":true,"http_mask_mode":"ws","path_root":"edge"}
+    }))?;
+    let users = vec![
+        PanelUser {
+            id: 1,
+            uuid: "alice-uuid".into(),
+            speed_limit: 10,
+            ..Default::default()
+        },
+        PanelUser {
+            id: 2,
+            uuid: "bob-uuid".into(),
+            ..Default::default()
+        },
+    ];
+    let BuiltServerConfig::Sudoku(config) =
+        build_server_config(ProtocolKind::Sudoku, &remote, &users).await?
+    else {
+        panic!("expected Sudoku")
+    };
+    assert_eq!(config.listen.port(), 8443);
+    assert_eq!(config.key, "alice-uuid");
+    assert_eq!(config.users, ["bob-uuid"]);
+    assert_eq!(config.options.http_mask_mode, "ws");
+    assert_eq!(config.options.path_root, "edge");
+    assert!(!protocol_requires_listener_user_reload(
+        ProtocolKind::Sudoku
+    ));
+    let core = ::aerion::ProxyCore::empty();
+    core.replace_users(core_users(ProtocolKind::Sudoku, &remote, &users)?)?;
+    let bob = core.authenticate("bob-uuid").await?;
+    assert_eq!(bob.user_id(), "2");
+    core.replace_users(core_users(ProtocolKind::Sudoku, &remote, &users[..1])?)?;
+    assert!(core.authenticate("bob-uuid").await.is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(1), bob.cancelled()).await?;
+    Ok(())
+}
+
 #[test]
 fn builds_mieru_server_config() {
     let remote = NodeConfigResponse {
@@ -415,13 +457,21 @@ fn tuic_ignores_unimplemented_zero_rtt() {
 fn protocol_requires_listener_user_reload_identifies_static_listeners() {
     assert!(protocol_requires_listener_user_reload(ProtocolKind::Mieru));
     assert!(protocol_requires_listener_user_reload(ProtocolKind::Naive));
-    assert!(protocol_requires_listener_user_reload(ProtocolKind::Shadowsocks));
+    assert!(protocol_requires_listener_user_reload(
+        ProtocolKind::Shadowsocks
+    ));
     assert!(protocol_requires_listener_user_reload(ProtocolKind::Tuic));
     assert!(protocol_requires_listener_user_reload(ProtocolKind::Vmess));
 
-    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Anytls));
-    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Hysteria2));
-    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Trojan));
+    assert!(!protocol_requires_listener_user_reload(
+        ProtocolKind::Anytls
+    ));
+    assert!(!protocol_requires_listener_user_reload(
+        ProtocolKind::Hysteria2
+    ));
+    assert!(!protocol_requires_listener_user_reload(
+        ProtocolKind::Trojan
+    ));
     assert!(!protocol_requires_listener_user_reload(ProtocolKind::Vless));
 }
 
@@ -509,4 +559,3 @@ fn credentials_changed_detects_user_modifications() {
         &credential_changed
     ));
 }
-

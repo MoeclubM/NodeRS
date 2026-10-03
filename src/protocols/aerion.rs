@@ -43,6 +43,7 @@ enum BuiltServerConfig {
     Anytls(::aerion::ServerConfig),
     Hysteria2(::aerion::Hysteria2ServerConfig),
     Mieru(::aerion::MieruServerConfig),
+    Sudoku(::aerion::SudokuServerConfig),
     Naive(::aerion::NaiveServerConfig),
     Shadowsocks(::aerion::ShadowsocksServerConfig),
     Trojan(::aerion::TrojanServerConfig),
@@ -240,6 +241,24 @@ async fn build_server_config(
         ProtocolKind::Anytls => build_anytls_config(remote, users).await,
         ProtocolKind::Hysteria2 => build_hysteria2_config(remote, users).await,
         ProtocolKind::Mieru => build_mieru_config(remote, users),
+        ProtocolKind::Sudoku => {
+            let options = serde_json::from_value::<::aerion::SudokuOptions>(
+                remote
+                    .sudoku
+                    .clone()
+                    .context("Sudoku node is missing sudoku settings")?,
+            )?;
+            options.validate()?;
+            let (key, users) = split_primary(credentials_for_server(protocol, users)?)?;
+            Ok(BuiltServerConfig::Sudoku(::aerion::SudokuServerConfig {
+                listen: effective_listen_ip(remote)
+                    .parse::<IpAddr>()
+                    .map(|ip| SocketAddr::new(ip, remote.server_port))?,
+                key,
+                users,
+                options,
+            }))
+        }
         ProtocolKind::Naive => build_naive_config(remote, users).await,
         ProtocolKind::Shadowsocks => shadowsocks::build_config(remote, users),
         ProtocolKind::Trojan => build_trojan_config(remote, users).await,

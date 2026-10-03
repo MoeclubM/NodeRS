@@ -36,6 +36,8 @@ pub struct NodePanelClient {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct NodeConfigResponse {
     pub protocol: String,
+    #[serde(default)]
+    pub sudoku: Option<Value>,
     #[serde(
         default,
         alias = "listenIp",
