@@ -330,7 +330,8 @@ def generate_mihomo_config(protocol, server_port, password, uuid_val, mixed_port
             "type": "sudoku", "server": "127.0.0.1", "port": server_port,
             "key": uuid_val or DEFAULT_UUID, "aead-method": "chacha20-poly1305",
             "table-type": "prefer_entropy", "enable-pure-downlink": False,
-            "padding-min": 5, "padding-max": 15, "multiplex": "off", "udp": True,
+            "padding-min": 5, "padding-max": 15, "multiplex": "off",
+            "http-mask": False, "udp": True,
         })
     elif protocol == "trojan":
         proxy.update({
@@ -534,6 +535,10 @@ class MihomoProtocolTester:
             tcp_ok, tcp_msg = self._socks_echo_test(
                 self.mixed_port, tcp_echo_port, b"tcp")
             if not tcp_ok:
+                for name, proc in [("noders", self.noders_proc), ("mihomo", self.mihomo_proc)]:
+                    logs = drain_proc_output(proc, timeout=2.0)
+                    for line in logs[-3000:].strip().split("\n"):
+                        self.log(f"  [{name}] {line}")
                 return False, f"TCP: {tcp_msg}"
             self.log("TCP PASS")
 
