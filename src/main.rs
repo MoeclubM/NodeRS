@@ -13,11 +13,16 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let argument = std::env::args().nth(1);
+    if matches!(argument.as_deref(), Some("--version" | "-V")) {
+        println!("noders {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let _ = rustls::crypto::ring::default_provider().install_default();
     logging::init();
 
-    let config_path = std::env::args()
-        .nth(1)
+    let config_path = argument
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 

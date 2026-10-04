@@ -1,5 +1,11 @@
 # NodeRS
 
+Sudoku nodes are supported through Aerion. Xboard sends a `sudoku` settings
+object; user UUIDs are independent PSKs. Limits, traffic accounting and user
+revocation use the existing core. HTTPMask supports legacy and WebSocket;
+HTTPS must terminate at a fronting reverse proxy. Stream/poll/auto HTTPMask
+modes are explicitly rejected.
+
 English | [简体中文](README.md)
 
 NodeRS is a Linux node agent for [Xboard](https://github.com/cedar2025/Xboard). One command on your server hooks it up to the panel; nodes, users, listen ports, and certificates are then provisioned from the panel, and the machine itself only keeps an API address, a machine key, and a `machine_id`. Protocols are served by [Aerion](https://github.com/MoeclubM/Aerion), the same implementation behind [XBClient](https://github.com/MoeclubM/XBClient).
