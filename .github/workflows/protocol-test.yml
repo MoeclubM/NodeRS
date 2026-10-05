@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: MoeclubM/Aerion
-          ref: c93763e576c60ea46be53a270140d93b319a7798
+          ref: 287c320067cdbc54822758f2a3e8dfe92286353f
           path: Aerion
 
       - name: Install Rust toolchain
