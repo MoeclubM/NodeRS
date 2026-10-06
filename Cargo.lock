@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "noders"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "aerion",
  "anyhow",
