@@ -523,14 +523,8 @@ impl ManagedNode {
         };
 
         if let Some((remote, etag)) = response {
-            if self.sync_state.lock().await.config.as_ref() == Some(&remote) {
-                self.sync_state.lock().await.config_etag = etag;
-                return Ok(());
-            }
             self.apply_remote_config(&remote).await?;
-            let mut sync_state = self.sync_state.lock().await;
-            sync_state.config_etag = etag;
-            sync_state.config = Some(remote);
+            self.sync_state.lock().await.config_etag = etag;
         }
 
         Ok(())
@@ -584,7 +578,16 @@ impl ManagedNode {
         self.push_interval
             .store(push_interval_seconds(base_config), Ordering::Relaxed);
 
-        self.controller.apply_remote_config(remote).await
+        // HTTP polling and websocket replay share the last successfully applied
+        // config. Serialize both paths so concurrent duplicates cannot restart
+        // a healthy listener and cancel its active sessions.
+        let mut sync_state = self.sync_state.lock().await;
+        if sync_state.config.as_ref() == Some(remote) {
+            return Ok(());
+        }
+        self.controller.apply_remote_config(remote).await?;
+        sync_state.config = Some(remote.clone());
+        Ok(())
     }
 
     async fn report_status(&self, payload: &StatusPayload) -> anyhow::Result<()> {
@@ -686,3 +689,6 @@ pub(crate) fn push_interval_seconds(base_config: Option<&BaseConfig>) -> u64 {
         .unwrap_or(DEFAULT_PANEL_PUSH_INTERVAL_SECONDS)
         .max(5)
 }
+
+#[cfg(test)]
+mod tests;
