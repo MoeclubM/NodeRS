@@ -686,3 +686,6 @@ pub(crate) fn push_interval_seconds(base_config: Option<&BaseConfig>) -> u64 {
         .unwrap_or(DEFAULT_PANEL_PUSH_INTERVAL_SECONDS)
         .max(5)
 }
+
+#[cfg(test)]
+mod tests;
