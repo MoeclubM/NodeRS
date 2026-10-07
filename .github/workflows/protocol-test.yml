@@ -30,21 +30,30 @@ jobs:
           pip3 install --break-system-packages pyyaml
 
       - name: Install Go
-        run: |
-          wget -qO /tmp/go.tar.gz https://go.dev/dl/go1.22.10.linux-amd64.tar.gz
-          tar -C /usr/local -xzf /tmp/go.tar.gz
-          rm /tmp/go.tar.gz
-          /usr/local/go/bin/go version
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache: false
 
       - name: Checkout NodeRS
         uses: actions/checkout@v5
+
+      - name: Resolve pinned Aerion revision
+        id: aerion
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as source:
+              revision = tomllib.load(source)['dependencies']['aerion']['rev']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'rev={revision}\n')
+          PY
 
       - name: Checkout Aerion
         uses: actions/checkout@v5
         with:
           repository: MoeclubM/Aerion
-          ref: 287c320067cdbc54822758f2a3e8dfe92286353f
+          ref: ${{ steps.aerion.outputs.rev }}
           path: Aerion
 
       - name: Install Rust toolchain
