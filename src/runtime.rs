@@ -582,8 +582,15 @@ impl ManagedNode {
         // config. Serialize both paths so concurrent duplicates cannot restart
         // a healthy listener and cancel its active sessions.
         let mut sync_state = self.sync_state.lock().await;
-        if sync_state.config.as_ref() == Some(remote) {
-            return Ok(());
+        if let Some(previous) = sync_state.config.as_mut() {
+            // Polling cadence is control metadata, omitted by Xboard's WS
+            // payload. Apply it above without restarting the data listener.
+            let previous_base =
+                std::mem::replace(&mut previous.base_config, remote.base_config.clone());
+            if &*previous == remote {
+                return Ok(());
+            }
+            previous.base_config = previous_base;
         }
         self.controller.apply_remote_config(remote).await?;
         sync_state.config = Some(remote.clone());

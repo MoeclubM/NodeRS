@@ -25,7 +25,15 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
         key: "unused-local-test-key".into(),
         machine_id: 1,
     })?;
-    let node = ManagedNode::new(1, ProtocolKind::Sudoku, panel.node_client(1), None);
+    let node = ManagedNode::new(
+        1,
+        ProtocolKind::Sudoku,
+        panel.node_client(1),
+        Some(BaseConfig {
+            pull_interval: Some(serde_json::json!(13)),
+            push_interval: Some(serde_json::json!(11)),
+        }),
+    );
     let reservation = TcpListener::bind("127.0.0.1:0").await?;
     let port = reservation.local_addr()?.port();
     drop(reservation);
@@ -36,6 +44,10 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
         sudoku: Some(serde_json::json!({
             "aead":"aes-128-gcm", "padding_min":0, "padding_max":0
         })),
+        base_config: Some(BaseConfig {
+            pull_interval: Some(serde_json::json!(24)),
+            push_interval: Some(serde_json::json!(22)),
+        }),
         ..Default::default()
     };
     node.apply_remote_config(&remote).await?;
@@ -76,10 +88,20 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
             .context("connect initial Sudoku stream")?;
         for iteration in 0..4 {
             if iteration > 0 {
+                let websocket = NodeConfigResponse {
+                    base_config: None,
+                    ..remote.clone()
+                };
+                node.apply_remote_config(&websocket).await?;
+                assert_eq!(node.pull_interval(), 13);
+                assert_eq!(node.push_interval(), 11);
+                node.apply_remote_config(&remote).await?;
+                assert_eq!(node.pull_interval(), 24);
+                assert_eq!(node.push_interval(), 22);
                 // Polling and websocket replay must share successful config state.
                 let (left, right) = tokio::join!(
                     node.apply_remote_config(&remote),
-                    node.apply_remote_config(&remote)
+                    node.apply_remote_config(&websocket)
                 );
                 left?;
                 right?;
