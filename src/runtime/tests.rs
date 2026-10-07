@@ -2,6 +2,21 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+async fn wait_for_listener(port: u16) -> anyhow::Result<TcpStream> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })
+    .await?
+}
+
 #[tokio::test]
 async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -30,6 +45,7 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
         ..Default::default()
     }])
     .await?;
+    drop(wait_for_listener(port).await?);
     let destination = TcpListener::bind("127.0.0.1:0").await?;
     let target = aerion::protocol::ProxyTarget::Ip(destination.local_addr()?);
     let echo = tokio::spawn(async move {
@@ -55,7 +71,9 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
         },
     ));
     let result = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut stream = aerion::socks::connect_tcp(socks_address, &target).await?;
+        let mut stream = aerion::socks::connect_tcp(socks_address, &target)
+            .await
+            .context("connect initial Sudoku stream")?;
         for iteration in 0..4 {
             if iteration > 0 {
                 // Polling and websocket replay must share successful config state.
@@ -69,7 +87,10 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
             let payload = vec![iteration as u8; 32_769];
             stream.write_all(&payload).await?;
             let mut response = vec![0; payload.len()];
-            stream.read_exact(&mut response).await?;
+            stream
+                .read_exact(&mut response)
+                .await
+                .with_context(|| format!("read echo after config replay iteration={iteration}"))?;
             assert!(response == payload, "config replay changed stream data");
         }
         let replacement = TcpListener::bind("127.0.0.1:0").await?;
@@ -80,7 +101,7 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
             ..remote.clone()
         };
         node.apply_remote_config(&changed).await?;
-        let _new_listener = TcpStream::connect(("127.0.0.1", new_port)).await?;
+        let _new_listener = wait_for_listener(new_port).await?;
         assert_eq!(node.sync_state.lock().await.config.as_ref(), Some(&changed));
         let mut byte = [0];
         let closed = stream.read(&mut byte).await;
