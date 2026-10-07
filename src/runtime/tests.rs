@@ -24,7 +24,7 @@ async fn identical_config_replay_preserves_live_sudoku_connection() -> anyhow::R
         ..Default::default()
     };
     node.apply_remote_config(&remote).await?;
-    node.replace_users(vec![PanelUser {
+    node.replace_users(&[PanelUser {
         id: 1,
         uuid: "config-replay-user".into(),
         ..Default::default()
