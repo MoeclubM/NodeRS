@@ -813,7 +813,7 @@ fn reality_config(
         short_ids: reality.short_ids.clone(),
         alpn_protocols: transport.alpn_protocols(),
         max_time_diff_secs: 0,
-        max_client_version: Some([0, 0, 0, 1]),
+        max_client_version: None,
         fallback_limit: ::aerion::RealityFallbackLimit::default(),
     })
 }

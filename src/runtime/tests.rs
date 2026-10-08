@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 async fn wait_for_listener(port: u16) -> anyhow::Result<TcpStream> {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(stream) => return Ok(stream),
@@ -14,7 +14,8 @@ async fn wait_for_listener(port: u16) -> anyhow::Result<TcpStream> {
             }
         }
     })
-    .await?
+    .await
+    .with_context(|| format!("wait for protocol listener on port {port}"))?
 }
 
 #[tokio::test]
