@@ -6,7 +6,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.103"
-aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "6eb6e44d4250dbdb8bbe2d3aa0ab9365932a8520" }
+aerion = { git = "https://github.com/MoeclubM/Aerion.git", rev = "4eb2e4276596e3890a4920ba125ac0dbf305f406" }
 base64 = "0.22.1"
 boring = "5.1.0"
 futures-util = "0.3.32"
