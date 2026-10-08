@@ -15,7 +15,7 @@ dependencies = [
 [[package]]
 name = "aerion"
 version = "0.1.0"
-source = "git+https://github.com/MoeclubM/Aerion.git?rev=7e0a53891492bbfe796f7eb03115dd3f8227b079#7e0a53891492bbfe796f7eb03115dd3f8227b079"
+source = "git+https://github.com/MoeclubM/Aerion.git?rev=32774f1eed612d7c6c3e38ffaea32e9f609d7f9f#32774f1eed612d7c6c3e38ffaea32e9f609d7f9f"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -39,6 +39,7 @@ dependencies = [
  "http",
  "md-5",
  "quinn",
+ "rand 0.9.5",
  "rcgen 0.13.2",
  "regex",
  "rustls",
