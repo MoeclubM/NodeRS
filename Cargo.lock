@@ -15,7 +15,7 @@ dependencies = [
 [[package]]
 name = "aerion"
 version = "0.1.0"
-source = "git+https://github.com/MoeclubM/Aerion.git?rev=e5f85d1b14f7c02b9f98f2e6fbb7fce304c9b90d#e5f85d1b14f7c02b9f98f2e6fbb7fce304c9b90d"
+source = "git+https://github.com/MoeclubM/Aerion.git?rev=8a76c9fb6bc45debde047e94a09020f651c488bd#8a76c9fb6bc45debde047e94a09020f651c488bd"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "noders"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "aerion",
  "anyhow",
