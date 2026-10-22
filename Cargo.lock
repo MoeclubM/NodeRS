@@ -25,7 +25,7 @@ dependencies = [
 [[package]]
 name = "aerion"
 version = "0.1.0"
-source = "git+https://github.com/MoeclubM/Aerion.git?rev=8b8d9f7bb6f575828c79fd91167fa70d89002599#8b8d9f7bb6f575828c79fd91167fa70d89002599"
+source = "git+https://github.com/MoeclubM/Aerion.git?rev=25faa149496b3bc93cbc28439a3dd3c8218d97e2#25faa149496b3bc93cbc28439a3dd3c8218d97e2"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -47,6 +47,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "http",
+ "libc",
  "md-5 0.10.6",
  "quinn",
  "rand 0.9.5",
@@ -2079,9 +2080,9 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
-version = "0.2.191"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libloading"
