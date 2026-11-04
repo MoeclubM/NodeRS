@@ -15,6 +15,7 @@ pub(super) fn spawn_running_server(
     protocol: ProtocolKind,
     config: BuiltServerConfig,
     core: ::aerion::core::ProxyCore,
+    flux_state: Option<::aerion::FluxServerState>,
 ) -> anyhow::Result<RunningServer> {
     let mut stop = None;
     let handles = match config {
@@ -28,7 +29,15 @@ pub(super) fn spawn_running_server(
             let task_stop = stop_token.clone();
             stop = Some(stop_token);
             vec![spawn_aerion_task(protocol, async move {
-                ::aerion::run_flux_server_with_core_until(config, core, task_stop).await
+                ::aerion::start_flux_server_with_state(
+                    config,
+                    flux_state
+                        .as_ref()
+                        .expect("Flux controller state configured"),
+                    task_stop,
+                )?
+                .wait()
+                .await
             })]
         }
         BuiltServerConfig::Hysteria2(config) => vec![spawn_aerion_task(protocol, async move {

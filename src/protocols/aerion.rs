@@ -27,6 +27,7 @@ pub struct ServerController {
     protocol: ProtocolKind,
     accounting: Arc<Accounting>,
     core: ::aerion::core::ProxyCore,
+    flux_state: Option<::aerion::FluxServerState>,
     users: RwLock<Vec<PanelUser>>,
     remote: RwLock<Option<NodeConfigResponse>>,
     last_traffic: Mutex<HashMap<String, [u64; 2]>>,
@@ -57,10 +58,13 @@ enum BuiltServerConfig {
 
 impl ServerController {
     pub fn new(protocol: ProtocolKind, accounting: Arc<Accounting>) -> Self {
+        let core = ::aerion::core::ProxyCore::empty();
         Self {
             protocol,
             accounting,
-            core: ::aerion::core::ProxyCore::empty(),
+            flux_state: (protocol == ProtocolKind::Flux)
+                .then(|| ::aerion::FluxServerState::new(core.clone(), true)),
+            core,
             users: RwLock::new(Vec::new()),
             remote: RwLock::new(None),
             last_traffic: Mutex::new(HashMap::new()),
@@ -248,12 +252,14 @@ impl ServerController {
         let config = build_server_config(self.protocol, &remote, &users).await?;
         let watched = collect_watched_tls_files(&config).await;
         let core_users = core_users(self.protocol, &remote, &users)?;
-        self.stop_locked(&mut inner).await;
+        self.stop_listeners_locked(&mut inner, self.protocol == ProtocolKind::Flux)
+            .await;
         self.core.replace_users(core_users)?;
         *inner = Some(spawn_running_server(
             self.protocol,
             config,
             self.core.clone(),
+            self.flux_state.clone(),
         )?);
         *self
             .watched_tls_files
@@ -272,12 +278,22 @@ impl ServerController {
     }
 
     async fn stop_locked(&self, inner: &mut Option<RunningServer>) {
+        self.stop_listeners_locked(inner, false).await;
+    }
+
+    async fn stop_listeners_locked(
+        &self,
+        inner: &mut Option<RunningServer>,
+        preserve_sessions: bool,
+    ) {
         let old = inner.take();
         if let Some(old) = old {
             if let Some(stop) = &old.stop {
                 stop.stop();
             }
-            self.core.cancel_all_sessions();
+            if !preserve_sessions {
+                self.core.cancel_all_sessions();
+            }
             for mut handle in old.handles {
                 if old.stop.is_some()
                     && let Ok(res) = tokio::time::timeout(Duration::from_secs(2), &mut handle).await
