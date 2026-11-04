@@ -21,6 +21,9 @@ pub(super) fn spawn_running_server(
                 ::aerion::run_server_with_core(config, core).await
             })]
         }
+        BuiltServerConfig::Flux(config) => vec![spawn_aerion_task(protocol, async move {
+            ::aerion::run_flux_server_with_core(config, core).await
+        })],
         BuiltServerConfig::Hysteria2(config) => vec![spawn_aerion_task(protocol, async move {
             ::aerion::run_hysteria2_server_with_core(config, core).await
         })],

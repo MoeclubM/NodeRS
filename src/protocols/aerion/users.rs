@@ -52,6 +52,20 @@ fn credentials_for_user(protocol: ProtocolKind, user: &PanelUser) -> anyhow::Res
             );
             credentials.push(uuid.to_string());
         }
+        ProtocolKind::Flux => {
+            let uuid = user.uuid.trim();
+            if !uuid.is_empty() {
+                credentials.push(uuid.to_string());
+            } else {
+                let password = user.password.trim();
+                ensure!(
+                    !password.is_empty(),
+                    "flux user {} is missing uuid",
+                    user.id
+                );
+                credentials.push(password.to_string());
+            }
+        }
         ProtocolKind::Hysteria2 => {
             push_unique_credential(&mut credentials, user.password.trim());
             push_unique_credential(&mut credentials, user.uuid.trim());

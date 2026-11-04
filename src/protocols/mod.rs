@@ -10,6 +10,7 @@ use crate::panel::{NodeConfigResponse, PanelUser};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolKind {
     Anytls,
+    Flux,
     Hysteria2,
     Mieru,
     Sudoku,
@@ -32,6 +33,8 @@ impl ProtocolKind {
 
         if normalized == "anytls" {
             Some(Self::Anytls)
+        } else if normalized == "flux" {
+            Some(Self::Flux)
         } else if matches!(normalized.as_str(), "hysteria2" | "hy2" | "hysteria") {
             Some(Self::Hysteria2)
         } else if normalized == "sudoku" {
@@ -61,6 +64,7 @@ impl ProtocolKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Anytls => "anytls",
+            Self::Flux => "flux",
             Self::Hysteria2 => "hysteria2",
             Self::Mieru => "mieru",
             Self::Sudoku => "sudoku",
@@ -80,6 +84,8 @@ mod tests {
 
     #[test]
     fn parses_common_protocol_aliases() {
+        assert_eq!(ProtocolKind::parse("flux"), Some(ProtocolKind::Flux));
+        assert_eq!(ProtocolKind::parse(" Flux "), Some(ProtocolKind::Flux));
         assert_eq!(ProtocolKind::parse("mieru"), Some(ProtocolKind::Mieru));
         assert_eq!(ProtocolKind::parse(" Sudoku "), Some(ProtocolKind::Sudoku));
         assert_eq!(ProtocolKind::parse("naive"), Some(ProtocolKind::Naive));

@@ -647,3 +647,208 @@ fn credentials_changed_detects_user_modifications() {
         &credential_changed
     ));
 }
+
+#[tokio::test]
+async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> anyhow::Result<()> {
+    let priv_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let xboard_remote: NodeConfigResponse = serde_json::from_value(json!({
+        "protocol": "flux",
+        "host": "edge.example.com",
+        "listen_ip": "0.0.0.0",
+        "server_port": 443,
+        "tls": 2,
+        "reality_settings": {
+            "server_name": "www.microsoft.com",
+            "server_port": 443,
+            "private_key": priv_key,
+            "short_id": "01020304"
+        },
+        "flux": {
+            "ip_strategy": "dual",
+            "standby_channels": 2,
+            "rotation_interval_sec": 180,
+            "rotation_bytes_mb": 96,
+            "security": "reality",
+            "obfs_key": "shared-obfs-secret-key",
+            "channels": [
+                {
+                    "id": "ct-v4-relay",
+                    "connect_host": "ct.example.com",
+                    "connect_ports": "20443",
+                    "listen_ports": "8443",
+                    "transport": "tcp",
+                    "security": "reality"
+                },
+                {
+                    "id": "cu-v6-relay",
+                    "connect_host": "cu6.example.com",
+                    "connect_ports": "30443",
+                    "listen_ports": "8443",
+                    "transport": "tcp",
+                    "security": "reality"
+                },
+                {
+                    "id": "cdn-ws",
+                    "connect_host": "cdn.example.com",
+                    "connect_ports": "443",
+                    "listen_ip": "127.0.0.1",
+                    "listen_ports": "18080",
+                    "transport": "http",
+                    "http_mode": "ws",
+                    "http_host": "cdn.example.com",
+                    "http_path": "/flux-ws",
+                    "security": "tls",
+                    "cert_mode": "origin_plain"
+                },
+                {
+                    "id": "udp-hop",
+                    "connect_ports": "21000-21002",
+                    "transport": "udp",
+                    "security": "obfs",
+                    "role": "backup",
+                    "weight": 80
+                }
+            ]
+        }
+    }))?;
+
+    let pxboard_remote = crate::pxboard::adapt_pxboard_node_config(json!({
+        "protocol": "flux",
+        "host": "edge.example.com",
+        "listen": { "host": "0.0.0.0", "port": 443 },
+        "transport": { "type": "tcp", "settings": {} },
+        "security": {
+            "mode": "reality",
+            "serverName": "www.microsoft.com",
+            "tlsSettings": {},
+            "reality": {
+                "serverName": "www.microsoft.com",
+                "serverPort": 443,
+                "privateKey": priv_key,
+                "shortId": "01020304"
+            },
+            "certificate": null
+        },
+        "protocolOptions": {
+            "ipStrategy": "dual",
+            "standbyChannels": 2,
+            "rotationIntervalSec": 180,
+            "rotationBytesMb": 96,
+            "obfsKey": "shared-obfs-secret-key",
+            "channels": [
+                {
+                    "id": "ct-v4-relay",
+                    "connectHost": "ct.example.com",
+                    "connectPorts": "20443",
+                    "listenPorts": "8443",
+                    "transport": "tcp",
+                    "security": "reality"
+                },
+                {
+                    "id": "cu-v6-relay",
+                    "connectHost": "cu6.example.com",
+                    "connectPorts": "30443",
+                    "listenPorts": "8443",
+                    "transport": "tcp",
+                    "security": "reality"
+                },
+                {
+                    "id": "cdn-ws",
+                    "connectHost": "cdn.example.com",
+                    "connectPorts": "443",
+                    "listenIp": "127.0.0.1",
+                    "listenPorts": "18080",
+                    "transport": "http",
+                    "httpMode": "ws",
+                    "httpHost": "cdn.example.com",
+                    "httpPath": "/flux-ws",
+                    "security": "tls",
+                    "certMode": "origin_plain"
+                },
+                {
+                    "id": "udp-hop",
+                    "connectPorts": "21000-21002",
+                    "transport": "udp",
+                    "security": "obfs",
+                    "role": "backup",
+                    "weight": 80
+                }
+            ]
+        }
+    }))?;
+
+    let users = vec![
+        PanelUser {
+            id: 1,
+            uuid: "alice-flux-uuid".into(),
+            ..Default::default()
+        },
+        PanelUser {
+            id: 2,
+            uuid: "bob-flux-uuid".into(),
+            ..Default::default()
+        },
+    ];
+
+    let BuiltServerConfig::Flux(xb_cfg) =
+        build_server_config(ProtocolKind::Flux, &xboard_remote, &users).await?
+    else {
+        panic!("expected Flux config for Xboard")
+    };
+    let BuiltServerConfig::Flux(px_cfg) =
+        build_server_config(ProtocolKind::Flux, &pxboard_remote, &users).await?
+    else {
+        panic!("expected Flux config for PxBoard")
+    };
+
+    assert!(!protocol_requires_listener_user_reload(ProtocolKind::Flux));
+    assert_eq!(xb_cfg.key, "alice-flux-uuid");
+    assert_eq!(xb_cfg.users, ["bob-flux-uuid"]);
+    // 4 logical channels -> 3 physical listener groups because ct-v4-relay & cu-v6-relay share :: :8443/tcp
+    assert_eq!(xb_cfg.listeners.len(), 3);
+    assert_eq!(px_cfg.listeners.len(), 3);
+    assert_eq!(xb_cfg.listeners[0].ports, vec![8443]);
+    assert_eq!(xb_cfg.listeners[1].ports, vec![18080]);
+    assert_eq!(xb_cfg.listeners[2].ports, vec![21000, 21001, 21002]);
+    for (a, b) in xb_cfg.listeners.iter().zip(px_cfg.listeners.iter()) {
+        assert_eq!(a.listen_ip, b.listen_ip);
+        assert_eq!(a.ports, b.ports);
+        assert_eq!(a.transport, b.transport);
+        assert_eq!(a.http_mode, b.http_mode);
+        assert_eq!(a.http_path, b.http_path);
+        assert_eq!(a.security, b.security);
+        assert_eq!(a.cert_mode, b.cert_mode);
+        assert_eq!(a.reality, b.reality);
+        assert_eq!(a.obfs_key, b.obfs_key);
+    }
+
+    // Conflicting security on the same local port must be rejected explicitly
+    let conflict_remote: NodeConfigResponse = serde_json::from_value(json!({
+        "protocol": "flux",
+        "server_port": 443,
+        "flux": {
+            "obfs_key": "shared-obfs-secret-key",
+            "channels": [
+                {
+                    "id": "ch1",
+                    "listen_ports": "9443",
+                    "transport": "tcp",
+                    "security": "obfs"
+                },
+                {
+                    "id": "ch2",
+                    "listen_ports": "9443",
+                    "transport": "http",
+                    "http_mode": "ws",
+                    "security": "obfs"
+                }
+            ]
+        }
+    }))?;
+    assert!(
+        build_server_config(ProtocolKind::Flux, &conflict_remote, &users)
+            .await
+            .is_err()
+    );
+    Ok(())
+}

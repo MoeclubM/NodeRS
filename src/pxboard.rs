@@ -182,107 +182,7 @@ impl PxBoardClient {
         let data: Value = self
             .request(Method::GET, &format!("/nodes/{id}/config"), None)
             .await?;
-        let mut wire = data
-            .get("protocolOptions")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        for alias in [
-            "listenIp",
-            "serverPort",
-            "networkSettings",
-            "serverName",
-            "tlsSettings",
-            "realitySettings",
-            "certConfig",
-        ] {
-            wire.remove(alias);
-        }
-        let network = data["transport"]["type"].as_str().unwrap_or("tcp");
-        let protocol = data["protocol"]
-            .as_str()
-            .context("missing PxBoard protocol")?;
-        let supported = match protocol {
-            "vless" | "vmess" | "trojan" => matches!(
-                network,
-                "" | "tcp"
-                    | "raw"
-                    | "ws"
-                    | "websocket"
-                    | "httpupgrade"
-                    | "grpc"
-                    | "h2"
-                    | "http"
-                    | "xhttp"
-                    | "splithttp"
-            ),
-            "hysteria2" | "tuic" => matches!(
-                network,
-                "" | "tcp" | "udp" | "quic" | "hysteria2" | "hy2" | "tuic"
-            ),
-            "mieru" => matches!(network, "" | "tcp" | "raw" | "udp"),
-            "naive" => matches!(
-                network,
-                "" | "tcp" | "raw" | "http" | "https" | "h2" | "h3" | "http3" | "quic"
-            ),
-            _ => matches!(network, "" | "tcp" | "raw"),
-        };
-        if !supported {
-            bail!("PxBoard transport {network} is not supported for {protocol}");
-        }
-        for field in [
-            "routes",
-            "custom_routes",
-            "customRoutes",
-            "custom_outbounds",
-            "customOutbounds",
-            "fallback",
-            "fallbacks",
-            "fallbackForAlpn",
-            "fallback_for_alpn",
-        ] {
-            if wire
-                .get(field)
-                .is_some_and(crate::panel::json_value_is_enabled)
-            {
-                bail!("PxBoard field {field} is not supported by this NodeRS build");
-            }
-        }
-        for (alias, canonical) in [
-            ("method", "cipher"),
-            ("security", "cipher"),
-            ("serverKey", "server_key"),
-        ] {
-            if let Some(value) = wire.remove(alias) {
-                wire.entry(canonical).or_insert(value);
-            }
-        }
-        if protocol == "shadowsocks" && !wire.contains_key("cipher") {
-            wire.insert("cipher".into(), json!("aes-128-gcm"));
-        }
-        wire.insert("protocol".into(), data["protocol"].clone());
-        wire.insert("server_port".into(), data["listen"]["port"].clone());
-        wire.insert("listen_ip".into(), data["listen"]["host"].clone());
-        wire.insert("host".into(), data["host"].clone());
-        wire.insert("network".into(), data["transport"]["type"].clone());
-        wire.insert(
-            "network_settings".into(),
-            data["transport"]["settings"].clone(),
-        );
-        let security = &data["security"];
-        wire.insert(
-            "tls".into(),
-            json!(match security["mode"].as_str() {
-                Some("reality") => 2,
-                Some("tls") => 1,
-                _ => 0,
-            }),
-        );
-        wire.insert("server_name".into(), security["serverName"].clone());
-        wire.insert("tls_settings".into(), security["tlsSettings"].clone());
-        wire.insert("reality_settings".into(), security["reality"].clone());
-        wire.insert("cert_config".into(), security["certificate"].clone());
-        serde_json::from_value(Value::Object(wire)).context("adapt PxBoard node configuration")
+        adapt_pxboard_node_config(data)
     }
     pub async fn users(&self, id: i64) -> anyhow::Result<UsersResponse> {
         let users: Vec<User> = self
@@ -420,6 +320,220 @@ impl PxBoardClient {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn adapt_pxboard_node_config(data: Value) -> anyhow::Result<NodeConfigResponse> {
+    let mut wire = data
+        .get("protocolOptions")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for alias in [
+        "listenIp",
+        "serverPort",
+        "networkSettings",
+        "serverName",
+        "tlsSettings",
+        "realitySettings",
+        "certConfig",
+    ] {
+        wire.remove(alias);
+    }
+    let network = data["transport"]["type"].as_str().unwrap_or("tcp");
+    let protocol = data["protocol"]
+        .as_str()
+        .context("missing PxBoard protocol")?;
+    let supported = match protocol {
+        "vless" | "vmess" | "trojan" => matches!(
+            network,
+            "" | "tcp"
+                | "raw"
+                | "ws"
+                | "websocket"
+                | "httpupgrade"
+                | "grpc"
+                | "h2"
+                | "http"
+                | "xhttp"
+                | "splithttp"
+        ),
+        "hysteria2" | "tuic" => matches!(
+            network,
+            "" | "tcp" | "udp" | "quic" | "hysteria2" | "hy2" | "tuic"
+        ),
+        "mieru" => matches!(network, "" | "tcp" | "raw" | "udp"),
+        "naive" => matches!(
+            network,
+            "" | "tcp" | "raw" | "http" | "https" | "h2" | "h3" | "http3" | "quic"
+        ),
+        "flux" => matches!(
+            network,
+            "" | "tcp"
+                | "raw"
+                | "udp"
+                | "quic"
+                | "http"
+                | "ws"
+                | "websocket"
+                | "httpupgrade"
+                | "h2"
+        ),
+        _ => matches!(network, "" | "tcp" | "raw"),
+    };
+    if !supported {
+        bail!("PxBoard transport {network} is not supported for {protocol}");
+    }
+    for field in [
+        "routes",
+        "custom_routes",
+        "customRoutes",
+        "custom_outbounds",
+        "customOutbounds",
+        "fallback",
+        "fallbacks",
+        "fallbackForAlpn",
+        "fallback_for_alpn",
+    ] {
+        if wire
+            .get(field)
+            .is_some_and(crate::panel::json_value_is_enabled)
+        {
+            bail!("PxBoard field {field} is not supported by this NodeRS build");
+        }
+    }
+
+    let security = &data["security"];
+    if protocol == "flux" {
+        let mut flux_map = wire
+            .remove("flux")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        for (alias, canonical) in [
+            ("ipStrategy", "ip_strategy"),
+            ("ip_strategy", "ip_strategy"),
+            ("standbyChannels", "standby_channels"),
+            ("standby_channels", "standby_channels"),
+            ("rotationIntervalSec", "rotation_interval_sec"),
+            ("rotation_interval_sec", "rotation_interval_sec"),
+            ("rotationBytesMb", "rotation_bytes_mb"),
+            ("rotation_bytes_mb", "rotation_bytes_mb"),
+            ("obfsKey", "obfs_key"),
+            ("obfs_key", "obfs_key"),
+            ("defaultSecurity", "security"),
+            ("default_security", "security"),
+            ("security", "security"),
+            ("udp", "udp"),
+            ("reality", "reality"),
+            ("channels", "channels"),
+        ] {
+            if let Some(value) = wire.remove(alias)
+                && !value.is_null()
+            {
+                flux_map.entry(canonical.to_string()).or_insert(value);
+            }
+        }
+        if !flux_map.contains_key("security")
+            && let Some(mode) = security["mode"].as_str()
+            && matches!(mode, "reality" | "tls" | "obfs")
+        {
+            flux_map.insert("security".into(), json!(mode));
+        }
+        if let Some(Value::Array(channels)) = flux_map.get_mut("channels") {
+            for item in channels.iter_mut() {
+                if let Some(obj) = item.as_object_mut() {
+                    normalize_flux_channel_object(obj);
+                }
+            }
+        }
+        if let Some(Value::Object(r_obj)) = flux_map.get_mut("reality") {
+            normalize_flux_reality_object(r_obj);
+        }
+        wire.insert("flux".into(), Value::Object(flux_map));
+    }
+
+    for (alias, canonical) in [
+        ("method", "cipher"),
+        ("security", "cipher"),
+        ("serverKey", "server_key"),
+    ] {
+        if let Some(value) = wire.remove(alias) {
+            wire.entry(canonical).or_insert(value);
+        }
+    }
+    if protocol == "shadowsocks" && !wire.contains_key("cipher") {
+        wire.insert("cipher".into(), json!("aes-128-gcm"));
+    }
+    wire.insert("protocol".into(), data["protocol"].clone());
+    wire.insert("server_port".into(), data["listen"]["port"].clone());
+    wire.insert("listen_ip".into(), data["listen"]["host"].clone());
+    wire.insert("host".into(), data["host"].clone());
+    wire.insert("network".into(), data["transport"]["type"].clone());
+    wire.insert(
+        "network_settings".into(),
+        data["transport"]["settings"].clone(),
+    );
+    wire.insert(
+        "tls".into(),
+        json!(match security["mode"].as_str() {
+            Some("reality") => 2,
+            Some("tls") => 1,
+            _ => 0,
+        }),
+    );
+    wire.insert("server_name".into(), security["serverName"].clone());
+    wire.insert("tls_settings".into(), security["tlsSettings"].clone());
+    wire.insert("reality_settings".into(), security["reality"].clone());
+    wire.insert("cert_config".into(), security["certificate"].clone());
+    serde_json::from_value(Value::Object(wire)).context("adapt PxBoard node configuration")
+}
+
+fn normalize_flux_channel_object(obj: &mut serde_json::Map<String, Value>) {
+    for (alias, canonical) in [
+        ("connectHost", "connect_host"),
+        ("connectPorts", "connect_ports"),
+        ("ipVersion", "ip_version"),
+        ("listenIp", "listen_ip"),
+        ("listenPorts", "listen_ports"),
+        ("httpMode", "http_mode"),
+        ("httpHost", "http_host"),
+        ("httpPath", "http_path"),
+        ("httpHeaders", "http_headers"),
+        ("certMode", "cert_mode"),
+        ("certPath", "cert_path"),
+        ("keyPath", "key_path"),
+        ("obfsKey", "obfs_key"),
+        ("shortId", "short_id"),
+        ("shortIds", "short_ids"),
+        ("publicKey", "public_key"),
+        ("privateKey", "private_key"),
+        ("serverName", "sni"),
+        ("realityFallback", "reality_fallback"),
+        ("realityOpts", "reality"),
+        ("reality_opts", "reality"),
+    ] {
+        if let Some(value) = obj.remove(alias) {
+            obj.entry(canonical).or_insert(value);
+        }
+    }
+    if let Some(Value::Object(r_obj)) = obj.get_mut("reality") {
+        normalize_flux_reality_object(r_obj);
+    }
+}
+
+fn normalize_flux_reality_object(obj: &mut serde_json::Map<String, Value>) {
+    for (alias, canonical) in [
+        ("serverName", "server_name"),
+        ("serverNames", "server_names"),
+        ("serverPort", "server_port"),
+        ("privateKey", "private_key"),
+        ("publicKey", "public_key"),
+        ("shortId", "short_id"),
+        ("shortIds", "short_ids"),
+    ] {
+        if let Some(value) = obj.remove(alias) {
+            obj.entry(canonical).or_insert(value);
+        }
     }
 }
 impl Outbox {

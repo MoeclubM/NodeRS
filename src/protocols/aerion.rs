@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{error, info, warn};
 
+mod flux;
 mod runner;
 mod shadowsocks;
 mod users;
@@ -29,6 +30,7 @@ pub struct ServerController {
     users: RwLock<Vec<PanelUser>>,
     remote: RwLock<Option<NodeConfigResponse>>,
     last_traffic: Mutex<HashMap<String, [u64; 2]>>,
+    watched_tls_files: Mutex<Vec<(PathBuf, Option<(u64, SystemTime)>)>>,
     inner: AsyncMutex<Option<RunningServer>>,
 }
 
@@ -41,6 +43,7 @@ struct AerionTlsIdentity {
 
 enum BuiltServerConfig {
     Anytls(::aerion::ServerConfig),
+    Flux(::aerion::FluxServerConfig),
     Hysteria2(::aerion::Hysteria2ServerConfig),
     Mieru(::aerion::MieruServerConfig),
     Sudoku(::aerion::SudokuServerConfig),
@@ -61,6 +64,7 @@ impl ServerController {
             users: RwLock::new(Vec::new()),
             remote: RwLock::new(None),
             last_traffic: Mutex::new(HashMap::new()),
+            watched_tls_files: Mutex::new(Vec::new()),
             inner: AsyncMutex::new(None),
         }
     }
@@ -123,6 +127,37 @@ impl ServerController {
     }
 
     pub async fn refresh_runtime_assets(&self) -> anyhow::Result<()> {
+        let remote = self.remote.read().await.clone();
+        if let Some(remote) = remote
+            && let Ok(tls) = EffectiveTlsConfig::from_remote(&remote)
+            && let tls::TlsMaterialSource::Acme {
+                cert_path,
+                key_path,
+                config,
+            } = &tls.source
+        {
+            acme::ensure_certificate(config, cert_path, key_path)
+                .await
+                .context("refresh ACME certificate")?;
+        }
+        let watched = self
+            .watched_tls_files
+            .lock()
+            .expect("watched TLS files lock poisoned")
+            .clone();
+        if watched.is_empty() {
+            return Ok(());
+        }
+        for (path, previous) in &watched {
+            if file_fingerprint(path).await != *previous {
+                info!(
+                    protocol = self.protocol.as_str(),
+                    path = %path.display(),
+                    "certificate file changed on disk; reloading runtime"
+                );
+                return self.restart().await;
+            }
+        }
         Ok(())
     }
 
@@ -202,11 +237,16 @@ impl ServerController {
         };
         if users.is_empty() {
             self.stop_locked(&mut inner).await;
+            self.watched_tls_files
+                .lock()
+                .expect("watched TLS files lock poisoned")
+                .clear();
             self.core.replace_users(Vec::new())?;
             return Ok(());
         }
 
         let config = build_server_config(self.protocol, &remote, &users).await?;
+        let watched = collect_watched_tls_files(&config).await;
         let core_users = core_users(self.protocol, &remote, &users)?;
         self.stop_locked(&mut inner).await;
         self.core.replace_users(core_users)?;
@@ -215,6 +255,10 @@ impl ServerController {
             config,
             self.core.clone(),
         )?);
+        *self
+            .watched_tls_files
+            .lock()
+            .expect("watched TLS files lock poisoned") = watched;
         info!(
             protocol = self.protocol.as_str(),
             "Aerion protocol runtime task started"
@@ -250,6 +294,7 @@ async fn build_server_config(
 ) -> anyhow::Result<BuiltServerConfig> {
     match protocol {
         ProtocolKind::Anytls => build_anytls_config(remote, users).await,
+        ProtocolKind::Flux => flux::build_config(remote, users).await,
         ProtocolKind::Hysteria2 => build_hysteria2_config(remote, users).await,
         ProtocolKind::Mieru => build_mieru_config(remote, users),
         ProtocolKind::Sudoku => {
@@ -1139,6 +1184,42 @@ pub(super) fn credentials_changed(
     old_pairs.sort_unstable();
     new_pairs.sort_unstable();
     old_pairs != new_pairs
+}
+
+async fn file_fingerprint(path: &std::path::Path) -> Option<(u64, SystemTime)> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let modified = meta.modified().ok()?;
+    Some((meta.len(), modified))
+}
+
+async fn collect_watched_tls_files(
+    config: &BuiltServerConfig,
+) -> Vec<(PathBuf, Option<(u64, SystemTime)>)> {
+    let mut paths = Vec::new();
+    if let BuiltServerConfig::Flux(flux_cfg) = config {
+        for listener in &flux_cfg.listeners {
+            if let Some(material) = &listener.tls_material {
+                if let Some(cert) = &material.cert_path
+                    && !cert.as_os_str().is_empty()
+                    && !paths.contains(cert)
+                {
+                    paths.push(cert.clone());
+                }
+                if let Some(key) = &material.key_path
+                    && !key.as_os_str().is_empty()
+                    && !paths.contains(key)
+                {
+                    paths.push(key.clone());
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let fp = file_fingerprint(&path).await;
+        out.push((path, fp));
+    }
+    out
 }
 
 #[cfg(test)]
