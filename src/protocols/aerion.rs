@@ -274,8 +274,21 @@ impl ServerController {
     async fn stop_locked(&self, inner: &mut Option<RunningServer>) {
         let old = inner.take();
         if let Some(old) = old {
+            if let Some(stop) = &old.stop {
+                stop.stop();
+            }
             self.core.cancel_all_sessions();
-            for handle in old.handles {
+            for mut handle in old.handles {
+                if old.stop.is_some()
+                    && let Ok(res) = tokio::time::timeout(Duration::from_secs(2), &mut handle).await
+                {
+                    if let Err(error) = res
+                        && !error.is_cancelled()
+                    {
+                        error!(protocol = self.protocol.as_str(), %error, "Aerion server task join failed during stop");
+                    }
+                    continue;
+                }
                 handle.abort();
                 if let Err(error) = handle.await
                     && !error.is_cancelled()

@@ -7,6 +7,7 @@ use crate::protocols::ProtocolKind;
 use super::BuiltServerConfig;
 
 pub(super) struct RunningServer {
+    pub(super) stop: Option<::aerion::ListenerStopToken>,
     pub(super) handles: Vec<JoinHandle<()>>,
 }
 
@@ -15,15 +16,21 @@ pub(super) fn spawn_running_server(
     config: BuiltServerConfig,
     core: ::aerion::core::ProxyCore,
 ) -> anyhow::Result<RunningServer> {
+    let mut stop = None;
     let handles = match config {
         BuiltServerConfig::Anytls(config) => {
             vec![spawn_aerion_task(protocol, async move {
                 ::aerion::run_server_with_core(config, core).await
             })]
         }
-        BuiltServerConfig::Flux(config) => vec![spawn_aerion_task(protocol, async move {
-            ::aerion::run_flux_server_with_core(config, core).await
-        })],
+        BuiltServerConfig::Flux(config) => {
+            let stop_token = ::aerion::ListenerStopToken::new();
+            let task_stop = stop_token.clone();
+            stop = Some(stop_token);
+            vec![spawn_aerion_task(protocol, async move {
+                ::aerion::run_flux_server_with_core_until(config, core, task_stop).await
+            })]
+        }
         BuiltServerConfig::Hysteria2(config) => vec![spawn_aerion_task(protocol, async move {
             ::aerion::run_hysteria2_server_with_core(config, core).await
         })],
@@ -52,7 +59,7 @@ pub(super) fn spawn_running_server(
             ::aerion::run_vmess_server_with_core(config, core).await
         })],
     };
-    Ok(RunningServer { handles })
+    Ok(RunningServer { stop, handles })
 }
 
 fn spawn_aerion_task<F>(protocol: ProtocolKind, future: F) -> JoinHandle<()>
