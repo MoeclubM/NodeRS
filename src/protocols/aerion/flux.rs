@@ -198,13 +198,13 @@ pub(super) async fn build_config(
         ip_strategy: settings.ip_strategy.unwrap_or_default(),
         standby_channels: settings
             .standby_channels
-            .unwrap_or(::aerion::DEFAULT_STANDBY_CHANNELS),
+            .unwrap_or(::aerion::flux::DEFAULT_STANDBY_CHANNELS),
         rotation_interval_sec: settings
             .rotation_interval_sec
-            .unwrap_or(::aerion::DEFAULT_ROTATION_INTERVAL_SEC),
+            .unwrap_or(::aerion::flux::DEFAULT_ROTATION_INTERVAL_SEC),
         rotation_bytes_mb: settings
             .rotation_bytes_mb
-            .unwrap_or(::aerion::DEFAULT_ROTATION_BYTES_MB),
+            .unwrap_or(::aerion::flux::DEFAULT_ROTATION_BYTES_MB),
     };
     options.validate()?;
 
