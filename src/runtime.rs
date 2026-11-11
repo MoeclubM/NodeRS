@@ -75,6 +75,10 @@ impl MachineRuntime {
         })
     }
 
+    pub(crate) fn panel(&self) -> &MachinePanelClient {
+        &self.panel
+    }
+
     async fn initialize(self: &Arc<Self>) -> anyhow::Result<()> {
         let handshake = self.panel.fetch_handshake().await?;
         self.refresh_machine_nodes().await?;

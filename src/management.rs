@@ -91,8 +91,7 @@ pub async fn run(path: &Path, mut config: AppConfig) -> anyhow::Result<()> {
         let (candidate, candidate_raw, revision) = if local_config != config {
             (local_config, local_raw, None)
         } else {
-            let source = MachinePanelClient::new(&config.panel)?;
-            let desired = match source.managed_configuration().await {
+            let desired = match runtime.panel().managed_configuration().await {
                 Ok(Some(desired)) => desired,
                 Ok(None) => continue,
                 Err(error) => {

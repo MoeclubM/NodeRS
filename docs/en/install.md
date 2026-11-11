@@ -64,9 +64,9 @@ When run from the repo or a raw URL the script downloads the release bundle auto
 Install and upgrade download releases from `MoeclubM/NodeRS` by default. Set `NODERS_REPOSITORY` to a different `owner/repo` for an individual command:
 
 ```bash
-NODERS_REPOSITORY=owner/NodeRS bash scripts/install.sh --version v0.1.49 \
+NODERS_REPOSITORY=owner/NodeRS bash scripts/install.sh --version v0.1.50 \
   --panel-type pxboard --api https://panel.example.com --key MACHINE_KEY --machine-id 1
-NODERS_REPOSITORY=owner/NodeRS noders update --version v0.1.49
+NODERS_REPOSITORY=owner/NodeRS noders update --version v0.1.50
 ```
 
 The override selects the release source for that command without changing the panel type. After installation or upgrade, management scripts use the default source from the new package. PxBoard instances still require a PxBoard-capable executable.
@@ -76,7 +76,7 @@ The override selects the release source for that command without changing the pa
 For `v0.1.49-pxboard.1` or `.2` installed from `MoeClub-Open/NodeRS`, run one upgrade against the original repository:
 
 ```bash
-NODERS_REPOSITORY=MoeclubM/NodeRS noders update --version v0.1.49
+NODERS_REPOSITORY=MoeclubM/NodeRS noders update --version v0.1.50
 ```
 
 This preserves panel connection settings, certificates, and traffic queues while switching future updates to the original repository. Subsequent upgrades can use `noders update` directly.
@@ -118,7 +118,7 @@ Upgrade to the latest release with the management command:
 ```bash
 noders update
 # pin a version / skip restarting afterwards
-noders update --version v0.1.49
+noders update --version v0.1.50
 noders update --no-restart
 ```
 
@@ -165,6 +165,6 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/instal
 | `/api/v2/server/machine/status` | Host status |
 | `/api/v2/server/handshake` | WebSocket; falls back to HTTP polling when empty |
 
-PxBoard uses `/api/v1/extensions/nodes/machines/{machineId}` with header authentication. See [PxBoard integration](pxboard.md) for the full contract.
+PxBoard uses unified `POST /rpc/v1/nodes/server.*` procedures with `Authorization: Bearer pxm_<machineId>.<key>` authentication. See [PxBoard integration](pxboard.md) for the full contract.
 
-Protocols are served by Aerion: AnyTLS, Hysteria2, Mieru, Naive, Shadowsocks, Trojan, TUIC, VLESS, VMess. Wire-level limits are documented in the [Aerion docs](https://github.com/MoeclubM/Aerion/blob/main/docs/limitations.md).
+Protocols are served by Aerion: AnyTLS, Flux, Hysteria2, Mieru, Naive, Shadowsocks, Sudoku, Trojan, TUIC, VLESS, VMess. Wire-level limits are documented in the [Aerion docs](https://github.com/MoeclubM/Aerion/blob/main/docs/limitations.md).

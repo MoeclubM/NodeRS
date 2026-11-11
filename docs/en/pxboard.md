@@ -4,7 +4,7 @@
 
 NodeRS connects to PxBoard through its nodes plugin. The local `type` setting selects the panel API and authentication method.
 
-Starting with `v0.1.49`, official NodeRS packages support both Xboard and PxBoard. Xboard remains the default panel type.
+Starting with `v0.1.50`, NodeRS connects to PxBoard over the unified `/rpc/v1` contract shared with Web and native clients. Official packages support both Xboard and PxBoard, with Xboard as the default panel type.
 
 ## Panel Setup
 
@@ -19,7 +19,7 @@ One machine can host multiple nodes. Machine and node numbers are separate ident
 Both the executable and installer must support PxBoard. From an extracted release bundle:
 
 ```bash
-bash install.sh --version v0.1.49 --panel-type pxboard \
+bash install.sh --version v0.1.50 --panel-type pxboard \
   --api https://panel.example.com \
   --key MACHINE_KEY \
   --machine-id 1
@@ -31,7 +31,7 @@ To download the installer and pin the release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
-  --version v0.1.49 --panel-type pxboard \
+  --version v0.1.50 --panel-type pxboard \
   --api https://panel.example.com --key MACHINE_KEY --machine-id 1
 ```
 
@@ -69,18 +69,15 @@ Installed systemd and OpenRC services already set their working directory. After
 
 ## API Contract
 
-Paths share the prefix `/api/v1/extensions/nodes/machines/{machineId}`. Requests carry the machine key in `X-Machine-Key`; successful JSON responses put their payload in `data`. Keys are never sent in the URL.
+Procedures are invoked via `POST /rpc/v1/nodes/{method}` with `Authorization: Bearer pxm_<machineId>.<key>` (or a pre-formatted `pxm_` token). Successful responses return `{"data": ...}` and errors return `{"error": {"code": "...", "message": "..."}}`. Keys are never placed in URLs, and machine tokens are scoped strictly to `nodes` `server.*` procedures.
 
-| Method and relative path | Purpose |
+| Procedure (`POST /rpc/v1/nodes/{method}`) | Purpose |
 | --- | --- |
-| `GET /handshake` | Require machine API version `1.0` |
-| `GET /nodes` | Node numbers, protocols, and polling intervals |
-| `GET /nodes/{nodeId}/config` | Listen, transport, security, and protocol configuration |
-| `GET /nodes/{nodeId}/users` | Active users with separate UUID and connection password |
-| `POST /nodes/{nodeId}/traffic` | Upload and download byte counts with a unique batch ID |
-| `POST /nodes/{nodeId}/alive` | Online accounts and IPs |
-| `POST /nodes/{nodeId}/status` | Node status |
-| `POST /status` | Machine status |
+| `server.bootstrap` | Verify machine API and RPC version `1.0` |
+| `server.pull` | Fetch whole-machine snapshot (`nodes`, per-node `config` and `users`, polling intervals, and pending `managedConfiguration`) with `knownRevision` delta support |
+| `server.traffic` | Submit upload and download byte counts with `nodeId` and a unique `batchId` |
+| `server.telemetry` | Report machine host `status` metrics and per-node online accounts/IPs |
+| `server.ackConfig` | Report `applied` or `failed` outcome for a `managedConfiguration` revision |
 
 Node configuration contains `protocol`, `host`, `listen`, `transport`, `security`, and `protocolOptions`. NodeRS adapts this structure to its existing protocol runtime; PxBoard does not need Xboard compatibility endpoints. Separate UUID and password fields support the credential requirements of Shadowsocks, Trojan, TUIC, and other protocols.
 
@@ -90,12 +87,12 @@ The current integration uses HTTP polling. Aerion determines protocol capabiliti
 
 NodeRS checks its currently authenticated panel every 30 seconds for a new local panel configuration. PxBoard administrators can change the panel type, address, machine number, and key from the machine page. NodeRS updates only the TOML file supplied at startup; it accepts no remote file paths or system commands.
 
-| Method and relative path | Payload |
+| Procedure | Payload |
 | --- | --- |
-| `GET /configuration` | `data: null`, or `{revision, config: {panel: {type, api, key, machine_id}}}` |
-| `POST /configuration/status` | `{revision, status: "applied" or "failed", message}` |
+| `server.pull` (`managedConfiguration` field) | `null`, or `{revision, config: {panel: {type, api, key, machine_id}}}` |
+| `server.ackConfig` | `{machineId, revision, status: "applied" or "failed", message}` |
 
-Both requests authenticate with the current `X-Machine-Key`. Target configuration contains a machine key and should be managed only by trusted panel administrators.
+Both procedures authenticate with the machine's `Authorization: Bearer pxm_<machineId>.<key>` header. Target configuration contains a machine key and should be managed only by trusted panel administrators.
 
 Before applying a change, NodeRS authenticates the target machine, fetches every target node configuration and user list, and backs up its existing TOML file. It then stops old synchronization tasks, closes existing connections, drains final traffic to the source panel, starts the target nodes, and saves the new configuration. Configuration, listener, or save failures restore the source runtime. If restoring the source also fails, NodeRS saves the source configuration and exits so the service manager can restart it. Clients must reconnect during a migration.
 

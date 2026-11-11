@@ -758,10 +758,7 @@ impl NodePanelClient {
         etag: Option<&str>,
     ) -> anyhow::Result<FetchState<NodeConfigResponse>> {
         if let Some(panel) = &self.machine.pxboard {
-            return Ok(FetchState::Modified(
-                panel.config(self.node_id).await?,
-                None,
-            ));
+            return panel.config(self.node_id, etag).await;
         }
         self.fetch_etag("/api/v2/server/config", etag).await
     }
@@ -771,7 +768,7 @@ impl NodePanelClient {
         etag: Option<&str>,
     ) -> anyhow::Result<FetchState<UsersResponse>> {
         if let Some(panel) = &self.machine.pxboard {
-            return Ok(FetchState::Modified(panel.users(self.node_id).await?, None));
+            return panel.users(self.node_id, etag).await;
         }
         self.fetch_etag("/api/v2/server/user", etag).await
     }

@@ -196,6 +196,50 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._send_json(200, {"users": DEFAULT_USERS})
             elif path == "/api/v2/server/report":
                 self._send_json(200, {})
+            elif path == "/rpc/v1/nodes/server.bootstrap":
+                self._send_json(200, {"data": {"apiVersion": "1.0", "rpcVersion": "1.0", "machineId": 1}})
+            elif path == "/rpc/v1/nodes/server.pull":
+                cfg = self._node_config()
+                px_cfg = {
+                    "id": self.server.node_id,
+                    "protocol": self.server.protocol,
+                    "host": "127.0.0.1",
+                    "listen": {"host": cfg.get("listen_ip", "127.0.0.1"), "port": cfg["server_port"]},
+                    "transport": {"type": cfg.get("network", "tcp"), "settings": cfg.get("network_settings")},
+                    "security": {
+                        "mode": "tls" if cfg.get("tls") == 1 else ("reality" if cfg.get("tls") == 2 else "none"),
+                        "serverName": cfg.get("server_name", ""),
+                        "tlsSettings": cfg.get("tls_settings"),
+                        "reality": cfg.get("reality_settings"),
+                        "certificate": cfg.get("cert_config"),
+                    },
+                    "protocolOptions": {k: v for k, v in cfg.items() if k not in {
+                        "protocol", "listen_ip", "server_port", "server_name", "network",
+                        "network_settings", "tls", "tls_settings", "reality_settings", "cert_config", "host"
+                    }},
+                }
+                users = [{
+                    "accountId": u["id"],
+                    "credential": {"uuid": u["uuid"], "password": "" if (self.server.protocol == "shadowsocks" and (self.server.cipher or SS_CIPHER).startswith("2022-")) else u["password"]},
+                    "speedLimitMbps": u.get("speed_limit", 0),
+                    "deviceLimit": u.get("device_limit", 0),
+                } for u in DEFAULT_USERS]
+                self._send_json(200, {"data": {
+                    "revision": "sim-rev-1",
+                    "unchanged": False,
+                    "pullIntervalSeconds": 30,
+                    "pushIntervalSeconds": 30,
+                    "managedConfiguration": None,
+                    "nodes": [{
+                        "id": self.server.node_id,
+                        "protocol": self.server.protocol,
+                        "name": f"test-{self.server.protocol}",
+                        "config": px_cfg,
+                        "users": users,
+                    }],
+                }})
+            elif path in ("/rpc/v1/nodes/server.traffic", "/rpc/v1/nodes/server.telemetry", "/rpc/v1/nodes/server.ackConfig"):
+                self._send_json(200, {"data": True})
             else:
                 self._send_json(404, {"error": f"unknown endpoint: {path}"})
         except Exception as exc:

@@ -64,9 +64,9 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/instal
 安装和升级默认从 `MoeclubM/NodeRS` 获取发布包，可用环境变量 `NODERS_REPOSITORY` 为本次命令指定其他 `owner/repo`。例如：
 
 ```bash
-NODERS_REPOSITORY=owner/NodeRS bash scripts/install.sh --version v0.1.49 \
+NODERS_REPOSITORY=owner/NodeRS bash scripts/install.sh --version v0.1.50 \
   --panel-type pxboard --api https://panel.example.com --key 机器密钥 --machine-id 1
-NODERS_REPOSITORY=owner/NodeRS noders update --version v0.1.49
+NODERS_REPOSITORY=owner/NodeRS noders update --version v0.1.50
 ```
 
 覆盖发布源只影响本次命令，不修改对接类型。安装或升级后，管理脚本使用新包中的默认发布源；PxBoard 实例仍要求下载的程序支持 PxBoard。
@@ -76,7 +76,7 @@ NODERS_REPOSITORY=owner/NodeRS noders update --version v0.1.49
 此前从 `MoeClub-Open/NodeRS` 安装的 `v0.1.49-pxboard.1` 或 `.2`，使用原仓库完成一次升级：
 
 ```bash
-NODERS_REPOSITORY=MoeclubM/NodeRS noders update --version v0.1.49
+NODERS_REPOSITORY=MoeclubM/NodeRS noders update --version v0.1.50
 ```
 
 升级保留面板连接配置、证书和流量队列，并将后续更新切回原仓库。之后直接执行 `noders update` 即可。
@@ -118,7 +118,7 @@ cargo build --release
 ```bash
 noders update
 # 指定版本 / 升级后不重启
-noders update --version v0.1.49
+noders update --version v0.1.50
 noders update --no-restart
 ```
 
@@ -165,6 +165,6 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/instal
 | `/api/v2/server/machine/status` | 主机状态 |
 | `/api/v2/server/handshake` | WebSocket；面板未启用时回退 HTTP 轮询 |
 
-PxBoard 使用独立的 `/api/v1/extensions/nodes/machines/{machineId}` 接口和请求头认证，完整约定见 [PxBoard 接入](pxboard.md)。
+PxBoard 使用统一的 `POST /rpc/v1/nodes/server.*` 接口与 `Authorization: Bearer pxm_<machineId>.<key>` 认证，完整约定见 [PxBoard 接入](pxboard.md)。
 
-协议由 Aerion 提供：AnyTLS、Hysteria2、Mieru、Naive、Shadowsocks、Trojan、TUIC、VLESS、VMess。协议在线上的限制见 [Aerion 文档](https://github.com/MoeclubM/Aerion/blob/main/docs/limitations.md)。
+协议由 Aerion 提供：AnyTLS、Flux、Hysteria2、Mieru、Naive、Shadowsocks、Sudoku、Trojan、TUIC、VLESS、VMess。协议在线上的限制见 [Aerion 文档](https://github.com/MoeclubM/Aerion/blob/main/docs/limitations.md)。

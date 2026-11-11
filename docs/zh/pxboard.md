@@ -4,7 +4,7 @@
 
 NodeRS 通过 PxBoard 的节点插件对接机器。PxBoard 使用自己的 API 和认证方式；本地配置中的 `type` 决定使用哪一组接口。
 
-从 `v0.1.49` 起，NodeRS 正式发布包同时支持 Xboard 与 PxBoard，默认对接类型仍为 Xboard。
+从 `v0.1.50` 起，NodeRS 通过与 Web、原生客户端一致的 `/rpc/v1` 接口对接 PxBoard，正式发布包同时支持 Xboard 与 PxBoard，默认对接类型仍为 Xboard。
 
 ## 面板准备
 
@@ -19,7 +19,7 @@ NodeRS 通过 PxBoard 的节点插件对接机器。PxBoard 使用自己的 API 
 安装包中的程序和安装脚本都必须包含 PxBoard 支持。在已解压的安装包目录运行：
 
 ```bash
-bash install.sh --version v0.1.49 --panel-type pxboard \
+bash install.sh --version v0.1.50 --panel-type pxboard \
   --api https://panel.example.com \
   --key 机器接入密钥 \
   --machine-id 1
@@ -31,7 +31,7 @@ OpenRC 系统将脚本名换成 `install-openrc.sh`。从源码目录运行时�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS/main/scripts/install.sh | bash -s -- \
-  --version v0.1.49 --panel-type pxboard \
+  --version v0.1.50 --panel-type pxboard \
   --api https://panel.example.com --key 机器接入密钥 --machine-id 1
 ```
 
@@ -69,18 +69,15 @@ cd /var/lib/noders/anytls
 
 ## 接口约定
 
-所有路径均以 `/api/v1/extensions/nodes/machines/{machineId}` 开头。请求使用 `X-Machine-Key` 头传递机器密钥，响应数据放在 JSON 的 `data` 字段中。密钥不出现在 URL 中。
+所有过程统一通过 `POST /rpc/v1/nodes/{method}` 调用。请求头携带 `Authorization: Bearer pxm_<machineId>.<key>`（兼容已带 `pxm_` 前缀的机器令牌），成功响应放在 JSON 的 `data` 字段中，错误响应为 `{"error":{"code":"...","message":"..."}}`。密钥不出现在 URL 中，机器令牌在面板核心层仅允许调用 `nodes` 服务的 `server.*` 过程。
 
-| 方法与相对路径 | 内容 |
+| 过程（`POST /rpc/v1/nodes/{method}`） | 内容 |
 | --- | --- |
-| `GET /handshake` | 确认机器接口版本为 `1.0` |
-| `GET /nodes` | 节点编号、协议及同步间隔 |
-| `GET /nodes/{nodeId}/config` | 监听、传输、安全与协议配置 |
-| `GET /nodes/{nodeId}/users` | 有效用户及独立的 UUID / 连接密码 |
-| `POST /nodes/{nodeId}/traffic` | 带唯一批次编号的上传与下载字节数 |
-| `POST /nodes/{nodeId}/alive` | 当前在线账户和 IP |
-| `POST /nodes/{nodeId}/status` | 节点运行状态 |
-| `POST /status` | 主机运行状态 |
+| `server.bootstrap` | 握手并确认 `apiVersion` 与 `rpcVersion` 均为 `1.0` |
+| `server.pull` | 按 `knownRevision` 合并拉取整机节点列表、各节点配置、授权用户、轮询间隔及待处理的面板迁移配置；未变化时直接返回 `unchanged: true` |
+| `server.traffic` | 按 `nodeId` 与唯一 `batchId` 上报增量上传与下载字节数 |
+| `server.telemetry` | 上报主机运行指标 `status` 及各节点在线账户与 IP（`nodeId/accounts`） |
+| `server.ackConfig` | 回报待处理面板迁移任务的应用状态（`applied` 或 `failed`） |
 
 节点配置由 `protocol`、`host`、`listen`、`transport`、`security`、`protocolOptions` 组成。NodeRS 将该结构转换为已有协议运行配置，不需要 PxBoard 提供 Xboard 兼容接口。用户的连接密码与 UUID 分开接收，适用于 Shadowsocks、Trojan、TUIC 等不同凭据需求。
 
@@ -90,12 +87,12 @@ cd /var/lib/noders/anytls
 
 包含配置管理功能的 NodeRS 每 30 秒向当前已认证面板检查一次本地面板配置。PxBoard 管理员可在机器页下发新的面板类型、地址、机器编号与密钥；NodeRS 只更新启动时指定的 TOML 文件，不接受远程文件路径或系统命令。
 
-| 方法与相对路径 | 内容 |
+| 过程 | 内容 |
 | --- | --- |
-| `GET /configuration` | `data` 为 `null`，或 `{revision, config: {panel: {type, api, key, machine_id}}}` |
-| `POST /configuration/status` | `{revision, status: "applied" 或 "failed", message}` |
+| `server.pull`（`managedConfiguration` 字段） | 为 `null`，或 `{revision, config: {panel: {type, api, key, machine_id}}}` |
+| `server.ackConfig` | `{machineId, revision, status: "applied" 或 "failed", message}` |
 
-以上接口沿用当前机器的 `X-Machine-Key` 认证。配置包含机器密钥，仅允许信任的面板管理员设置迁移目标。
+以上过程沿用当前机器的 `Authorization: Bearer pxm_<machineId>.<key>` 认证。配置包含机器密钥，仅允许信任的面板管理员设置迁移目标。
 
 应用前会认证目标机器，读取其全部节点配置和用户，再备份现有 TOML 文件。随后停止旧面板的同步任务、结束现有连接并向旧面板回报最后流量，启动目标节点并保存新配置。目标配置、监听或保存失败时恢复旧配置及运行；若旧节点也无法恢复，则保留旧配置并退出，由服务管理器重新启动。迁移会断开已有连接，客户端需要重新连接。
 
