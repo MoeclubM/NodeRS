@@ -3,6 +3,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use boring::nid::Nid;
 use boring::x509::X509;
+use futures_util::future::select_ok;
 use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer;
 use p256::elliptic_curve::rand_core::OsRng;
@@ -15,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,7 +36,12 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_ATTEMPTS: usize = 90;
 const HTTP_BUFFER_SIZE: usize = 8192;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const DNS_PROPAGATION_RESOLVERS: &[&str] = &["1.1.1.1:53", "8.8.8.8:53"];
+const DNS_PROPAGATION_RESOLVERS: &[&str] = &[
+    "1.1.1.1:53",
+    "[2606:4700:4700::1111]:53",
+    "8.8.8.8:53",
+    "[2001:4860:4860::8888]:53",
+];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcmeConfig {
     pub directory_url: String,
@@ -85,6 +92,31 @@ pub async fn ensure_certificate(
     if !needs_renewal(cert_path, key_path, &domains, config.renew_before_days).await? {
         return Ok(false);
     }
+    match issue_certificate(config, &domains, cert_path, key_path).await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if !needs_renewal(cert_path, key_path, &domains, 0)
+                .await
+                .unwrap_or(true)
+            {
+                warn!(
+                    %error,
+                    cert_path = %cert_path.display(),
+                    "ACME certificate renewal failed; continuing with existing unexpired certificate"
+                );
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+async fn issue_certificate(
+    config: &AcmeConfig,
+    domains: &[String],
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<()> {
     let client = Client::builder()
         .user_agent(format!("NodeRS/{} ACME", env!("CARGO_PKG_VERSION")))
         .build()
@@ -93,7 +125,7 @@ pub async fn ensure_certificate(
     let account_key = load_or_create_account_key(&config.account_key_path).await?;
     let acme = AcmeClient::new(client, directory, account_key)?;
     let account = acme.ensure_account(&config.email).await?;
-    let mut order = acme.new_order(&account.kid, &domains).await?;
+    let mut order = acme.new_order(&account.kid, domains).await?;
     authorize_order(
         &acme,
         &account.kid,
@@ -102,7 +134,7 @@ pub async fn ensure_certificate(
     )
     .await?;
     let domain_key = load_or_create_domain_key(key_path).await?;
-    let csr_der = build_certificate_signing_request(&domain_key, &domains)?;
+    let csr_der = build_certificate_signing_request(&domain_key, domains)?;
     order = acme
         .finalize_order(&account.kid, &order.url, &order.finalize, &csr_der)
         .await?;
@@ -117,7 +149,7 @@ pub async fn ensure_certificate(
         .await?;
     write_domain_key(key_path, &domain_key).await?;
     write_atomic(cert_path, certificate_pem.as_bytes()).await?;
-    Ok(true)
+    Ok(())
 }
 async fn needs_renewal(
     cert_path: &Path,
@@ -372,14 +404,62 @@ async fn wait_for_dns_propagation(
     }
 }
 async fn txt_record_visible(record: &DnsChallengeRecord) -> bool {
-    for resolver in DNS_PROPAGATION_RESOLVERS {
-        match lookup_txt_records(&record.fqdn, resolver).await {
-            Ok(values) if values.iter().any(|value| value == &record.value) => return true,
-            Ok(_) => {}
-            Err(_) => {}
+    let resolvers = propagation_resolvers().await;
+    if resolvers.is_empty() {
+        return false;
+    }
+    let checks = resolvers.into_iter().map(|resolver| {
+        Box::pin(async move {
+            match lookup_txt_records(&record.fqdn, &resolver).await {
+                Ok(values) if values.iter().any(|value| value == &record.value) => Ok(()),
+                _ => Err(()),
+            }
+        })
+    });
+    select_ok(checks).await.is_ok()
+}
+async fn propagation_resolvers() -> Vec<String> {
+    let mut resolvers = Vec::with_capacity(DNS_PROPAGATION_RESOLVERS.len() + 4);
+    let mut seen = HashSet::new();
+    for &resolver in DNS_PROPAGATION_RESOLVERS {
+        if seen.insert(resolver.to_string()) {
+            resolvers.push(resolver.to_string());
         }
     }
-    false
+    if let Ok(contents) = tokio::fs::read_to_string("/etc/resolv.conf").await {
+        for spec in parse_resolv_conf_nameservers(&contents) {
+            if seen.insert(spec.clone()) {
+                resolvers.push(spec);
+            }
+        }
+    }
+    resolvers
+}
+fn parse_resolv_conf_nameservers(contents: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut parts = line.split_whitespace();
+        if !matches!(parts.next(), Some("nameserver")) {
+            continue;
+        }
+        let Some(raw_ip) = parts.next() else {
+            continue;
+        };
+        if raw_ip.contains('%') {
+            continue;
+        }
+        let Ok(ip) = raw_ip.parse::<IpAddr>() else {
+            continue;
+        };
+        if let IpAddr::V6(v6) = ip
+            && v6.is_unicast_link_local()
+        {
+            continue;
+        }
+        out.push(SocketAddr::new(ip, 53).to_string());
+    }
+    out
 }
 struct AcmeClient {
     client: Client,

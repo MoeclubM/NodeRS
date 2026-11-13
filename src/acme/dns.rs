@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 
-const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 static NEXT_DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 pub(super) async fn lookup_txt_records(
     name: &str,
