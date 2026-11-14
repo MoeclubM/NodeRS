@@ -730,11 +730,10 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
             "certificate": null
         },
         "protocolOptions": {
-            "ipStrategy": "dual",
+            "ipStrategy": "latency",
             "standbyChannels": 2,
             "rotationIntervalSec": 180,
             "rotationBytesMb": 96,
-            "obfsKey": "shared-obfs-secret-key",
             "channels": [
                 {
                     "id": "ct-v4-relay",
@@ -769,8 +768,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "id": "udp-hop",
                     "connectPorts": "21000-21002",
                     "transport": "udp",
-                    "security": "obfs",
-                    "role": "backup",
+                    "obfsKey": "shared-obfs-secret-key",
+                    "role": "udp_relay",
                     "weight": 80
                 }
             ]
@@ -850,5 +849,24 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
             .await
             .is_err()
     );
+
+    // Empty channels list defaults to a single dual-stack TCP listener
+    let empty_channels_remote: NodeConfigResponse = serde_json::from_value(json!({
+        "protocol": "flux",
+        "listen_ip": "::",
+        "server_port": 18444,
+        "server_key": "auto-tcp-obfs-secret"
+    }))?;
+    let BuiltServerConfig::Flux(default_tcp_cfg) =
+        build_server_config(ProtocolKind::Flux, &empty_channels_remote, &users).await?
+    else {
+        panic!("expected Flux config for empty channels")
+    };
+    assert_eq!(default_tcp_cfg.listeners.len(), 1);
+    assert_eq!(
+        default_tcp_cfg.listeners[0].transport,
+        ::aerion::FluxTransportKind::Tcp
+    );
+    assert_eq!(default_tcp_cfg.listeners[0].ports, vec![18444]);
     Ok(())
 }

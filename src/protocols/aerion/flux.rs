@@ -214,20 +214,12 @@ pub(super) async fn build_config(
             remote.server_port > 0,
             "Flux node requires server_port when channels list is empty"
         );
-        vec![
-            FluxChannelInput {
-                id: "default-tcp".to_string(),
-                transport: Some("tcp".to_string()),
-                security: Some(default_sec),
-                ..Default::default()
-            },
-            FluxChannelInput {
-                id: "default-udp".to_string(),
-                transport: Some("udp".to_string()),
-                security: Some(default_sec),
-                ..Default::default()
-            },
-        ]
+        vec![FluxChannelInput {
+            id: "default-tcp".to_string(),
+            transport: Some("tcp".to_string()),
+            security: Some(default_sec),
+            ..Default::default()
+        }]
     } else {
         let enabled = settings
             .channels
@@ -308,7 +300,20 @@ pub(super) async fn build_config(
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
         let http_path = normalize_http_path(ch.http_path.as_deref());
-        let security = ch.security.unwrap_or(default_sec);
+        let security = ch.security.unwrap_or_else(|| {
+            if first_non_empty([
+                ch.reality.as_ref().and_then(|r| r.private_key.as_deref()),
+                ch.private_key.as_deref(),
+            ])
+            .is_some()
+            {
+                ::aerion::FluxSecurityMode::Reality
+            } else if first_non_empty([ch.obfs_key.as_deref()]).is_some() {
+                ::aerion::FluxSecurityMode::Obfs
+            } else {
+                default_sec
+            }
+        });
         let is_udp = matches!(transport, ::aerion::FluxTransportKind::Udp);
 
         let mut candidate = ::aerion::FluxChannelServerConfig {
