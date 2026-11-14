@@ -594,13 +594,7 @@ pub(crate) fn adapt_pxboard_node_config(data: Value) -> anyhow::Result<NodeConfi
             ("rotation_interval_sec", "rotation_interval_sec"),
             ("rotationBytesMb", "rotation_bytes_mb"),
             ("rotation_bytes_mb", "rotation_bytes_mb"),
-            ("obfsKey", "obfs_key"),
-            ("obfs_key", "obfs_key"),
-            ("defaultSecurity", "security"),
-            ("default_security", "security"),
-            ("security", "security"),
             ("udp", "udp"),
-            ("reality", "reality"),
             ("channels", "channels"),
         ] {
             if let Some(value) = wire.remove(alias)
@@ -609,21 +603,12 @@ pub(crate) fn adapt_pxboard_node_config(data: Value) -> anyhow::Result<NodeConfi
                 flux_map.entry(canonical.to_string()).or_insert(value);
             }
         }
-        if !flux_map.contains_key("security")
-            && let Some(mode) = security["mode"].as_str()
-            && matches!(mode, "reality" | "tls" | "obfs")
-        {
-            flux_map.insert("security".into(), json!(mode));
-        }
         if let Some(Value::Array(channels)) = flux_map.get_mut("channels") {
             for item in channels.iter_mut() {
                 if let Some(obj) = item.as_object_mut() {
                     normalize_flux_channel_object(obj);
                 }
             }
-        }
-        if let Some(Value::Object(r_obj)) = flux_map.get_mut("reality") {
-            normalize_flux_reality_object(r_obj);
         }
         wire.insert("flux".into(), Value::Object(flux_map));
     }
@@ -679,33 +664,7 @@ fn normalize_flux_channel_object(obj: &mut serde_json::Map<String, Value>) {
         ("certPath", "cert_path"),
         ("keyPath", "key_path"),
         ("obfsKey", "obfs_key"),
-        ("shortId", "short_id"),
-        ("shortIds", "short_ids"),
-        ("publicKey", "public_key"),
-        ("privateKey", "private_key"),
         ("serverName", "sni"),
-        ("realityFallback", "reality_fallback"),
-        ("realityOpts", "reality"),
-        ("reality_opts", "reality"),
-    ] {
-        if let Some(value) = obj.remove(alias) {
-            obj.entry(canonical).or_insert(value);
-        }
-    }
-    if let Some(Value::Object(r_obj)) = obj.get_mut("reality") {
-        normalize_flux_reality_object(r_obj);
-    }
-}
-
-fn normalize_flux_reality_object(obj: &mut serde_json::Map<String, Value>) {
-    for (alias, canonical) in [
-        ("serverName", "server_name"),
-        ("serverNames", "server_names"),
-        ("serverPort", "server_port"),
-        ("privateKey", "private_key"),
-        ("publicKey", "public_key"),
-        ("shortId", "short_id"),
-        ("shortIds", "short_ids"),
     ] {
         if let Some(value) = obj.remove(alias) {
             obj.entry(canonical).or_insert(value);

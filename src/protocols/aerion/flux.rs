@@ -3,8 +3,6 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail, ensure};
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
@@ -25,44 +23,10 @@ struct FluxNodeSettings {
     rotation_interval_sec: Option<u64>,
     #[serde(default, alias = "rotationBytesMb")]
     rotation_bytes_mb: Option<u64>,
-    #[serde(default, alias = "defaultSecurity", alias = "default_security")]
-    security: Option<::aerion::FluxSecurityMode>,
-    #[serde(default, alias = "obfsKey")]
-    obfs_key: Option<String>,
     #[serde(default)]
     udp: Option<bool>,
     #[serde(default)]
-    reality: Option<FluxRealityInput>,
-    #[serde(default)]
     channels: Vec<FluxChannelInput>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct FluxRealityInput {
-    #[serde(default)]
-    dest: Option<String>,
-    #[serde(default, alias = "serverName", alias = "sni")]
-    server_name: Option<String>,
-    #[serde(
-        default,
-        alias = "serverNames",
-        deserialize_with = "deserialize_string_list"
-    )]
-    server_names: Vec<String>,
-    #[serde(default, alias = "serverPort")]
-    server_port: Option<u16>,
-    #[serde(default, alias = "privateKey")]
-    private_key: Option<String>,
-    #[serde(default, alias = "shortId")]
-    short_id: Option<String>,
-    #[serde(
-        default,
-        alias = "shortIds",
-        deserialize_with = "deserialize_string_list"
-    )]
-    short_ids: Vec<String>,
-    #[serde(default)]
-    fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,22 +71,6 @@ struct FluxChannelInput {
     key_path: Option<String>,
     #[serde(default, alias = "obfsKey")]
     obfs_key: Option<String>,
-    #[serde(default)]
-    dest: Option<String>,
-    #[serde(default, alias = "privateKey")]
-    private_key: Option<String>,
-    #[serde(default, alias = "shortId")]
-    short_id: Option<String>,
-    #[serde(
-        default,
-        alias = "shortIds",
-        deserialize_with = "deserialize_string_list"
-    )]
-    short_ids: Vec<String>,
-    #[serde(default, alias = "realityFallback")]
-    reality_fallback: Option<bool>,
-    #[serde(default, alias = "reality_opts", alias = "realityOpts")]
-    reality: Option<FluxRealityInput>,
 }
 
 impl Default for FluxChannelInput {
@@ -148,12 +96,6 @@ impl Default for FluxChannelInput {
             cert_path: None,
             key_path: None,
             obfs_key: None,
-            dest: None,
-            private_key: None,
-            short_id: None,
-            short_ids: Vec::new(),
-            reality_fallback: None,
-            reality: None,
         }
     }
 }
@@ -176,8 +118,6 @@ struct ListenerSignature {
     security: ::aerion::FluxSecurityMode,
     cert_mode: ::aerion::FluxCertMode,
     tls_fingerprint: Option<TlsFingerprint>,
-    reality: Option<::aerion::RealityServerConfig>,
-    reality_fallback: Option<bool>,
     obfs_key: Option<String>,
 }
 
@@ -208,16 +148,25 @@ pub(super) async fn build_config(
     };
     options.validate()?;
 
-    let default_sec = resolve_default_security(remote, &settings);
     let raw_channels = if settings.channels.is_empty() {
         ensure!(
             remote.server_port > 0,
             "Flux node requires server_port when channels list is empty"
         );
+        let fallback_obfs = first_non_empty([
+            Some(remote.obfs_password.as_str()),
+            Some(remote.server_key.as_str()),
+        ])
+        .map(ToString::to_string);
         vec![FluxChannelInput {
             id: "default-tcp".to_string(),
             transport: Some("tcp".to_string()),
-            security: Some(default_sec),
+            security: Some(if fallback_obfs.is_some() {
+                ::aerion::FluxSecurityMode::Obfs
+            } else {
+                ::aerion::FluxSecurityMode::Tls
+            }),
+            obfs_key: fallback_obfs,
             ..Default::default()
         }]
     } else {
@@ -301,17 +250,10 @@ pub(super) async fn build_config(
             .map(ToString::to_string);
         let http_path = normalize_http_path(ch.http_path.as_deref());
         let security = ch.security.unwrap_or_else(|| {
-            if first_non_empty([
-                ch.reality.as_ref().and_then(|r| r.private_key.as_deref()),
-                ch.private_key.as_deref(),
-            ])
-            .is_some()
-            {
-                ::aerion::FluxSecurityMode::Reality
-            } else if first_non_empty([ch.obfs_key.as_deref()]).is_some() {
+            if first_non_empty([ch.obfs_key.as_deref()]).is_some() {
                 ::aerion::FluxSecurityMode::Obfs
             } else {
-                default_sec
+                ::aerion::FluxSecurityMode::Tls
             }
         });
         let is_udp = matches!(transport, ::aerion::FluxTransportKind::Udp);
@@ -328,8 +270,6 @@ pub(super) async fn build_config(
             security,
             cert_mode: ch.cert_mode.unwrap_or(::aerion::FluxCertMode::Inherit),
             tls_material: None,
-            reality: None,
-            reality_fallback: None,
             obfs_key: None,
         };
 
@@ -340,19 +280,6 @@ pub(super) async fn build_config(
         };
 
         match security {
-            ::aerion::FluxSecurityMode::Reality => {
-                candidate.reality = Some(build_channel_reality(
-                    &id,
-                    ch,
-                    &settings,
-                    remote,
-                    alpn.clone(),
-                )?);
-                candidate.reality_fallback = ch
-                    .reality_fallback
-                    .or_else(|| ch.reality.as_ref().and_then(|r| r.fallback))
-                    .or_else(|| settings.reality.as_ref().and_then(|r| r.fallback));
-            }
             ::aerion::FluxSecurityMode::Tls => match candidate.cert_mode {
                 ::aerion::FluxCertMode::OriginPlain => {
                     ensure!(
@@ -429,13 +356,9 @@ pub(super) async fn build_config(
                 }
             },
             ::aerion::FluxSecurityMode::Obfs => {
-                let obfs_key = first_non_empty([
-                    ch.obfs_key.as_deref(),
-                    settings.obfs_key.as_deref(),
-                    Some(remote.obfs_password.as_str()),
-                    Some(remote.server_key.as_str()),
-                ])
-                .with_context(|| format!("Flux channel {id} security=obfs requires obfs_key"))?;
+                let obfs_key = first_non_empty([ch.obfs_key.as_deref()]).with_context(|| {
+                    format!("Flux channel {id} security=obfs requires obfs_key")
+                })?;
                 ensure!(
                     obfs_key.len() >= 4,
                     "Flux channel {id} obfs_key must be at least 4 characters"
@@ -461,8 +384,6 @@ pub(super) async fn build_config(
                     m.alpn_protocols.clone(),
                 )
             }),
-            reality: candidate.reality.clone(),
-            reality_fallback: candidate.reality_fallback,
             obfs_key: candidate.obfs_key.clone(),
         };
 
@@ -536,296 +457,6 @@ pub(super) async fn build_config(
     Ok(BuiltServerConfig::Flux(server_config))
 }
 
-fn resolve_default_security(
-    remote: &NodeConfigResponse,
-    settings: &FluxNodeSettings,
-) -> ::aerion::FluxSecurityMode {
-    if let Some(sec) = settings.security {
-        return sec;
-    }
-    match remote.cipher.trim().to_ascii_lowercase().as_str() {
-        "reality" => return ::aerion::FluxSecurityMode::Reality,
-        "tls" => return ::aerion::FluxSecurityMode::Tls,
-        "obfs" => return ::aerion::FluxSecurityMode::Obfs,
-        _ => {}
-    }
-    match remote.tls_mode() {
-        2 => ::aerion::FluxSecurityMode::Reality,
-        1 => ::aerion::FluxSecurityMode::Tls,
-        _ => {
-            if has_reality_private_key(remote, settings) {
-                ::aerion::FluxSecurityMode::Reality
-            } else if first_non_empty([
-                settings.obfs_key.as_deref(),
-                Some(remote.obfs_password.as_str()),
-                Some(remote.server_key.as_str()),
-            ])
-            .is_some()
-            {
-                ::aerion::FluxSecurityMode::Obfs
-            } else {
-                ::aerion::FluxSecurityMode::Tls
-            }
-        }
-    }
-}
-
-fn has_reality_private_key(remote: &NodeConfigResponse, settings: &FluxNodeSettings) -> bool {
-    first_non_empty([
-        settings
-            .reality
-            .as_ref()
-            .and_then(|r| r.private_key.as_deref()),
-        Some(remote.reality_settings.private_key.as_str()),
-        Some(remote.tls_settings.private_key.as_str()),
-    ])
-    .is_some()
-}
-
-fn build_channel_reality(
-    id: &str,
-    ch: &FluxChannelInput,
-    settings: &FluxNodeSettings,
-    remote: &NodeConfigResponse,
-    alpn_protocols: Vec<Vec<u8>>,
-) -> anyhow::Result<::aerion::RealityServerConfig> {
-    let ch_r = ch.reality.as_ref();
-    let node_r = settings.reality.as_ref();
-
-    let priv_key_str = first_non_empty([
-        ch_r.and_then(|r| r.private_key.as_deref()),
-        ch.private_key.as_deref(),
-        node_r.and_then(|r| r.private_key.as_deref()),
-        Some(remote.reality_settings.private_key.as_str()),
-        Some(remote.tls_settings.private_key.as_str()),
-    ])
-    .with_context(|| format!("Flux channel {id} security=reality requires private_key"))?;
-    let private_key = decode_reality_private_key(priv_key_str)
-        .with_context(|| format!("decode Flux channel {id} REALITY private_key"))?;
-
-    let dest_str = first_non_empty([
-        ch_r.and_then(|r| r.dest.as_deref()),
-        ch.dest.as_deref(),
-        node_r.and_then(|r| r.dest.as_deref()),
-    ]);
-
-    let mut server_names = Vec::new();
-    let push_name = |list: &mut Vec<String>, candidate: &str| {
-        let trimmed = candidate.trim();
-        if !trimmed.is_empty() && !list.iter().any(|existing| existing == trimmed) {
-            list.push(trimmed.to_string());
-        }
-    };
-    if let Some(sni) = ch.sni.as_deref() {
-        push_name(&mut server_names, sni);
-    }
-    if let Some(r) = ch_r {
-        if let Some(sn) = r.server_name.as_deref() {
-            push_name(&mut server_names, sn);
-        }
-        for sn in &r.server_names {
-            push_name(&mut server_names, sn);
-        }
-    }
-    if server_names.is_empty() {
-        if let Some(r) = node_r {
-            if let Some(sn) = r.server_name.as_deref() {
-                push_name(&mut server_names, sn);
-            }
-            for sn in &r.server_names {
-                push_name(&mut server_names, sn);
-            }
-        }
-        push_name(&mut server_names, &remote.reality_settings.server_name);
-        for sn in &remote.reality_settings.server_names {
-            push_name(&mut server_names, sn);
-        }
-        push_name(&mut server_names, &remote.tls_settings.server_name);
-        for sn in &remote.tls_settings.server_names {
-            push_name(&mut server_names, sn);
-        }
-        push_name(&mut server_names, &remote.server_name);
-    }
-
-    let fallback_port = ch_r
-        .and_then(|r| r.server_port)
-        .filter(|p| *p > 0)
-        .or_else(|| node_r.and_then(|r| r.server_port).filter(|p| *p > 0))
-        .or_else(|| {
-            (remote.reality_settings.server_port > 0).then_some(remote.reality_settings.server_port)
-        })
-        .or_else(|| {
-            (remote.tls_settings.server_port > 0).then_some(remote.tls_settings.server_port)
-        })
-        .unwrap_or(443);
-
-    let (server_name, server_port) = if let Some(dest) = dest_str {
-        parse_dest_host_port(dest, fallback_port)
-            .with_context(|| format!("parse Flux channel {id} REALITY dest {dest}"))?
-    } else {
-        let first_sni = server_names
-            .first()
-            .cloned()
-            .with_context(|| format!("Flux channel {id} security=reality requires sni or dest"))?;
-        (first_sni, fallback_port)
-    };
-    if server_names.is_empty() {
-        server_names.push(server_name.clone());
-    }
-
-    let short_ids = collect_short_ids(ch, settings, remote)
-        .with_context(|| format!("decode Flux channel {id} REALITY short_id"))?;
-
-    Ok(::aerion::RealityServerConfig {
-        server_name,
-        server_port,
-        server_names,
-        private_key,
-        short_ids,
-        alpn_protocols,
-        max_time_diff_secs: 0,
-        max_client_version: None,
-        fallback_limit: ::aerion::RealityFallbackLimit::default(),
-    })
-}
-
-fn collect_short_ids(
-    ch: &FluxChannelInput,
-    settings: &FluxNodeSettings,
-    remote: &NodeConfigResponse,
-) -> anyhow::Result<Vec<[u8; 8]>> {
-    let mut raw: Vec<&str> = Vec::new();
-    if let Some(r) = ch.reality.as_ref() {
-        if let Some(sid) = r
-            .short_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            raw.push(sid);
-        }
-        for sid in &r.short_ids {
-            if !sid.trim().is_empty() {
-                raw.push(sid.trim());
-            }
-        }
-    }
-    if let Some(sid) = ch
-        .short_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        raw.push(sid);
-    }
-    for sid in &ch.short_ids {
-        if !sid.trim().is_empty() {
-            raw.push(sid.trim());
-        }
-    }
-    if raw.is_empty() {
-        if let Some(r) = settings.reality.as_ref() {
-            if let Some(sid) = r
-                .short_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            {
-                raw.push(sid);
-            }
-            for sid in &r.short_ids {
-                if !sid.trim().is_empty() {
-                    raw.push(sid.trim());
-                }
-            }
-        }
-        if !remote.reality_settings.short_id.trim().is_empty() {
-            raw.push(remote.reality_settings.short_id.trim());
-        }
-        for sid in &remote.reality_settings.short_ids {
-            if !sid.trim().is_empty() {
-                raw.push(sid.trim());
-            }
-        }
-        if !remote.tls_settings.short_id.trim().is_empty() {
-            raw.push(remote.tls_settings.short_id.trim());
-        }
-        for sid in &remote.tls_settings.short_ids {
-            if !sid.trim().is_empty() {
-                raw.push(sid.trim());
-            }
-        }
-    }
-    if raw.is_empty() {
-        return Ok(vec![[0u8; 8]]);
-    }
-    let mut out = Vec::with_capacity(raw.len());
-    for hex_str in raw {
-        let sid = decode_short_id(hex_str)?;
-        if !out.contains(&sid) {
-            out.push(sid);
-        }
-    }
-    Ok(out)
-}
-
-fn decode_reality_private_key(encoded: &str) -> anyhow::Result<[u8; 32]> {
-    let trimmed = encoded.trim();
-    let decoded = URL_SAFE_NO_PAD
-        .decode(trimmed)
-        .or_else(|_| URL_SAFE.decode(trimmed))
-        .or_else(|_| STANDARD_NO_PAD.decode(trimmed))
-        .or_else(|_| STANDARD.decode(trimmed))
-        .with_context(|| format!("invalid base64 REALITY key {trimmed}"))?;
-    ensure!(
-        decoded.len() == 32,
-        "REALITY private_key must decode to 32 bytes"
-    );
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
-}
-
-fn decode_short_id(hex_str: &str) -> anyhow::Result<[u8; 8]> {
-    ensure!(
-        hex_str.len() <= 16 && hex_str.len() % 2 == 0,
-        "REALITY short_id must be even-length hex <= 16 chars"
-    );
-    let mut out = [0u8; 8];
-    let len = hex_str.len() / 2;
-    hex::decode_to_slice(hex_str.as_bytes(), &mut out[..len])
-        .with_context(|| format!("invalid REALITY short_id {hex_str}"))?;
-    Ok(out)
-}
-
-fn parse_dest_host_port(raw: &str, default_port: u16) -> anyhow::Result<(String, u16)> {
-    let trimmed = raw.trim();
-    ensure!(!trimmed.is_empty(), "empty REALITY dest");
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .context("invalid bracketed IPv6 REALITY dest")?;
-        let port = if let Some(port_str) = tail.strip_prefix(':') {
-            port_str.parse::<u16>().context("parse REALITY dest port")?
-        } else if tail.is_empty() {
-            default_port
-        } else {
-            bail!("invalid REALITY dest suffix {tail}");
-        };
-        ensure!(port > 0, "REALITY dest port must be > 0");
-        return Ok((host.to_string(), port));
-    }
-    if let Some((host, port_str)) = trimmed.rsplit_once(':')
-        && !host.contains(':')
-        && let Ok(port) = port_str.parse::<u16>()
-    {
-        ensure!(!host.trim().is_empty(), "empty REALITY dest host");
-        ensure!(port > 0, "REALITY dest port must be > 0");
-        return Ok((host.trim().to_string(), port));
-    }
-    Ok((trimmed.to_string(), default_port))
-}
-
 fn normalize_http_path(path: Option<&str>) -> String {
     match path.map(str::trim).filter(|p| !p.is_empty()) {
         None => "/".to_string(),
@@ -858,31 +489,5 @@ where
         None | Some(Value::Null) => Ok(true),
         Some(val) => crate::panel::value_to_bool(&val)
             .ok_or_else(|| serde::de::Error::custom(format!("expected bool, got {val}"))),
-    }
-}
-
-fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match Option::<Value>::deserialize(deserializer)? {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(items)) => Ok(items
-            .into_iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s.trim().to_string()).filter(|s| !s.is_empty()),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            })
-            .collect()),
-        Some(Value::String(text)) => Ok(text
-            .split([',', '\n', '\r', ' '])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect()),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "expected string or array, got {other}"
-        ))),
     }
 }

@@ -650,26 +650,16 @@ fn credentials_changed_detects_user_modifications() {
 
 #[tokio::test]
 async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> anyhow::Result<()> {
-    let priv_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let xboard_remote: NodeConfigResponse = serde_json::from_value(json!({
         "protocol": "flux",
         "host": "edge.example.com",
         "listen_ip": "0.0.0.0",
         "server_port": 443,
-        "tls": 2,
-        "reality_settings": {
-            "server_name": "www.microsoft.com",
-            "server_port": 443,
-            "private_key": priv_key,
-            "short_id": "01020304"
-        },
         "flux": {
-            "ip_strategy": "dual",
+            "ip_strategy": "latency",
             "standby_channels": 2,
             "rotation_interval_sec": 180,
             "rotation_bytes_mb": 96,
-            "security": "reality",
-            "obfs_key": "shared-obfs-secret-key",
             "channels": [
                 {
                     "id": "ct-v4-relay",
@@ -677,7 +667,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "connect_ports": "20443",
                     "listen_ports": "8443",
                     "transport": "tcp",
-                    "security": "reality"
+                    "security": "obfs",
+                    "obfs_key": "shared-relay-secret-key"
                 },
                 {
                     "id": "cu-v6-relay",
@@ -685,7 +676,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "connect_ports": "30443",
                     "listen_ports": "8443",
                     "transport": "tcp",
-                    "security": "reality"
+                    "security": "obfs",
+                    "obfs_key": "shared-relay-secret-key"
                 },
                 {
                     "id": "cdn-ws",
@@ -705,7 +697,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "connect_ports": "21000-21002",
                     "transport": "udp",
                     "security": "obfs",
-                    "role": "backup",
+                    "obfs_key": "shared-obfs-secret-key",
+                    "role": "udp_relay",
                     "weight": 80
                 }
             ]
@@ -718,15 +711,10 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         "listen": { "host": "0.0.0.0", "port": 443 },
         "transport": { "type": "tcp", "settings": {} },
         "security": {
-            "mode": "reality",
-            "serverName": "www.microsoft.com",
+            "mode": "none",
+            "serverName": "",
             "tlsSettings": {},
-            "reality": {
-                "serverName": "www.microsoft.com",
-                "serverPort": 443,
-                "privateKey": priv_key,
-                "shortId": "01020304"
-            },
+            "reality": null,
             "certificate": null
         },
         "protocolOptions": {
@@ -741,7 +729,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "connectPorts": "20443",
                     "listenPorts": "8443",
                     "transport": "tcp",
-                    "security": "reality"
+                    "security": "obfs",
+                    "obfsKey": "shared-relay-secret-key"
                 },
                 {
                     "id": "cu-v6-relay",
@@ -749,7 +738,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "connectPorts": "30443",
                     "listenPorts": "8443",
                     "transport": "tcp",
-                    "security": "reality"
+                    "security": "obfs",
+                    "obfsKey": "shared-relay-secret-key"
                 },
                 {
                     "id": "cdn-ws",
@@ -817,7 +807,6 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         assert_eq!(a.http_path, b.http_path);
         assert_eq!(a.security, b.security);
         assert_eq!(a.cert_mode, b.cert_mode);
-        assert_eq!(a.reality, b.reality);
         assert_eq!(a.obfs_key, b.obfs_key);
     }
 
@@ -826,26 +815,48 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         "protocol": "flux",
         "server_port": 443,
         "flux": {
-            "obfs_key": "shared-obfs-secret-key",
             "channels": [
                 {
                     "id": "ch1",
                     "listen_ports": "9443",
                     "transport": "tcp",
-                    "security": "obfs"
+                    "security": "obfs",
+                    "obfs_key": "shared-obfs-secret-key"
                 },
                 {
                     "id": "ch2",
                     "listen_ports": "9443",
                     "transport": "http",
                     "http_mode": "ws",
-                    "security": "obfs"
+                    "security": "obfs",
+                    "obfs_key": "shared-obfs-secret-key"
                 }
             ]
         }
     }))?;
     assert!(
         build_server_config(ProtocolKind::Flux, &conflict_remote, &users)
+            .await
+            .is_err()
+    );
+
+    // Legacy REALITY mode in Flux channels must be rejected
+    let reality_rejected: NodeConfigResponse = serde_json::from_value(json!({
+        "protocol": "flux",
+        "server_port": 443,
+        "flux": {
+            "channels": [
+                {
+                    "id": "ch1",
+                    "listen_ports": "9443",
+                    "transport": "tcp",
+                    "security": "reality"
+                }
+            ]
+        }
+    }))?;
+    assert!(
+        build_server_config(ProtocolKind::Flux, &reality_rejected, &users)
             .await
             .is_err()
     );
