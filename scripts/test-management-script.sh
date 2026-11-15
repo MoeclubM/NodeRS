@@ -59,6 +59,7 @@ prepare_fake_release_bundle() {
   cp "$ROOT_DIR/scripts/upgrade.sh" "$bundle_dir/upgrade.sh"
   cp "$ROOT_DIR/scripts/lib/install-common.sh" "$bundle_dir/lib/install-common.sh"
   cp "$ROOT_DIR/packaging/systemd/noders.service" "$bundle_dir/packaging/systemd/noders.service"
+  chmod 0755 "$bundle_dir/install.sh" "$bundle_dir/install-openrc.sh" "$bundle_dir/upgrade.sh"
 }
 
 test_validate_args() {

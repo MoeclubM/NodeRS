@@ -236,7 +236,7 @@ bootstrap_release() {
     exit 1
   }
 
-  "$package_root/upgrade.sh" "$@"
+  bash "$package_root/upgrade.sh" "$@"
 }
 
 ensure_existing_installation() {
