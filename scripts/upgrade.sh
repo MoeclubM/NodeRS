@@ -193,7 +193,10 @@ parse_args() {
 }
 
 release_layout_present() {
-  [[ -f "$SCRIPT_DIR/noders" ]]
+  [[ -f "$SCRIPT_DIR/noders" ]] &&
+  [[ -f "$SCRIPT_DIR/config.example.toml" ]] &&
+  [[ -f "$COMMON_LIB_PATH" ]] &&
+  [[ ! -f "$SCRIPT_DIR/install.env" ]]
 }
 
 resolve_release_tag() {

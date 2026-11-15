@@ -335,6 +335,7 @@ test_upgrade_skips_binary_self_copy() (
   config_dir="$tmp_root/config"
   install -d "$support_dir/lib" "$support_dir/packaging/systemd" "$prefix_dir/bin" "$config_dir"
 
+  cp "$ROOT_DIR/config.example.toml" "$support_dir/config.example.toml"
   cp "$ROOT_DIR/scripts/install.sh" "$support_dir/install.sh"
   cp "$ROOT_DIR/scripts/install-openrc.sh" "$support_dir/install-openrc.sh"
   cp "$ROOT_DIR/scripts/upgrade.sh" "$support_dir/upgrade.sh"
@@ -359,6 +360,62 @@ test_upgrade_skips_binary_self_copy() (
   assert_contains "Upgraded NodeRS" "$stdout_path" "upgrade.sh did not finish successfully in binary self-copy scenario"
 )
 
+test_noders_update_bootstraps_from_installed_support_dir() (
+  local tmp_root fake_bin release_src asset_suffix pkg_name tarball_path stdout_path stderr_path
+
+  tmp_root="$(mktemp -d)"
+  cleanup_update_bootstrap_test() {
+    rm -rf "$tmp_root"
+  }
+  trap cleanup_update_bootstrap_test EXIT
+
+  PREFIX="$tmp_root/prefix"
+  CONFIG_DIR="$tmp_root/config"
+  STATE_DIR="$tmp_root/state"
+  LOG_DIR="$tmp_root/log"
+  RUN_DIR="$tmp_root/run"
+  install -d "$CONFIG_DIR/machines" "$STATE_DIR" "$LOG_DIR" "$RUN_DIR"
+
+  install_management_support "$ROOT_DIR/scripts"
+  make_fake_command "$PREFIX/lib/noders/noders" '#!/bin/sh
+printf "old-binary\n"'
+
+  asset_suffix="$(detect_release_asset_suffix)"
+  pkg_name="noders-v0.1.99-${asset_suffix}"
+  release_src="$tmp_root/release-src"
+  prepare_fake_release_bundle "$release_src/$pkg_name"
+  make_fake_command "$release_src/$pkg_name/noders" '#!/bin/sh
+printf "v0.1.99\n"'
+  tarball_path="$tmp_root/${pkg_name}.tar.gz"
+  tar -C "$release_src" -czf "$tarball_path" "$pkg_name"
+
+  fake_bin="$tmp_root/fake-bin"
+  mkdir -p "$fake_bin"
+  make_fake_command "$fake_bin/curl" '#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cp "$NODERS_FAKE_RELEASE_TARBALL" "$out"'
+
+  stdout_path="$tmp_root/stdout"
+  stderr_path="$tmp_root/stderr"
+  if ! PATH="$fake_bin:$PATH" \
+    NODERS_FAKE_RELEASE_TARBALL="$tarball_path" \
+    "$PREFIX/bin/noders" update --version v0.1.99 --no-restart >"$stdout_path" 2>"$stderr_path"; then
+    echo "noders update failed to bootstrap release from installed support dir" >&2
+    cat "$stderr_path" >&2
+    exit 1
+  fi
+
+  assert_equals "v0.1.99" "$("$PREFIX/lib/noders/noders")" "noders update did not replace installed binary from release bundle"
+  assert_contains "Downloading ${pkg_name}.tar.gz" "$stdout_path" "noders update did not download release bundle"
+)
+
 main() {
   test_validate_args
   test_install_common_defaults_service_names
@@ -367,6 +424,7 @@ main() {
   test_upgrade_removes_stale_numeric_systemd_unit
   test_install_management_support_skips_self_copy
   test_upgrade_skips_binary_self_copy
+  test_noders_update_bootstraps_from_installed_support_dir
 }
 
 main "$@"
