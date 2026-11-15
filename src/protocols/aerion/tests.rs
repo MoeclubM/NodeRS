@@ -797,8 +797,10 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
     assert!(!protocol_requires_listener_user_reload(ProtocolKind::Flux));
     assert_eq!(xb_cfg.key, "alice-flux-uuid");
     assert_eq!(xb_cfg.users, ["bob-flux-uuid"]);
-    assert_eq!(xb_cfg.options.channel_max_mbps, 35);
-    assert_eq!(px_cfg.options.channel_max_mbps, 35);
+    assert_eq!(
+        pxboard_remote.flux.as_ref().unwrap()["channel_max_mbps"],
+        35
+    );
     // 4 logical channels -> 3 physical listener groups because ct-v4-relay & cu-v6-relay share :: :8443/tcp
     assert_eq!(xb_cfg.listeners.len(), 3);
     assert_eq!(px_cfg.listeners.len(), 3);

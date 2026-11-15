@@ -351,9 +351,10 @@ pub(super) async fn build_config(
                 }
             },
             ::aerion::FluxSecurityMode::Obfs => {
-                let private_key = first_non_empty([ch.private_key.as_deref()]).with_context(|| {
-                    format!("Flux channel {id} security=obfs requires private_key")
-                })?;
+                let private_key =
+                    first_non_empty([ch.private_key.as_deref()]).with_context(|| {
+                        format!("Flux channel {id} security=obfs requires private_key")
+                    })?;
                 let _ = ::aerion::flux::parse_flux_x25519_key(private_key)
                     .with_context(|| format!("Flux channel {id} private_key"))?;
                 candidate.private_key = Some(private_key.to_string());
