@@ -650,6 +650,8 @@ fn credentials_changed_detects_user_modifications() {
 
 #[tokio::test]
 async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> anyhow::Result<()> {
+    let (tcp_priv, _) = ::aerion::flux::generate_flux_x25519_keypair()?;
+    let (udp_priv, _) = ::aerion::flux::generate_flux_x25519_keypair()?;
     let xboard_remote: NodeConfigResponse = serde_json::from_value(json!({
         "protocol": "flux",
         "host": "edge.example.com",
@@ -658,6 +660,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         "flux": {
             "ip_strategy": "latency",
             "standby_channels": 2,
+            "channel_max_mbps": 35,
             "rotation_interval_sec": 180,
             "rotation_bytes_mb": 96,
             "channels": [
@@ -668,7 +671,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "listen_ports": "8443",
                     "transport": "tcp",
                     "security": "obfs",
-                    "obfs_key": "shared-relay-secret-key"
+                    "private_key": tcp_priv
                 },
                 {
                     "id": "cu-v6-relay",
@@ -677,7 +680,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "listen_ports": "8443",
                     "transport": "tcp",
                     "security": "obfs",
-                    "obfs_key": "shared-relay-secret-key"
+                    "private_key": tcp_priv
                 },
                 {
                     "id": "cdn-ws",
@@ -697,7 +700,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "connect_ports": "21000-21002",
                     "transport": "udp",
                     "security": "obfs",
-                    "obfs_key": "shared-obfs-secret-key",
+                    "private_key": udp_priv,
                     "role": "udp_relay",
                     "weight": 80
                 }
@@ -720,6 +723,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         "protocolOptions": {
             "ipStrategy": "latency",
             "standbyChannels": 2,
+            "channelMaxMbps": 35,
             "rotationIntervalSec": 180,
             "rotationBytesMb": 96,
             "channels": [
@@ -730,7 +734,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "listenPorts": "8443",
                     "transport": "tcp",
                     "security": "obfs",
-                    "obfsKey": "shared-relay-secret-key"
+                    "privateKey": tcp_priv
                 },
                 {
                     "id": "cu-v6-relay",
@@ -739,7 +743,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "listenPorts": "8443",
                     "transport": "tcp",
                     "security": "obfs",
-                    "obfsKey": "shared-relay-secret-key"
+                    "privateKey": tcp_priv
                 },
                 {
                     "id": "cdn-ws",
@@ -758,7 +762,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "id": "udp-hop",
                     "connectPorts": "21000-21002",
                     "transport": "udp",
-                    "obfsKey": "shared-obfs-secret-key",
+                    "privateKey": udp_priv,
                     "role": "udp_relay",
                     "weight": 80
                 }
@@ -793,6 +797,8 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
     assert!(!protocol_requires_listener_user_reload(ProtocolKind::Flux));
     assert_eq!(xb_cfg.key, "alice-flux-uuid");
     assert_eq!(xb_cfg.users, ["bob-flux-uuid"]);
+    assert_eq!(xb_cfg.options.channel_max_mbps, 35);
+    assert_eq!(px_cfg.options.channel_max_mbps, 35);
     // 4 logical channels -> 3 physical listener groups because ct-v4-relay & cu-v6-relay share :: :8443/tcp
     assert_eq!(xb_cfg.listeners.len(), 3);
     assert_eq!(px_cfg.listeners.len(), 3);
@@ -807,7 +813,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         assert_eq!(a.http_path, b.http_path);
         assert_eq!(a.security, b.security);
         assert_eq!(a.cert_mode, b.cert_mode);
-        assert_eq!(a.obfs_key, b.obfs_key);
+        assert_eq!(a.private_key, b.private_key);
     }
 
     // Conflicting security on the same local port must be rejected explicitly
@@ -821,7 +827,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "listen_ports": "9443",
                     "transport": "tcp",
                     "security": "obfs",
-                    "obfs_key": "shared-obfs-secret-key"
+                    "private_key": udp_priv
                 },
                 {
                     "id": "ch2",
@@ -829,7 +835,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
                     "transport": "http",
                     "http_mode": "ws",
                     "security": "obfs",
-                    "obfs_key": "shared-obfs-secret-key"
+                    "private_key": udp_priv
                 }
             ]
         }
@@ -866,7 +872,7 @@ async fn builds_flux_xboard_and_pxboard_equivalently_and_dedups_listeners() -> a
         "protocol": "flux",
         "listen_ip": "::",
         "server_port": 18444,
-        "server_key": "auto-tcp-obfs-secret"
+        "server_name": "edge.example.com"
     }))?;
     let BuiltServerConfig::Flux(default_tcp_cfg) =
         build_server_config(ProtocolKind::Flux, &empty_channels_remote, &users).await?

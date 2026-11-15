@@ -19,6 +19,8 @@ struct FluxNodeSettings {
     ip_strategy: Option<::aerion::FluxIpStrategy>,
     #[serde(default, alias = "standbyChannels")]
     standby_channels: Option<usize>,
+    #[serde(default, alias = "channelMaxMbps", alias = "channel-max-mbps")]
+    channel_max_mbps: Option<u64>,
     #[serde(default, alias = "rotationIntervalSec")]
     rotation_interval_sec: Option<u64>,
     #[serde(default, alias = "rotationBytesMb")]
@@ -69,8 +71,8 @@ struct FluxChannelInput {
     cert_path: Option<String>,
     #[serde(default, alias = "keyPath")]
     key_path: Option<String>,
-    #[serde(default, alias = "obfsKey")]
-    obfs_key: Option<String>,
+    #[serde(default, alias = "privateKey")]
+    private_key: Option<String>,
 }
 
 impl Default for FluxChannelInput {
@@ -95,7 +97,7 @@ impl Default for FluxChannelInput {
             cert_mode: None,
             cert_path: None,
             key_path: None,
-            obfs_key: None,
+            private_key: None,
         }
     }
 }
@@ -118,7 +120,7 @@ struct ListenerSignature {
     security: ::aerion::FluxSecurityMode,
     cert_mode: ::aerion::FluxCertMode,
     tls_fingerprint: Option<TlsFingerprint>,
-    obfs_key: Option<String>,
+    private_key: Option<String>,
 }
 
 pub(super) async fn build_config(
@@ -139,6 +141,9 @@ pub(super) async fn build_config(
         standby_channels: settings
             .standby_channels
             .unwrap_or(::aerion::flux::DEFAULT_STANDBY_CHANNELS),
+        channel_max_mbps: settings
+            .channel_max_mbps
+            .unwrap_or(::aerion::flux::DEFAULT_CHANNEL_MAX_MBPS),
         rotation_interval_sec: settings
             .rotation_interval_sec
             .unwrap_or(::aerion::flux::DEFAULT_ROTATION_INTERVAL_SEC),
@@ -153,20 +158,10 @@ pub(super) async fn build_config(
             remote.server_port > 0,
             "Flux node requires server_port when channels list is empty"
         );
-        let fallback_obfs = first_non_empty([
-            Some(remote.obfs_password.as_str()),
-            Some(remote.server_key.as_str()),
-        ])
-        .map(ToString::to_string);
         vec![FluxChannelInput {
             id: "default-tcp".to_string(),
             transport: Some("tcp".to_string()),
-            security: Some(if fallback_obfs.is_some() {
-                ::aerion::FluxSecurityMode::Obfs
-            } else {
-                ::aerion::FluxSecurityMode::Tls
-            }),
-            obfs_key: fallback_obfs,
+            security: Some(::aerion::FluxSecurityMode::Tls),
             ..Default::default()
         }]
     } else {
@@ -250,7 +245,7 @@ pub(super) async fn build_config(
             .map(ToString::to_string);
         let http_path = normalize_http_path(ch.http_path.as_deref());
         let security = ch.security.unwrap_or_else(|| {
-            if first_non_empty([ch.obfs_key.as_deref()]).is_some() {
+            if first_non_empty([ch.private_key.as_deref()]).is_some() {
                 ::aerion::FluxSecurityMode::Obfs
             } else {
                 ::aerion::FluxSecurityMode::Tls
@@ -270,7 +265,7 @@ pub(super) async fn build_config(
             security,
             cert_mode: ch.cert_mode.unwrap_or(::aerion::FluxCertMode::Inherit),
             tls_material: None,
-            obfs_key: None,
+            private_key: None,
         };
 
         let alpn = if is_udp {
@@ -356,14 +351,12 @@ pub(super) async fn build_config(
                 }
             },
             ::aerion::FluxSecurityMode::Obfs => {
-                let obfs_key = first_non_empty([ch.obfs_key.as_deref()]).with_context(|| {
-                    format!("Flux channel {id} security=obfs requires obfs_key")
+                let private_key = first_non_empty([ch.private_key.as_deref()]).with_context(|| {
+                    format!("Flux channel {id} security=obfs requires private_key")
                 })?;
-                ensure!(
-                    obfs_key.len() >= 4,
-                    "Flux channel {id} obfs_key must be at least 4 characters"
-                );
-                candidate.obfs_key = Some(obfs_key.to_string());
+                let _ = ::aerion::flux::parse_flux_x25519_key(private_key)
+                    .with_context(|| format!("Flux channel {id} private_key"))?;
+                candidate.private_key = Some(private_key.to_string());
             }
         }
 
@@ -384,7 +377,7 @@ pub(super) async fn build_config(
                     m.alpn_protocols.clone(),
                 )
             }),
-            obfs_key: candidate.obfs_key.clone(),
+            private_key: candidate.private_key.clone(),
         };
 
         let mut new_ports_for_listener = Vec::new();

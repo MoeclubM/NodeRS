@@ -590,6 +590,8 @@ pub(crate) fn adapt_pxboard_node_config(data: Value) -> anyhow::Result<NodeConfi
             ("ip_strategy", "ip_strategy"),
             ("standbyChannels", "standby_channels"),
             ("standby_channels", "standby_channels"),
+            ("channelMaxMbps", "channel_max_mbps"),
+            ("channel_max_mbps", "channel_max_mbps"),
             ("rotationIntervalSec", "rotation_interval_sec"),
             ("rotation_interval_sec", "rotation_interval_sec"),
             ("rotationBytesMb", "rotation_bytes_mb"),
@@ -663,7 +665,9 @@ fn normalize_flux_channel_object(obj: &mut serde_json::Map<String, Value>) {
         ("certMode", "cert_mode"),
         ("certPath", "cert_path"),
         ("keyPath", "key_path"),
-        ("obfsKey", "obfs_key"),
+        ("privateKey", "private_key"),
+        ("publicKey", "public_key"),
+        ("tlsBinding", "tls_binding"),
         ("serverName", "sni"),
     ] {
         if let Some(value) = obj.remove(alias) {
