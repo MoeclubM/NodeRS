@@ -25,7 +25,7 @@ dependencies = [
 [[package]]
 name = "aerion"
 version = "0.1.0"
-source = "git+https://github.com/MoeclubM/Aerion.git?rev=84f9457ae06719d51499b3b02dbe3d175a5cf9f1#84f9457ae06719d51499b3b02dbe3d175a5cf9f1"
+source = "git+https://github.com/MoeclubM/Aerion.git?rev=1ca2b406b4f4633062867e67e810c5b1e321a76c#1ca2b406b4f4633062867e67e810c5b1e321a76c"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -72,6 +72,7 @@ dependencies = [
  "tracing-subscriber",
  "tun2proxy",
  "webpki-roots 1.0.12",
+ "windows-sys 0.61.2",
  "x25519-dalek",
 ]
 
@@ -2267,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "noders"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "aerion",
  "anyhow",
